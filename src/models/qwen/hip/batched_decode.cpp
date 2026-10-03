@@ -697,6 +697,23 @@ QwenGpuExecutor::ForwardVerificationBatch(
                 reinterpret_cast<float*>(scratch.decode.weight_bf16.data()),
                 sequence_size * attention_scratch.size()};
           }
+          // Design D4: the verification step seals the tiles its view rule
+          // selects before reading them, exactly like the decode step. The
+          // predicate uses q_max = start_pos + rows - 1; with L >= W every
+          // sealed row is already committed.
+          {
+            const auto& regions = state_arena.GetKvarnRegions();
+            LaunchKvarnSeal(
+                *state_arena.GetKvarnSealState(),
+                item.executor->policy_.kvarn, state_arena.d_kvarn_sink,
+                state_arena.d_kvarn_tail, regions.sink_elements,
+                regions.tail_elements,
+                static_cast<std::uint32_t>(regions.tail_rows),
+                state_arena.d_kvarn_body,
+                static_cast<std::uint32_t>(regions.tile_count), attention_layer,
+                config.num_key_value_heads, start_pos, nullptr,
+                static_cast<std::uint32_t>(sequence_size), arena_.stream);
+          }
           LaunchCausalDecodeAttention(
               (scratch.attention.q.data() + offset * attention_size),
               (scratch.ssm.gate.data() + offset * attention_size),

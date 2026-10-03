@@ -556,9 +556,12 @@ gufo::hip::QwenExecutionPolicy KvarnPolicy(const char* name,
 }
 
 // Device read of the per-session sealed-tile counter for layer 0 / KV head 0.
+// Snapshot restore copies asynchronously on the session's non-blocking stream,
+// so synchronize before reading the counter.
 std::uint32_t SealedTileCount(Executor& executor) {
   Expect(executor.GetKvarnSealState() != nullptr,
          "KVarN session must own seal state");
+  HIP_CHECK(hipDeviceSynchronize());
   std::uint32_t sealed = 0;
   HIP_CHECK(hipMemcpy(&sealed, executor.GetKvarnSealState()->sealed(),
                       sizeof(sealed), hipMemcpyDeviceToHost));
