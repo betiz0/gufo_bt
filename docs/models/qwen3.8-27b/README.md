@@ -35,6 +35,109 @@ but AR and speculation need not share the same-seed sequence. See the
 [quality contract](QUALITY.md). Thinking/template controls and HTTP
 sampling defaults are described in [the server guide](../../SERVER.md#reasoning-controls).
 
+## KV cache quantization (phase 0)
+
+The KVarN KV-cache quantization change
+(`openspec/changes/add-kvarn-kv-cache-quantization`) has passed its phase-0
+quality gate (G0, design D17). Presets are selected with `--kv-cache` and the
+full-precision tail behind each KVarN query with `--kv-cache-tail`. The fitting
+tails are `kvarn-k4v4` 256 (memory-first) and `kvarn-k6v5` 2048 (quality-first);
+`kvarn-k5v4` fits the memory-first budget with no tail. Sizes are design D5's
+formula at the 262,144-token capacity (16 attention layers, 4 KV heads), where
+the session KV capacity in GiB equals the total bpv. FP16 KV is 16.00 GiB.
+"none" means no tail tokens were added (L = W).
+
+| Preset | Tail | Body bpv | Total bpv | KV/session (GiB) |
+| --- | ---: | ---: | ---: | ---: |
+| `kvarn-k4v4` | none | 4.4375 | 4.452 | 4.45 |
+| `kvarn-k4v4` | 256 | 4.4375 | 4.467 | 4.47 |
+| `kvarn-k4v4` | 1024 | 4.4375 | 4.514 | 4.51 |
+| `kvarn-k4v4` | 2048 | 4.4375 | 4.577 | 4.58 |
+| `kvarn-k5v4` | none | 4.9375 | 4.952 | 4.95 |
+| `kvarn-k5v4` | 256 | 4.9375 | 4.967 | 4.97 |
+| `kvarn-k5v4` | 1024 | 4.9375 | 5.014 | 5.01 |
+| `kvarn-k5v4` | 2048 | 4.9375 | 5.076 | 5.08 |
+| `kvarn-k5v5` | none | 5.4375 | 5.452 | 5.45 |
+| `kvarn-k5v5` | 256 | 5.4375 | 5.467 | 5.47 |
+| `kvarn-k5v5` | 1024 | 5.4375 | 5.514 | 5.51 |
+| `kvarn-k5v5` | 2048 | 5.4375 | 5.576 | 5.58 |
+| `kvarn-k6v5` | none | 5.9375 | 5.951 | 5.95 |
+| `kvarn-k6v5` | 256 | 5.9375 | 5.966 | 5.97 |
+| `kvarn-k6v5` | 1024 | 5.9375 | 6.013 | 6.01 |
+| `kvarn-k6v5` | 2048 | 5.9375 | 6.076 | 6.08 |
+
+Teacher-forced comparison against the FP16-KV teacher: three corpora, the 256
+positions after each 4K/32K/128K prefix, one tokenization and one history
+(design D14/D17; corpus 1 / 32K excluded by the pre-registered teacher-NLL
+rule). KL is KL(teacher ‖ candidate) in nats, top-1 is teacher-argmax agreement,
+ΔNLL is the teacher-token NLL difference (candidate − teacher). No non-finite
+logits occurred. The probes are phase-0 approximations (design D13); phase 1
+implements the production read path.
+
+| Preset | Tail | Depth | Mean KL | Median KL | P99.9 KL | Top-1 | ΔNLL |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `kvarn-k4v4` | none | 4K | 0.24927 | 0.000261 | 15.475 | 0.9479 | +0.01343 |
+| `kvarn-k4v4` | none | 32K | 0.35534 | 0.000842 | 19.428 | 0.9277 | +0.09796 |
+| `kvarn-k4v4` | none | 128K | 0.44308 | 0.000368 | 21.991 | 0.9154 | +0.08163 |
+| `kvarn-k4v4` | 256 | 4K | 0.17350 | 0.000148 | 13.607 | 0.9583 | -0.03365 |
+| `kvarn-k4v4` | 256 | 32K | 0.22953 | 0.000456 | 17.052 | 0.9336 | -0.00896 |
+| `kvarn-k4v4` | 256 | 128K | 0.29218 | 0.000185 | 17.803 | 0.9375 | +0.04018 |
+| `kvarn-k4v4` | 1024 | 4K | 0.09675 | 0.000060 | 10.346 | 0.9727 | -0.00972 |
+| `kvarn-k4v4` | 1024 | 32K | 0.21262 | 0.000211 | 17.179 | 0.9473 | -0.06917 |
+| `kvarn-k4v4` | 1024 | 128K | 0.27590 | 0.000180 | 17.832 | 0.9427 | +0.12797 |
+| `kvarn-k4v4` | 2048 | 4K | 0.04373 | 0.000043 | 6.880 | 0.9792 | +0.00564 |
+| `kvarn-k4v4` | 2048 | 32K | 0.16413 | 0.000191 | 13.909 | 0.9473 | -0.01222 |
+| `kvarn-k4v4` | 2048 | 128K | 0.16229 | 0.000073 | 15.127 | 0.9518 | +0.01625 |
+| `kvarn-k5v4` | none | 4K | 0.23700 | 0.000163 | 13.857 | 0.9583 | -0.05671 |
+| `kvarn-k5v4` | none | 32K | 0.17164 | 0.000582 | 16.873 | 0.9570 | -0.00279 |
+| `kvarn-k5v4` | none | 128K | 0.21613 | 0.000100 | 18.941 | 0.9466 | -0.05385 |
+| `kvarn-k5v4` | 256 | 4K | 0.14301 | 0.000095 | 13.172 | 0.9661 | -0.03229 |
+| `kvarn-k5v4` | 256 | 32K | 0.13826 | 0.000214 | 13.153 | 0.9551 | -0.05032 |
+| `kvarn-k5v4` | 256 | 128K | 0.20961 | 0.000080 | 16.935 | 0.9570 | +0.06301 |
+| `kvarn-k5v4` | 1024 | 4K | 0.06006 | 0.000048 | 8.950 | 0.9714 | +0.01540 |
+| `kvarn-k5v4` | 1024 | 32K | 0.14627 | 0.000179 | 15.231 | 0.9512 | +0.02877 |
+| `kvarn-k5v4` | 1024 | 128K | 0.13445 | 0.000068 | 16.345 | 0.9596 | +0.05124 |
+| `kvarn-k5v4` | 2048 | 4K | 0.01522 | 0.000031 | 1.884 | 0.9805 | +0.01889 |
+| `kvarn-k5v4` | 2048 | 32K | 0.19446 | 0.000316 | 17.768 | 0.9453 | -0.05213 |
+| `kvarn-k5v4` | 2048 | 128K | 0.09981 | 0.000049 | 14.053 | 0.9661 | -0.02620 |
+| `kvarn-k5v5` | none | 4K | 0.13607 | 0.000078 | 13.494 | 0.9674 | -0.00943 |
+| `kvarn-k5v5` | none | 32K | 0.26603 | 0.000223 | 22.323 | 0.9512 | +0.06888 |
+| `kvarn-k5v5` | none | 128K | 0.16526 | 0.000057 | 18.579 | 0.9583 | -0.03585 |
+| `kvarn-k5v5` | 256 | 4K | 0.06705 | 0.000050 | 9.302 | 0.9753 | +0.04035 |
+| `kvarn-k5v5` | 256 | 32K | 0.21720 | 0.000228 | 21.116 | 0.9512 | +0.10954 |
+| `kvarn-k5v5` | 256 | 128K | 0.14140 | 0.000055 | 17.297 | 0.9596 | +0.00150 |
+| `kvarn-k5v5` | 1024 | 4K | 0.05964 | 0.000034 | 7.945 | 0.9792 | +0.01916 |
+| `kvarn-k5v5` | 1024 | 32K | 0.16733 | 0.000118 | 21.738 | 0.9629 | +0.01690 |
+| `kvarn-k5v5` | 1024 | 128K | 0.16189 | 0.000043 | 16.857 | 0.9557 | +0.01494 |
+| `kvarn-k5v5` | 2048 | 4K | 0.02698 | 0.000020 | 3.645 | 0.9805 | +0.00985 |
+| `kvarn-k5v5` | 2048 | 32K | 0.08016 | 0.000112 | 7.796 | 0.9668 | +0.04783 |
+| `kvarn-k5v5` | 2048 | 128K | 0.10445 | 0.000036 | 13.538 | 0.9635 | +0.02374 |
+| `kvarn-k6v5` | none | 4K | 0.09385 | 0.000053 | 14.071 | 0.9753 | +0.03815 |
+| `kvarn-k6v5` | none | 32K | 0.19179 | 0.000138 | 20.771 | 0.9590 | +0.09377 |
+| `kvarn-k6v5` | none | 128K | 0.11192 | 0.000046 | 9.961 | 0.9570 | +0.01205 |
+| `kvarn-k6v5` | 256 | 4K | 0.11230 | 0.000036 | 16.445 | 0.9727 | +0.05246 |
+| `kvarn-k6v5` | 256 | 32K | 0.10684 | 0.000120 | 13.021 | 0.9609 | +0.05789 |
+| `kvarn-k6v5` | 256 | 128K | 0.13560 | 0.000044 | 16.691 | 0.9661 | -0.00048 |
+| `kvarn-k6v5` | 1024 | 4K | 0.02867 | 0.000025 | 2.966 | 0.9714 | +0.00301 |
+| `kvarn-k6v5` | 1024 | 32K | 0.15900 | 0.000101 | 20.632 | 0.9648 | +0.03745 |
+| `kvarn-k6v5` | 1024 | 128K | 0.09695 | 0.000028 | 14.456 | 0.9661 | +0.03620 |
+| `kvarn-k6v5` | 2048 | 4K | 0.01502 | 0.000023 | 1.645 | 0.9779 | -0.00611 |
+| `kvarn-k6v5` | 2048 | 32K | 0.07043 | 0.000076 | 11.131 | 0.9727 | +0.01227 |
+| `kvarn-k6v5` | 2048 | 128K | 0.10306 | 0.000023 | 14.848 | 0.9661 | +0.06929 |
+
+Gate (design D17): each judged metric (mean KL, median KL, large-deviation rate,
+top-1 disagreement rate) is mapped to its q8→q4 interpolated position p per
+depth, and the worst p must be ≤ 0.15 for the quality-first preset and ≤ 1 for
+the memory-first preset. `kvarn-k6v5` tail 2048 passes at worst p 0.143 (128K
+large-deviation rate); `kvarn-k4v4` tail 256 passes at worst p 0.971 (128K
+large-deviation rate). P99.9 KL and ΔNLL are recorded but not judged.
+
+Reproduce (design D16):
+
+```sh
+python3 tools/qwen27b/kvarn_quality.py report --label g0-tail --gate
+```
+
 ## Images
 
 Use the matching `mmproj-BF16.gguf` beside the target or pass `--mmproj PATH`.

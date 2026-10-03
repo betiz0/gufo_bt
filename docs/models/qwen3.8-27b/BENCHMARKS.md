@@ -157,6 +157,50 @@ C1, context capacity 262144, DFlash2. Cold target/draft files to HTTP readiness.
 
 ![Loading time](artifacts/charts/loading.svg)
 
+## KVarN KV read path
+
+AMD Strix Halo `gfx1151`, Qwen27B Q8_0, `gufo bench --n-prompt 2048 --n-gen 128`,
+one warmed measurement per point, ratio against the mean of the two FP16 runs
+that bracket each depth (design D16). Contract: AR tg ≥ 0.95× FP16 at depth
+0–4K, ≥ 1.00× at depth 32K and above, and at 128K for the memory-first preset
+`kvarn-k4v4` R ≥ 1 + f·G* with f = 0.5, where G* is the ideal gain computed
+from the same measurement series (design D18).
+
+<!-- bench:kvarn-ar -->
+| Qwen27B Q8 AR tg128 (tok/s) | d0 | d4,096 | d32,768 | d131,072 |
+| --- | ---: | ---: | ---: | ---: |
+| fp16 (reference) | 7.69 | 7.63 | 7.19 | 6.03 |
+| kvarn-k4v4, tail unset | 7.64 | 7.50 | 6.73 | 4.90 |
+| kvarn-k4v4, tail 2048 | 7.64 | 7.49 | 6.70 | 4.88 |
+| kvarn-k5v4, tail unset | 7.64 | 7.47 | 6.54 | 4.51 |
+| kvarn-k5v4, tail 2048 | 7.64 | 7.48 | 6.49 | 4.48 |
+| kvarn-k6v5, tail unset | 7.64 | 7.42 | 6.20 | 3.88 |
+| kvarn-k6v5, tail 2048 | 7.64 | 7.45 | 6.15 | 3.86 |
+
+Ratios to the FP16 reference: 0.99 at d0, 0.97–0.98 at d4K, 0.86–0.94 at
+d32K, and 0.64–0.81 at d128K. Only the d0 and d4K floors (≥ 0.95) are met; the
+d32K and d128K floors (≥ 1.00, and R ≥ 1 + 0.5·G* for `kvarn-k4v4` at d128K,
+design D18) are not (G1 fails).
+<!-- /bench -->
+
+Measured scope: one `gufo bench --n-prompt 2048 --n-gen 128` run per point, so
+the difference to the FP16 point of the same depth is the KVarN read-path cost
+(the model's projections, the recurrent layers and the KV writes are otherwise
+identical). At d32K that cost is 17.6 ms of a 148.6 ms token (was 41.4 ms with
+the per-key decoder of the phase-1 baseline) and at d128K 73 ms of a 204 ms
+token (was 166 ms); FP16's read of the same keys costs 8 ms and 35 ms.
+
+That is the whole gap: FP16's read is bandwidth-bound at the machine's
+~245 GB/s, moving 8.6 GB of FP16 KV per token, while the `kvarn-k4v4` body is
+2.1 GB. The contract's 1.15× at d128K therefore allows the KVarN read about
+14 ms in total, only ~5 ms above its own memory floor. The per-key online
+softmax alone (the 256-key dot product, the value accumulation, the five-step
+lane reduction and three exponentials, for 24 heads x 131072 keys x 16
+full-attention layers) issues roughly 370 warp instructions per query head and
+key at about 62% issue efficiency, which is more than that budget; the tile
+staging that removes two thirds of those instructions instead costs occupancy
+(74 -> 107 VGPRs; see [experiments](EXPERIMENTS.md)) and measured slower.
+
 ## Memory occupation
 
 C1, context capacity 262144, AR. Peak memory reported by HIP.

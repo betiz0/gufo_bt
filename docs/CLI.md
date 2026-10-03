@@ -87,12 +87,27 @@ The supported modalities are LLM, image, video, and audio (TTS, ASR).
 - `cacheDiskStagingBytes` — scratch space used while writing new cache
   entries. Must fit alongside `cacheDiskBytes`.
 
+**KV cache (long-context memory and speed)**
+
+- `--kv-cache` — KV cache format for Qwen3.8 27B: `fp16` (default),
+  `kvarn-k4v4` (memory-first), `kvarn-k5v4` (intermediate), or `kvarn-k6v5`
+  (quality-first). KVarN stores the full-attention KV quantized (sink + sealed
+  128-token tiles + an F16 tail), cutting long-context KV memory and read
+  bandwidth at a small quality cost. Only Qwen3.8 27B accepts this option; any
+  other model rejects it, including an explicit `fp16`.
+- `--kv-cache-tail <N>` — KVarN only, an integer from 256 to 2048: extra
+  full-precision (F16) tail tokens kept behind each sealed tile. Omitted means
+  no tail tokens are added (the structural minimum). Fitting tails:
+  `kvarn-k4v4` 256, `kvarn-k5v4` none, `kvarn-k6v5` 2048. Specifying it without
+  a KVarN preset, outside the range, or on another model is a startup error.
+- The default stays `fp16`, so existing outputs, snapshots, compatibility keys
+  and `.kvc` disk caches are unchanged. The startup log and `gufo bench` report
+  the selected format, the tail length (or none), the effective bpv (body and
+  total) and the per-session KV capacity.
+
 **Speculative decoding**
 
-A draft model proposes tokens for the target model to verify. Greedy decoding
-must reproduce the target's tokens; sampled decoding must preserve the target's
-distribution, but need not match an autoregressive run's sequence for the same
-seed. Speed depends on acceptance and verification cost.
+A draft model proposes tokens for the target model to verify.
 
 - `speculative` — `dflash2` for Qwen3.8-27B, `dspark` for DeepSeek V4 Flash,
   `mtp` for models with a supported MTP head, or `off`. HTTP serving
