@@ -105,6 +105,23 @@ The supported modalities are LLM, image, video, and audio (TTS, ASR).
   the selected format, the tail length (or none), the effective bpv (body and
   total) and the per-session KV capacity.
 
+KVarN is a KV-memory feature and is slower than FP16 KV for long-context
+generation: it passes the shallow floors (AR tg ≥ 0.95× FP16 at depth 0–4K,
+DFlash2 tg ≥ 0.95× at depth 0, C8 ≥ 0.95×, startup ≤ +5%, p99/p50 ≤ 1.05×) and
+loses speed as the context grows. Measured `tg ratio / pp ratio` against FP16
+KV at the same depth (Q8_0, G1 2026-10-03; the depth 32K/128K tg and all-depth
+pp ratios are the recorded reference values, and later judgments must keep the
+same point at ≥ 0.97× of them):
+
+| Preset | Tail | d0 | 4K | 32K | 128K |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `kvarn-k4v4` | none | 0.996 / 0.925 | 0.986 / 0.922 | 0.949 / 0.890 | 0.843 / 0.826 |
+| `kvarn-k4v4` | 2048 | 0.996 / 0.985 | 0.987 / 0.922 | 0.943 / 0.894 | 0.838 / 0.840 |
+| `kvarn-k5v4` | none | 0.996 / 0.924 | 0.982 / 0.921 | 0.914 / 0.889 | 0.753 / 0.822 |
+| `kvarn-k5v4` | 2048 | 0.996 / 0.985 | 0.984 / 0.921 | 0.910 / 0.894 | 0.752 / 0.835 |
+| `kvarn-k6v5` | none | 0.996 / 0.924 | 0.974 / 0.921 | 0.860 / 0.887 | 0.632 / 0.816 |
+| `kvarn-k6v5` | 2048 | 0.996 / 0.985 | 0.979 / 0.920 | 0.854 / 0.891 | 0.631 / 0.830 |
+
 **Speculative decoding**
 
 A draft model proposes tokens for the target model to verify.

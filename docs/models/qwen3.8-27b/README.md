@@ -66,6 +66,26 @@ the session KV capacity in GiB equals the total bpv. FP16 KV is 16.00 GiB.
 | `kvarn-k6v5` | 1024 | 5.9375 | 6.013 | 6.01 |
 | `kvarn-k6v5` | 2048 | 5.9375 | 6.076 | 6.08 |
 
+Speed (design D19). KVarN trades speed for KV memory: it passes the shallow
+floors (AR tg ≥ 0.95× FP16 at depth 0–4K) and is slower than FP16 KV in
+long-context generation. The table is the G1 measurement (2026-10-03, Q8_0,
+three series, `pp` median of three; see [benchmarks](BENCHMARKS.md)). The depth
+32K/128K tg ratios and the all-depth pp ratios are the recorded **reference
+values**: later judgments must keep the same point at ≥ 0.97× of them.
+
+| Preset | Tail | d0 | 4K | 32K | 128K |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `kvarn-k4v4` | none | 0.996 / 0.925 | 0.986 / 0.922 | 0.949 / 0.890 | 0.843 / 0.826 |
+| `kvarn-k4v4` | 2048 | 0.996 / 0.985 | 0.987 / 0.922 | 0.943 / 0.894 | 0.838 / 0.840 |
+| `kvarn-k5v4` | none | 0.996 / 0.924 | 0.982 / 0.921 | 0.914 / 0.889 | 0.753 / 0.822 |
+| `kvarn-k5v4` | 2048 | 0.996 / 0.985 | 0.984 / 0.921 | 0.910 / 0.894 | 0.752 / 0.835 |
+| `kvarn-k6v5` | none | 0.996 / 0.924 | 0.974 / 0.921 | 0.860 / 0.887 | 0.632 / 0.816 |
+| `kvarn-k6v5` | 2048 | 0.996 / 0.985 | 0.979 / 0.920 | 0.854 / 0.891 | 0.631 / 0.830 |
+
+Cells are `tg ratio / pp ratio` against FP16 KV at the same depth. The benefit
+is the KV memory of many long-context sessions (16.0 GiB → 4.45–6.08 GiB per
+262K session), not single-session long-context speed.
+
 Teacher-forced comparison against the FP16-KV teacher: three corpora, the 256
 positions after each 4K/32K/128K prefix, one tokenization and one history
 (design D14/D17; corpus 1 / 32K excluded by the pre-registered teacher-NLL

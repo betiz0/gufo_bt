@@ -159,54 +159,70 @@ C1, context capacity 262144, DFlash2. Cold target/draft files to HTTP readiness.
 
 ## KVarN KV read path
 
-AMD Strix Halo `gfx1151`, Qwen27B Q8_0, `gufo bench --n-prompt 2048 --n-gen 128`,
-one warmed measurement per point, ratio against the mean of the two FP16 runs
-that bracket each depth (design D16). Contract: AR tg ≥ 0.95× FP16 at depth
-0–4K, ≥ 1.00× at depth 32K and above, and at 128K for the memory-first preset
-`kvarn-k4v4` R ≥ 1 + f·G* with f = 0.5, where G* is the ideal gain computed
-from the same measurement series (design D18).
+AMD Strix Halo `gfx1151`, Qwen27B Q8_0
+(`Qwen3.8-27B-Q8_0.gguf`, SHA-256 `d17816b6…`), `gufo bench --n-prompt 2048
+--n-gen 128 --n-depth …`, three measurement series, one warmed run per point.
+`pp` is the median of the three series, `tg` comes from the same series, and
+FP16 KV is measured inside every series (designs D16/D19).
+
+Contract (D19): the floors are AR tg ≥ 0.95× FP16 at depth 0–4K, DFlash2 tg
+≥ 0.95× at depth 0, C8 aggregate throughput ≥ 0.95×, startup time worsening
+≤ 5%, and generation token-to-token p99/p50 ≤ 1.05× FP16's. Depth 32K and above
+AR tg and all-depth pp have no floor: the FP16 ratios below are the recorded
+**reference values**, and later judgments (G2, G4/T-09) must keep the same point
+at ≥ 0.97× of them. KVarN is a KV-memory feature and is expected to be slower
+than FP16 KV for long-context single-session generation.
 
 <!-- bench:kvarn-ar -->
-| Qwen27B Q8 AR tg128 (tok/s) | d0 | d4,096 | d32,768 | d131,072 |
+| Qwen27B Q8 AR tg128 (tok/s) / FP16 ratio | d0 | d4,096 | d32,768 | d131,072 |
 | --- | ---: | ---: | ---: | ---: |
-| fp16 (reference) | 7.69 | 7.62 | 7.19 | 6.04 |
-| kvarn-k4v4, tail unset | 7.66 | 7.50 | 6.65 | 4.75 |
-| kvarn-k4v4, tail 2048 | 7.66 | 7.52 | 6.60 | 4.71 |
-| kvarn-k5v4, tail unset | 7.66 | 7.47 | 6.45 | 4.34 |
-| kvarn-k5v4, tail 2048 | 7.66 | 7.49 | 6.38 | 4.32 |
-| kvarn-k6v5, tail unset | 7.66 | 7.42 | 6.07 | 3.66 |
-| kvarn-k6v5, tail 2048 | 7.66 | 7.44 | 6.03 | 3.65 |
+| fp16 (reference) | 7.70 | 7.64 | 7.20 | 6.04 |
+| kvarn-k4v4, tail unset | 7.67 / 0.996 | 7.53 / 0.986 | 6.83 / 0.949 | 5.09 / 0.843 |
+| kvarn-k4v4, tail 2048 | 7.67 / 0.996 | 7.54 / 0.987 | 6.79 / 0.943 | 5.06 / 0.838 |
+| kvarn-k5v4, tail unset | 7.67 / 0.996 | 7.50 / 0.982 | 6.58 / 0.914 | 4.55 / 0.753 |
+| kvarn-k5v4, tail 2048 | 7.67 / 0.996 | 7.52 / 0.984 | 6.55 / 0.910 | 4.54 / 0.752 |
+| kvarn-k6v5, tail unset | 7.67 / 0.996 | 7.44 / 0.974 | 6.19 / 0.860 | 3.82 / 0.632 |
+| kvarn-k6v5, tail 2048 | 7.67 / 0.996 | 7.48 / 0.979 | 6.15 / 0.854 | 3.81 / 0.631 |
 
-Ratios to the FP16 reference: 0.996 at d0, 0.974–0.987 at d4K, 0.839–0.926 at
-d32K, and 0.605–0.787 at d128K. Only the d0 and d4K floors (≥ 0.95) are met; the
-d32K and d128K floors (≥ 1.00, and R ≥ 1 + 0.5·G* = 1.092/1.090 for
-`kvarn-k4v4` at d128K, design D18) are not, so G1 fails and the performance
-work stops for a user decision (D18).
+| Qwen27B Q8 pp2048 (tok/s) / FP16 ratio | d0 | d4,096 | d32,768 | d131,072 |
+| --- | ---: | ---: | ---: | ---: |
+| fp16 (reference) | 328.89 | 320.63 | 283.93 | 204.50 |
+| kvarn-k4v4, tail unset | 304.09 / 0.925 | 295.78 / 0.922 | 252.69 / 0.890 | 168.97 / 0.826 |
+| kvarn-k4v4, tail 2048 | 323.85 / 0.985 | 295.51 / 0.922 | 253.91 / 0.894 | 171.74 / 0.840 |
+| kvarn-k5v4, tail unset | 304.05 / 0.924 | 295.46 / 0.921 | 252.41 / 0.889 | 168.13 / 0.822 |
+| kvarn-k5v4, tail 2048 | 324.11 / 0.985 | 295.39 / 0.921 | 253.77 / 0.894 | 170.85 / 0.835 |
+| kvarn-k6v5, tail unset | 303.88 / 0.924 | 295.30 / 0.921 | 251.71 / 0.887 | 166.88 / 0.816 |
+| kvarn-k6v5, tail 2048 | 323.91 / 0.985 | 295.10 / 0.920 | 253.00 / 0.891 | 169.65 / 0.830 |
 
-Measured 2026-10-03 with the host toolchain (ROCm 7.14, host glibc 2.43; Q8_0,
-`artifacts/g1sys`): the `nix develop` build links ROCm's raw `hipClang` without
-the nixpkgs compiler wrapper and mixes host glibc 2.43 with the store's glibc
-2.42, so that binary cannot start here. `python3 tools/qwen27b/g1.py evaluate
---artifacts artifacts/g1sys` reproduces the table.
+The tg floor passes for every preset and tail (0.974–0.996 at depth 0–4K), so
+G1 is met under D19. The depth 32K/128K tg ratios (0.632–0.949) and the
+all-depth pp ratios (0.816–0.985) are the reference values G1 records; later
+judgments must stay at ≥ 0.97× of the same point. The depth-0 `pp` spread
+between tail unset and tail 2048 (0.925 against 0.985) is recorded as measured.
+
+Measured 2026-10-03 with the host toolchain (ROCm 7.14, host glibc 2.43): the
+`nix develop` build links ROCm's raw `hipClang` without the nixpkgs compiler
+wrapper and mixes host glibc 2.43 with the store's glibc 2.42, so that binary
+cannot start here. Reproduce with:
+`for r in 1 2 3; do python3 tools/qwen27b/g1.py run --binary build/release/gufo
+--out artifacts/g1d19-r$r; python3 tools/qwen27b/g1.py wait --out
+artifacts/g1d19-r$r; done && python3 tools/qwen27b/g1_d19.py --artifacts
+artifacts` (logs under `artifacts/g1d19-r{1,2,3}`, summary
+`artifacts/g1d19-summary.json`).
 <!-- /bench -->
 
-Measured scope: one `gufo bench --n-prompt 2048 --n-gen 128` run per point, so
-the difference to the FP16 point of the same depth is the KVarN read-path cost
-(the model's projections, the recurrent layers and the KV writes are otherwise
-identical). At d32K that cost is 17.6 ms of a 148.6 ms token (was 41.4 ms with
-the per-key decoder of the phase-1 baseline) and at d128K 73 ms of a 204 ms
-token (was 166 ms); FP16's read of the same keys costs 8 ms and 35 ms.
-
-That is the whole gap: FP16's read is bandwidth-bound at the machine's
-~245 GB/s, moving 8.6 GB of FP16 KV per token, while the `kvarn-k4v4` body is
-2.1 GB. The contract's 1.15× at d128K therefore allows the KVarN read about
-14 ms in total, only ~5 ms above its own memory floor. The per-key online
-softmax alone (the 256-key dot product, the value accumulation, the five-step
-lane reduction and three exponentials, for 24 heads x 131072 keys x 16
-full-attention layers) issues roughly 370 warp instructions per query head and
-key at about 62% issue efficiency, which is more than that budget; the tile
-staging that removes two thirds of those instructions instead costs occupancy
-(74 -> 107 VGPRs; see [experiments](EXPERIMENTS.md)) and measured slower.
+Measured scope: the difference to the FP16 point of the same depth is the KVarN
+read-path cost (the model's projections, the recurrent layers and the KV writes
+are otherwise identical). With the retained per-key read (`kKeyBlock = 1`), that
+cost is 16.0 ms of a 146.4 ms token for `kvarn-k4v4` tail unset at d32K and
+66.1 ms of a 196.5 ms token at d128K; FP16's read of the same keys costs 9.0 ms
+and 35.7 ms. FP16 is bandwidth-bound (8.6 GB of KV per token at ~240 GB/s) while
+the `kvarn-k4v4` body is 2.4 GB, so the memory saving is real, but the per-key
+dequantization compute dominates: measured cache-resident it is 53.9 ms per 128K
+token for `kvarn-k4v4` (121.5 ms for `kvarn-k6v5`) against FP16's 33.9 ms. The
+key-block variants (2/4/8 keys) all measured slower than per-key. See
+[experiments](EXPERIMENTS.md) for the sweep, the compute-only measurement, and
+the memory-side motivation (`proposal.md`).
 
 ## Memory occupation
 
