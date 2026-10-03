@@ -903,6 +903,52 @@ int main(int argc, const char* const* argv) {
       Expect(incompatible_result.tokens == direct_continuation,
              "Qwen compatibility miss changed cold execution");
 
+      // KVarN carries a distinct disk-cache identity (design D9): it must not
+      // reuse the FP16 entry even with the same artifact fingerprint, the same
+      // preset and tail must reuse its own entry, and another preset or tail
+      // must be a cold miss.
+      const gufo::server::TextKvCacheConfig kvarn_k4v4{.value = "kvarn-k4v4"};
+      const gufo::server::TextKvCacheConfig kvarn_k4v4_tail{
+          .value = "kvarn-k4v4", .tail_tokens = 2048};
+      const gufo::server::TextKvCacheConfig kvarn_k6v5{.value = "kvarn-k6v5"};
+      {
+        gufo::server::InferenceBackend kvarn_writer;
+        Expect(kvarn_writer.load(model, &error, context, 1, {}, {}, {},
+                                 disk_cache, kvarn_k4v4),
+               error);
+        const auto kvarn_cold =
+            kvarn_writer.chat(cache_request(continued_messages), 2, {});
+        Expect(!kvarn_cold.cache_hit && !kvarn_cold.cache_disk_hit,
+               "a KVarN backend must not reuse the FP16 disk cache");
+        Expect(kvarn_cold.tokens == direct_continuation,
+               "the KVarN cold miss changed cold execution");
+        (void)kvarn_writer.chat(cache_request(messages), 2, {});
+      }
+      {
+        gufo::server::InferenceBackend kvarn_restart;
+        Expect(kvarn_restart.load(model, &error, context, 1, {}, {}, {},
+                                  disk_cache, kvarn_k4v4),
+               error);
+        const auto kvarn_hit =
+            kvarn_restart.chat(cache_request(continued_messages), 2, {});
+        Expect(kvarn_hit.cache_hit && kvarn_hit.cache_disk_hit,
+               "the same KVarN preset and tail must reuse its disk cache");
+        Expect(kvarn_hit.tokens == direct_continuation,
+               "the KVarN disk restore changed continuation tokens");
+      }
+      for (const auto& other : {kvarn_k4v4_tail, kvarn_k6v5}) {
+        gufo::server::InferenceBackend kvarn_other;
+        Expect(kvarn_other.load(model, &error, context, 1, {}, {}, {},
+                                disk_cache, other),
+               error);
+        const auto kvarn_mismatch =
+            kvarn_other.chat(cache_request(continued_messages), 2, {});
+        Expect(!kvarn_mismatch.cache_hit && !kvarn_mismatch.cache_disk_hit,
+               "a different KVarN preset or tail must be a cold miss");
+        Expect(kvarn_mismatch.tokens == direct_continuation,
+               "the KVarN identity miss changed cold execution");
+      }
+
       if (draft_model_path != nullptr) {
         const gufo::server::TextSpeculativeConfig dflash_config{
             .backend = gufo::server::TextSpeculativeBackend::kDFlash,
