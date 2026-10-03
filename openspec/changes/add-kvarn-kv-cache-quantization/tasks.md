@@ -83,8 +83,11 @@ ID（T-01〜T-09、G0〜G4）の定義は design.md の「検証 ID と成果物
 - [x] 4.3 GEMM 経路（`LaunchBatchedAttentionGemm`、テスト・ベンチ専用）を KVarN 選択時に明示的なエラーにする。完了条件: KVarN 記述子を渡して GEMM 経路を呼ぶテストで、FP16 や FP32 へ黙って切り替わらずにエラーになる
 - [ ] 4.4 DFlash2 と AR の一貫性を確認する（深度 0〜128K、封印境界を検証窓に含むケースを含む）。スイートは design D16 の実行方法で、構成ごとに結果を書き出して再開できるように実行する。完了条件: 既存の一貫性スイート（`tools/bench/speculative-corpus.py`、160 リクエスト規模）を `serve llm --kv-cache <preset>` で全 KVarN プリセットについてテール長未指定と `--kv-cache-tail 2048` の両方で実行し、greedy の不一致が 0 件である
 - [ ] 4.5 **G2** を判定する（pp と DFlash2 tg）。測定は design D16 の実行方法で行い、測定重みと未達時の扱いは design D18、判定の内容は design D19 に従う。完了条件: Q8_0 の重みで、既存のベンチマーク手法（同じ測定系列の FP16 と交互、pp は各点 3 回の中央値）により、すべての KVarN プリセットについてテール長未指定と L = 2048 の両方で、各深度の pp の FP16 比が 3.11 で記録した基準値の 0.97 倍以上、DFlash2 tg が深度 0 で 0.95 倍以上であることを `gufo bench` で確認し、深度 32K 以上の DFlash2 tg の FP16 比を基準値として記録する。未達の場合は design D18 のとおり利用者に返す
-- [ ] 4.6 フェーズ 2 の結果を `EXPERIMENTS.md`（採否 1 行）、`QUALITY.md`（品質証拠）、`BENCHMARKS.md`（速度）に記録する。完了条件: 記録した再現コマンドがそのまま実行できる
-- [ ] 4.7 prefill の封印と KVarN 読み出しのコストを分解して記録する（G1 の測定で pp は 24 点中 21 点が FP16 比 0.82〜0.94、テール長未指定は深度 0 でも 0.92 前後）。design D19 により合否には使わず、文書で pp の低下を説明するために行う。完了条件: 深度 0・32K・128K で、チャンク内封印、チャンクフラッシュ、tile / WMMA / batched の読み出しの各時間を FP16 の同じ区間と並べて `EXPERIMENTS.md` に記録する
+  - 結果（2026-10-04）: pp の再確認は**合格**（G2 の pp FP16 比は同一点の G1 値の 1.00〜1.01 倍で、いずれも基準値の 0.97 倍以上）。**DFlash2 の深度 0 の下限（0.95）は未達**: `kvarn-k4v4` 13.78 t/s 対 FP16 23.47（0.588）、`kvarn-k6v5` 2048 13.78（0.587）。DFlash2 tg の FP16 比（基準値として記録）: d0 0.587〜0.588、4K 0.728〜0.866、32K 0.574〜0.627、128K 0.367〜0.439。原因: 投機検証は 1 ステップで最大 8 行を読むため、KVarN 読み出しの計算（キャッシュ常駐で 1.07 ns/query-head-key、FP16 は 0.67）が短い文脈でも支配する。封印の起動（1 ステップ 16 回）は無視できる。design D18/D19 に従い**停止して利用者に返す**。記録: `EXPERIMENTS.md`、`BENCHMARKS.md`、`artifacts/g2d19-summary.json`。
+- [x] 4.6 フェーズ 2 の結果を `EXPERIMENTS.md`（採否 1 行）、`QUALITY.md`（品質証拠）、`BENCHMARKS.md`（速度）に記録する。完了条件: 記録した再現コマンドがそのまま実行できる
+  - 根拠（2026-10-04）: `EXPERIMENTS.md` に prefill コスト分解と G2 判定、`BENCHMARKS.md` に DFlash2 の tg/pp 比と G2 の結論、`QUALITY.md` にはフェーズ 2 で追加の品質証拠なし（品質は G0 と T-08 が担う）。各記録に再現コマンド（`g1.py`＋`g1_d19.py`／`prof.py`）を併記。
+- [x] 4.7 prefill の封印と KVarN 読み出しのコストを分解して記録する（G1 の測定で pp は 24 点中 21 点が FP16 比 0.82〜0.94、テール長未指定は深度 0 でも 0.92 前後）。design D19 により合否には使わず、文書で pp の低下を説明するために行う。完了条件: 深度 0・32K・128K で、チャンク内封印、チャンクフラッシュ、tile / WMMA / batched の読み出しの各時間を FP16 の同じ区間と並べて `EXPERIMENTS.md` に記録する
+  - 根拠（2026-10-04）: `EXPERIMENTS.md` の「KVarN prefill cost decomposition」に記録。`kvarn-k4v4` の封印 909 / 9,242 / 34,021 ms、チャンクフラッシュ 1.2 / 5.6 / 20.5 ms、`Kvarn` decode 読み出し 88.6 / 2,665 / 32,299 ms（d0/32K/128K）、prefill の tile/WMMA/batched 読みは attention ステージ差分として +20.6 / +1,152 / +18,260 ms。封印が最大の要因。
 
 ## 5. フェーズ 3: 状態と報告
 

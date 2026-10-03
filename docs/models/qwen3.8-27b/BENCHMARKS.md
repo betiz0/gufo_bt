@@ -211,6 +211,14 @@ artifacts` (logs under `artifacts/g1d19-r{1,2,3}`, summary
 `artifacts/g1d19-summary.json`).
 <!-- /bench -->
 
+DFlash2 (speculative decoding), same series, `gufo bench --speculative dflash2`:
+FP16 tg 23.47 / 17.99 / 38.45 / 7.47 t/s at d0 / 4K / 32K / 128K; the KVarN
+DFlash2 tg FP16 ratios are d0 0.587–0.588, 4K 0.728–0.866, 32K 0.574–0.627,
+128K 0.367–0.439 (the depth 32K+ values are recorded reference values). The D19
+depth-0 DFlash2 floor (0.95) is not met, so the performance work stops for a
+user decision (D18/D19). The pp re-check passes: every G2 pp ratio is 1.00–1.01×
+of the G1 value at the same point, i.e. ≥ 0.97× of the recorded reference.
+
 Measured scope: the difference to the FP16 point of the same depth is the KVarN
 read-path cost (the model's projections, the recurrent layers and the KV writes
 are otherwise identical). With the retained per-key read (`kKeyBlock = 1`), that

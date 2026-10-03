@@ -28,14 +28,27 @@ TG_FLOOR_DEPTHS = (0, 4096)
 TG_FLOOR = 0.95
 
 
-def read(path: Path, depth: int, metric: str) -> float | None:
+def read(path: Path, depth: int, base: str, suffix: str = "") -> float | None:
     if not path.exists():
         return None
-    want = metric if depth == 0 else f"{metric} @ d{depth}"
+    want = (base if depth == 0 else f"{base} @ d{depth}") + suffix
     for line in path.read_text(errors="replace").splitlines():
         match = ROW.match(line)
         if match and match.group("test").strip() == want:
             return float(match.group("mean"))
+    return None
+
+
+# Speculative runs name the generation row `tg128-dflash2` (and
+# `tg128 @ d<depth>-dflash2`); accept either spelling.
+TG_NAMES = (("tg128", ""), ("tg128", "-dflash2"))
+
+
+def read_tg(path: Path, depth: int) -> float | None:
+    for base, suffix in TG_NAMES:
+        value = read(path, depth, base, suffix)
+        if value is not None:
+            return value
     return None
 
 
@@ -58,17 +71,21 @@ def main() -> int:
     kvarn: dict[tuple[str, int], dict[str, float | None]] = {}
     for depth in DEPTHS:
         fp16[depth] = {
-            metric: median(
-                [read(root / f"{args.series_prefix}{r}" / f"fp16_d{depth}.log", depth, metric)
-                 for r in SERIES])
-            for metric in ("pp2048", "tg128")
+            "pp2048": median(
+                [read(root / f"{args.series_prefix}{r}" / f"fp16_d{depth}.log", depth, "pp2048")
+                 for r in SERIES]),
+            "tg128": median(
+                [read_tg(root / f"{args.series_prefix}{r}" / f"fp16_d{depth}.log", depth)
+                 for r in SERIES]),
         }
         for tag in KVARN:
             kvarn[(tag, depth)] = {
-                metric: median(
+                "pp2048": median(
                     [read(root / f"{args.series_prefix}{r}" / f"{tag}_d{depth}.log", depth,
-                          metric) for r in SERIES])
-                for metric in ("pp2048", "tg128")
+                          "pp2048") for r in SERIES]),
+                "tg128": median(
+                    [read_tg(root / f"{args.series_prefix}{r}" / f"{tag}_d{depth}.log", depth)
+                     for r in SERIES]),
             }
 
     summary: dict = {"model_sha256": None, "fp16": {}, "presets": {},
