@@ -52,7 +52,7 @@ constexpr std::uint32_t kLanes = 32;
 constexpr std::uint32_t kVectorWidth = kHeadDim / 4;
 constexpr std::uint32_t kVectorsPerLane = kVectorWidth / kLanes;
 constexpr std::uint32_t kTileTokens = 128;
-constexpr std::uint32_t kKeyBlock = 8;
+constexpr std::uint32_t kKeyBlock = 1;
 constexpr std::size_t kLowOffset = models::qwen::kKvarnPayloadMetadataBytes;
 constexpr std::size_t kMidOffset =
     kLowOffset + models::qwen::kKvarnLowPlaneBytes;
