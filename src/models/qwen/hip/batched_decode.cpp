@@ -271,8 +271,8 @@ std::vector<tokenization::TokenId> QwenGpuExecutor::ForwardTokenBatch(
       // KVarN sessions write K/V into the sink/ring and read the sealed tiles
       // through the shared decode-read helper; the batched sessions share the
       // fingerprint, so one check covers every row (design D2/D4/D7).
-      const bool kvarn_enabled = coordinator->arena_.GetKvarnWriteParams()
-                                     .enabled();
+      const bool kvarn_enabled =
+          coordinator->arena_.GetKvarnWriteParams().enabled();
       if (kvarn_enabled && !detail::IsFusedQkNormSupported(config.head_dim)) {
         throw std::runtime_error(
             "KVarN KV storage requires the fused QK-norm/RoPE/KV-write path");
@@ -283,16 +283,14 @@ std::vector<tokenization::TokenId> QwenGpuExecutor::ForwardTokenBatch(
               scratch.attention.q.data(),
               static_cast<const float*>(layer.attn_q_norm.data),
               scratch.attention.q.data(), batch_size,
-              config.num_attention_heads, config.head_dim, 1e-6F,
-              arena.stream);
+              config.num_attention_heads, config.head_dim, 1e-6F, arena.stream);
         }
         if (!layer.attn_k_norm.empty()) {
           LaunchBatchedPerHeadRMSNorm(
               scratch.attention.k.data(),
               static_cast<const float*>(layer.attn_k_norm.data),
               scratch.attention.k.data(), batch_size,
-              config.num_key_value_heads, config.head_dim, 1e-6F,
-              arena.stream);
+              config.num_key_value_heads, config.head_dim, 1e-6F, arena.stream);
         }
       }
       for (std::size_t row = 0; row < batch_size; ++row) {
@@ -322,15 +320,15 @@ std::vector<tokenization::TokenId> QwenGpuExecutor::ForwardTokenBatch(
               arena.stream, items[row].executor->vision_input_.rope(),
               state_arena.GetKvarnWriteParams());
           const auto& regions = state_arena.GetKvarnRegions();
-          LaunchKvarnSeal(
-              *state_arena.GetKvarnSealState(),
-              items[row].executor->policy_.kvarn, state_arena.d_kvarn_sink,
-              state_arena.d_kvarn_tail, regions.sink_elements,
-              regions.tail_elements,
-              static_cast<std::uint32_t>(regions.tail_rows),
-              state_arena.d_kvarn_body,
-              static_cast<std::uint32_t>(regions.tile_count), attention_layer,
-              config.num_key_value_heads, position, nullptr, 1, arena.stream);
+          LaunchKvarnSeal(*state_arena.GetKvarnSealState(),
+                          items[row].executor->policy_.kvarn,
+                          state_arena.d_kvarn_sink, state_arena.d_kvarn_tail,
+                          regions.sink_elements, regions.tail_elements,
+                          static_cast<std::uint32_t>(regions.tail_rows),
+                          state_arena.d_kvarn_body,
+                          static_cast<std::uint32_t>(regions.tile_count),
+                          attention_layer, config.num_key_value_heads, position,
+                          nullptr, 1, arena.stream);
           LaunchKvarnDecodeAttention(
               query, gate, context, attention_layer, position, nullptr, 1,
               config.num_attention_heads, config.num_key_value_heads,

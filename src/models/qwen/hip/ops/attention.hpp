@@ -29,8 +29,9 @@ struct KvarnWriteParams {
   /// Bounded per-chunk F16 workspace (design D4/4.1). During prefill the
   /// fused write stores each rotated row here, indexed by its row within the
   /// chunk, instead of the sink/ring, so the sink and the L+128+W ring keep
-  /// the pre-chunk rows the view rule still reads as F16. `LaunchKvarnChunkFlush`
-  /// merges the chunk into the sink and ring after attention.
+  /// the pre-chunk rows the view rule still reads as F16.
+  /// `LaunchKvarnChunkFlush` merges the chunk into the sink and ring after
+  /// attention.
   __half* chunk{nullptr};
   std::uint64_t chunk_plane_elements{0};
 
@@ -181,17 +182,14 @@ void LaunchFusedQKNormRoPEKvWrite(
 /// (opt-c010-qk-rope-kv). When out_context_bf16 is non-null the context is also
 /// written as BF16, which saves the caller a conversion launch when the next
 /// projection consumes BF16.
-void LaunchBatchedAttention(const float* q, const float* k, const float* v,
-                            const float* gate, float* k_cache, float* v_cache,
-                            void* k_cache_f16, void* v_cache_f16,
-                            float* out_context, std::uint32_t layer_idx,
-                            std::uint32_t start_pos, std::size_t batch_size,
-                            std::uint32_t max_context, std::uint32_t num_heads,
-                            std::uint32_t num_kv_heads, std::uint32_t head_dim,
-                            hipStream_t stream = nullptr,
-                            bool skip_kv_write = false,
-                            void* out_context_bf16 = nullptr,
-                            KvarnReadParams kvarn = {});
+void LaunchBatchedAttention(
+    const float* q, const float* k, const float* v, const float* gate,
+    float* k_cache, float* v_cache, void* k_cache_f16, void* v_cache_f16,
+    float* out_context, std::uint32_t layer_idx, std::uint32_t start_pos,
+    std::size_t batch_size, std::uint32_t max_context, std::uint32_t num_heads,
+    std::uint32_t num_kv_heads, std::uint32_t head_dim,
+    hipStream_t stream = nullptr, bool skip_kv_write = false,
+    void* out_context_bf16 = nullptr, KvarnReadParams kvarn = {});
 
 /// Batched fuse of per-head Q/K RMSNorm, RoPE, and the KV-cache write across B
 /// tokens into one launch (opt-c010-qk-rope-kv). Writes the normed+roped Q into
@@ -244,8 +242,7 @@ void LaunchBatchedFusedQKNormRoPEKvWrite(
     hipStream_t stream = nullptr, float* lse_out = nullptr,
     std::uint32_t key_begin = 0, bool skip_kv_write = false,
     std::span<float> packed_k_workspace = {},
-    std::span<float> packed_v_workspace = {},
-    KvarnReadParams kvarn = {});
+    std::span<float> packed_v_workspace = {}, KvarnReadParams kvarn = {});
 
 /// Large-batch causal attention using float32 QK/PV GEMMs and one reusable
 /// [batch, context] score buffer. Test- and benchmark-only: it reads the FP32

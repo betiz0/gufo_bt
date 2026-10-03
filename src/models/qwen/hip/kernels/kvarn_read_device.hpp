@@ -1,8 +1,9 @@
-// Shared device-side KVarN read helpers (openspec add-kvarn-kv-cache-quantization,
-// design D2/D5/D7). Included by the prefill attention kernels for the view
-// rule, the tile payload layout and the stored-element arithmetic; the decode
-// read arithmetic lives in `kernels/kvarn_read.hip` (design D7). Qwen-only;
-// never include from other model trees.
+// Shared device-side KVarN read helpers (openspec
+// add-kvarn-kv-cache-quantization, design D2/D5/D7). Included by the prefill
+// attention kernels for the view rule, the tile payload layout and the
+// stored-element arithmetic; the decode read arithmetic lives in
+// `kernels/kvarn_read.hip` (design D7). Qwen-only; never include from other
+// model trees.
 #ifndef GUFO_MODELS_QWEN_HIP_KERNELS_KVARN_READ_DEVICE_HPP_
 #define GUFO_MODELS_QWEN_HIP_KERNELS_KVARN_READ_DEVICE_HPP_
 
@@ -33,17 +34,17 @@ inline constexpr std::size_t kKvarnHighOffset =
 __device__ __forceinline__ std::uint8_t KvarnUnpackCode(
     const std::uint8_t* payload, std::uint8_t bits, std::size_t index) {
   const std::uint8_t* const low = payload + kKvarnLowOffset;
-  std::uint8_t code = static_cast<std::uint8_t>(
-      (low[index / 2] >> (4U * (index % 2))) & 0x0FU);
+  std::uint8_t code =
+      static_cast<std::uint8_t>((low[index / 2] >> (4U * (index % 2))) & 0x0FU);
   if (bits >= 5) {
     code = static_cast<std::uint8_t>(
-        code |
-        (((payload + kKvarnMidOffset)[index / 8] >> (index % 8)) & 1U) << 4);
+        code | (((payload + kKvarnMidOffset)[index / 8] >> (index % 8)) & 1U)
+                   << 4);
   }
   if (bits >= 6) {
     code = static_cast<std::uint8_t>(
-        code |
-        (((payload + kKvarnHighOffset)[index / 8] >> (index % 8)) & 1U) << 5);
+        code | (((payload + kKvarnHighOffset)[index / 8] >> (index % 8)) & 1U)
+                   << 5);
   }
   return code;
 }
@@ -92,12 +93,13 @@ __device__ __forceinline__ float KvarnRawDecodedElement(
     const std::uint8_t* payload, std::uint8_t bits, bool is_value,
     std::uint32_t token, std::uint32_t channel) {
   const float code = static_cast<float>(KvarnUnpackCode(
-      payload, bits, static_cast<std::size_t>(token) * kKvarnHeadDim + channel));
+      payload, bits,
+      static_cast<std::size_t>(token) * kKvarnHeadDim + channel));
   const std::size_t parameter =
-      is_value ? (static_cast<std::size_t>(token) *
-                      models::qwen::kKvarnValueGroups +
-                  channel / models::qwen::kKvarnValueGroupChannels)
-               : channel;
+      is_value
+          ? (static_cast<std::size_t>(token) * models::qwen::kKvarnValueGroups +
+             channel / models::qwen::kKvarnValueGroupChannels)
+          : channel;
   const auto* const rtn_scale = reinterpret_cast<const __half*>(payload);
   const auto* const rtn_zero = rtn_scale + models::qwen::kKvarnRtnParams;
   return code * __half2float(rtn_scale[parameter]) +
@@ -149,8 +151,8 @@ __device__ __forceinline__ bool KvarnTileInView(std::uint32_t position,
 /// which the deferred flush has not overwritten yet.
 __device__ __forceinline__ const __half* KvarnF16RowForChunk(
     const KvarnReadParams& kvarn, std::uint32_t layer, std::uint32_t kv_head,
-    std::uint32_t position, std::uint32_t chunk_begin,
-    std::uint32_t chunk_end, bool is_value) {
+    std::uint32_t position, std::uint32_t chunk_begin, std::uint32_t chunk_end,
+    bool is_value) {
   if (kvarn.chunk != nullptr && position >= chunk_begin &&
       position < chunk_end) {
     const std::size_t row =
@@ -171,12 +173,10 @@ __device__ __forceinline__ const __half* KvarnF16RowForChunk(
 __device__ __forceinline__ float KvarnStoredKElement(
     const KvarnReadParams& kvarn, std::uint32_t layer, std::uint32_t kv_head,
     std::uint32_t position, std::uint32_t quantized_tiles,
-    std::uint32_t chunk_begin, std::uint32_t chunk_end,
-    std::uint32_t channel) {
+    std::uint32_t chunk_begin, std::uint32_t chunk_end, std::uint32_t channel) {
   if (!KvarnTileInView(position, quantized_tiles)) {
-    const __half* const row =
-        KvarnF16RowForChunk(kvarn, layer, kv_head, position, chunk_begin,
-                            chunk_end, false);
+    const __half* const row = KvarnF16RowForChunk(
+        kvarn, layer, kv_head, position, chunk_begin, chunk_end, false);
     return __half2float(row[channel]);
   }
   const std::uint32_t tile = (position - 128) / 128;
@@ -197,12 +197,10 @@ __device__ __forceinline__ float KvarnStoredKElement(
 __device__ __forceinline__ float KvarnStoredVElement(
     const KvarnReadParams& kvarn, std::uint32_t layer, std::uint32_t kv_head,
     std::uint32_t position, std::uint32_t quantized_tiles,
-    std::uint32_t chunk_begin, std::uint32_t chunk_end,
-    std::uint32_t channel) {
+    std::uint32_t chunk_begin, std::uint32_t chunk_end, std::uint32_t channel) {
   if (!KvarnTileInView(position, quantized_tiles)) {
-    const __half* const row =
-        KvarnF16RowForChunk(kvarn, layer, kv_head, position, chunk_begin,
-                            chunk_end, true);
+    const __half* const row = KvarnF16RowForChunk(
+        kvarn, layer, kv_head, position, chunk_begin, chunk_end, true);
     return __half2float(row[channel]);
   }
   const std::uint32_t tile = (position - 128) / 128;

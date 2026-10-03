@@ -344,10 +344,13 @@ public:
       return {};
     }
     return KvarnWriteParams{
-        static_cast<__half*>(d_kvarn_sink), static_cast<__half*>(d_kvarn_tail),
-        kvarn_regions_.sink_elements, kvarn_regions_.tail_elements,
+        static_cast<__half*>(d_kvarn_sink),
+        static_cast<__half*>(d_kvarn_tail),
+        kvarn_regions_.sink_elements,
+        kvarn_regions_.tail_elements,
         static_cast<std::uint32_t>(kvarn_regions_.tail_rows),
-        static_cast<__half*>(d_kvarn_chunk), KvarnChunkPlaneElements()};
+        static_cast<__half*>(d_kvarn_chunk),
+        KvarnChunkPlaneElements()};
   }
   /// KVarN read source for the decode attention, or a disabled value for the
   /// FP16/FP32 policies (design D1/D2/D7).

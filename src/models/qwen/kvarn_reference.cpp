@@ -382,15 +382,18 @@ constexpr std::size_t kBaselineBlockValues = 32;
 
 }  // namespace
 
-KvarnRegions ComputeKvarnRegions(
-    std::uint8_t k_bits, std::uint8_t v_bits, std::size_t tail_length,
-    std::size_t verify_rows, std::size_t capacity_tokens,
-    std::size_t attention_layers, std::size_t kv_heads) noexcept {
+KvarnRegions ComputeKvarnRegions(std::uint8_t k_bits, std::uint8_t v_bits,
+                                 std::size_t tail_length,
+                                 std::size_t verify_rows,
+                                 std::size_t capacity_tokens,
+                                 std::size_t attention_layers,
+                                 std::size_t kv_heads) noexcept {
   const std::size_t body_tokens =
       capacity_tokens > kKvarnSinkRows ? capacity_tokens - kKvarnSinkRows : 0;
   const std::size_t tiles =
       (body_tokens + kKvarnTileTokens - 1) / kKvarnTileTokens;
-  const std::size_t ring_rows = tail_length + kKvarnRingMarginRows + verify_rows;
+  const std::size_t ring_rows =
+      tail_length + kKvarnRingMarginRows + verify_rows;
   const std::size_t heads = attention_layers * kv_heads;
   constexpr std::size_t kFp16Bytes = sizeof(std::uint16_t);
   constexpr std::size_t kPlaneCount = static_cast<std::size_t>(kPlanes);

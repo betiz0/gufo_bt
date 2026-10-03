@@ -53,9 +53,8 @@ private:
 /// F16 workspace (design D4/4.1): rows of the current chunk are read from
 /// there, older rows from the sink and ring, which a prefill chunk has not
 /// overwritten yet.
-void LaunchKvarnSeal(const KvarnSealState& state,
-                     const QwenKvarnPreset& preset, void* sink, void* tail,
-                     std::uint64_t sink_plane_elements,
+void LaunchKvarnSeal(const KvarnSealState& state, const QwenKvarnPreset& preset,
+                     void* sink, void* tail, std::uint64_t sink_plane_elements,
                      std::uint64_t tail_plane_elements, std::uint32_t ring_rows,
                      std::uint8_t* body, std::uint32_t tile_count,
                      std::uint32_t layer_idx, std::uint32_t num_kv_heads,

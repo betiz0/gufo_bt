@@ -638,7 +638,8 @@ void TestKvarnRegionAccounting() {
       // Design D4/4.1: the bounded per-chunk F16 workspace is a fixed session
       // cap of one whole prefill chunk (two planes).
       constexpr std::size_t kMaxPromptBatch = 4096;
-      const std::size_t chunk_rows = std::min<std::size_t>(context, kMaxPromptBatch);
+      const std::size_t chunk_rows =
+          std::min<std::size_t>(context, kMaxPromptBatch);
       const std::size_t expected_chunk =
           2 * chunk_rows * config.num_key_value_heads * config.head_dim *
           sizeof(std::uint16_t);
@@ -669,8 +670,8 @@ void TestKvarnRegionAccounting() {
       Expect(regions.sink_bytes == expected_sink &&
                  regions.body_bytes == expected_body &&
                  regions.tail_bytes == expected_tail &&
-                 regions.total_bytes == expected_sink + expected_body +
-                                            expected_tail,
+                 regions.total_bytes ==
+                     expected_sink + expected_body + expected_tail,
              "the allocated KVarN regions must match the design D5 formula");
       Expect(regions.tile_count == tiles && regions.tail_rows == ring_rows,
              "the KVarN layout must report the tile count and ring capacity");

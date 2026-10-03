@@ -500,8 +500,8 @@ void RunNullPlaneGuard() {
       rejected = true;
     }
     if (!rejected)
-      throw std::runtime_error(std::string("null KV planes must be rejected by ") +
-                               label);
+      throw std::runtime_error(
+          std::string("null KV planes must be rejected by ") + label);
   };
   // Position form, device-position (graph) form, and the verification-row form
   // with a disabled KVarN source.
@@ -517,8 +517,8 @@ void RunNullPlaneGuard() {
       [&] {
         gufo::hip::LaunchAttention(
             d_q, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
-            d_out, /*layer_idx=*/0, /*d_pos=*/nullptr, /*max_context=*/4, kHeads,
-            kKvHeads, kHeadDim, nullptr, /*skip_kv_write=*/false);
+            d_out, /*layer_idx=*/0, /*d_pos=*/nullptr, /*max_context=*/4,
+            kHeads, kKvHeads, kHeadDim, nullptr, /*skip_kv_write=*/false);
       },
       "LaunchAttention(d_pos)");
   expect_rejected(

@@ -87,8 +87,8 @@ int main() {
   // tail, and the quality-first k6v5 total <= 6.4 at L = 2048.
   const auto bpv = [](std::uint8_t k_bits, std::uint8_t v_bits,
                       std::size_t tail) {
-    return gufo::models::qwen::EstimateKvarnMemory(
-        k_bits, v_bits, tail, kQwenKvarnW, 262144, 16, 4);
+    return gufo::models::qwen::EstimateKvarnMemory(k_bits, v_bits, tail,
+                                                   kQwenKvarnW, 262144, 16, 4);
   };
   for (std::size_t tail : {std::size_t{kQwenKvarnW}, std::size_t{256},
                            std::size_t{1024}, std::size_t{2048}}) {

@@ -225,15 +225,16 @@ inline constexpr std::size_t kKvarnRingMarginRows = kKvarnTileTokens;
 }
 
 /// Tile index a position belongs to: t = (position - 128) / 128 (design D2).
-[[nodiscard]] constexpr std::size_t KvarnTileIndex(std::size_t position) noexcept {
+[[nodiscard]] constexpr std::size_t KvarnTileIndex(
+    std::size_t position) noexcept {
   return (position - kKvarnSinkRows) / kKvarnTileTokens;
 }
 
 /// Byte offset of one sealed tile's K payload inside the KVarN body; the V
 /// payload of the same tile follows immediately (design D5/D7).
 [[nodiscard]] constexpr std::size_t KvarnBodyTileOffset(
-    std::size_t layer, std::size_t kv_heads, std::size_t head,
-    std::size_t tile, std::size_t tile_count, std::size_t k_tile_bytes,
+    std::size_t layer, std::size_t kv_heads, std::size_t head, std::size_t tile,
+    std::size_t tile_count, std::size_t k_tile_bytes,
     std::size_t v_tile_bytes) noexcept {
   return ((layer * kv_heads + head) * tile_count + tile) *
          (k_tile_bytes + v_tile_bytes);
@@ -253,13 +254,13 @@ inline constexpr std::size_t kKvarnRingMarginRows = kKvarnTileTokens;
 /// full-attention layer and KV head (design.md D1/D5). The sink and the tail
 /// ring hold F16 K and V; the body holds one sealed K and V payload per tile.
 struct KvarnRegions {
-  std::size_t tile_count{0};      ///< Tiles per (layer, KV head).
-  std::size_t tail_rows{0};       ///< Ring capacity C = L + 128 + W.
-  std::size_t sink_elements{0};   ///< Per K or V plane.
-  std::size_t tail_elements{0};   ///< Per K or V plane.
-  std::size_t sink_bytes{0};      ///< Both planes.
-  std::size_t body_bytes{0};      ///< Both planes.
-  std::size_t tail_bytes{0};      ///< Both planes.
+  std::size_t tile_count{0};     ///< Tiles per (layer, KV head).
+  std::size_t tail_rows{0};      ///< Ring capacity C = L + 128 + W.
+  std::size_t sink_elements{0};  ///< Per K or V plane.
+  std::size_t tail_elements{0};  ///< Per K or V plane.
+  std::size_t sink_bytes{0};     ///< Both planes.
+  std::size_t body_bytes{0};     ///< Both planes.
+  std::size_t tail_bytes{0};     ///< Both planes.
   std::size_t total_bytes{0};
 };
 

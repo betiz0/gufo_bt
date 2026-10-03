@@ -1,6 +1,5 @@
-#include <unistd.h>
-
 #include <hip/hip_runtime.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <array>
@@ -197,9 +196,9 @@ void CheckQwenIncrementalOracle(
           "Qwen image prefill logits changed with chunk boundaries");
 }
 
-// Task 5.4 / spec "セッション状態の整合" (image scenario): KVarN under a context
-// that carries image tokens and M-RoPE positions. Generation must cross the
-// first tile view-switch position 256 + L (design D2/D4), and restoring a
+// Task 5.4 / spec "セッション状態の整合" (image scenario): KVarN under a
+// context that carries image tokens and M-RoPE positions. Generation must cross
+// the first tile view-switch position 256 + L (design D2/D4), and restoring a
 // snapshot taken before that generation must reproduce the uninterrupted
 // logits bit for bit.
 void CheckQwenKvarnImageSnapshotOracle(
@@ -241,11 +240,9 @@ void CheckQwenKvarnImageSnapshotOracle(
     const auto position = static_cast<std::uint32_t>(tokens.size() + step);
     next = reference.ForwardToken(next, position);
     const auto logits = reference.CopyLastLogits();
-    Require(
-        std::ranges::all_of(logits, [](float value) {
-          return std::isfinite(value);
-        }),
-        "KVarN image logits must be finite");
+    Require(std::ranges::all_of(
+                logits, [](float value) { return std::isfinite(value); }),
+            "KVarN image logits must be finite");
     expected.emplace_back(logits.begin(), logits.end());
   }
   std::uint32_t sealed = 0;
@@ -262,9 +259,8 @@ void CheckQwenKvarnImageSnapshotOracle(
     Require(std::ranges::equal(restored.CopyLastLogits(), expected[step]),
             "KVarN image snapshot restore changed logits");
   }
-  std::cout << "KVarN image M-RoPE seal/snapshot exact prefix="
-            << tokens.size() << " steps=" << steps << " sealed=" << sealed
-            << '\n';
+  std::cout << "KVarN image M-RoPE seal/snapshot exact prefix=" << tokens.size()
+            << " steps=" << steps << " sealed=" << sealed << '\n';
 }
 
 void CheckAppendSnapshotOracle(

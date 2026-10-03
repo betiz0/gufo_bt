@@ -391,10 +391,10 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
         // design D4/4.1: after this layer's attention, merge the bounded
         // per-chunk F16 workspace into the sink and ring, so the next step
         // reads the same rows as a sequential decode.
-        LaunchKvarnChunkFlush(
-            arena_.GetKvarnWriteParams(), attn_layer_idx,
-            config.num_key_value_heads, start_pos,
-            static_cast<std::uint32_t>(batch_size), arena_.stream);
+        LaunchKvarnChunkFlush(arena_.GetKvarnWriteParams(), attn_layer_idx,
+                              config.num_key_value_heads, start_pos,
+                              static_cast<std::uint32_t>(batch_size),
+                              arena_.stream);
       }
 
       // opt-c172-fp32-quant: the Q8_0 route reads only the quantized

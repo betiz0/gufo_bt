@@ -235,8 +235,7 @@ bool DiskCacheEnabled(const TextDiskCacheConfig& config) noexcept {
 /// FP16/FP32 keep their existing strings; KVarN names its preset, K/V widths,
 /// tail length (distinguishing unset from an explicit W) and scale type, so a
 /// cache built with another preset or tail is never reused.
-std::string QwenKvStorageIdentity(
-    const hip::QwenExecutionPolicy& policy) {
+std::string QwenKvStorageIdentity(const hip::QwenExecutionPolicy& policy) {
   if (!policy.UsesKvarn()) {
     return policy.UsesFp16AttentionKv() ? "fp16" : "fp32";
   }
@@ -249,8 +248,7 @@ std::string QwenKvStorageIdentity(
     value << "-tail-" << policy.kvarn.tail_length;
   }
   value << "-s"
-        << (policy.kvarn.scale == hip::QwenKvarnScale::kBf16 ? "bf16"
-                                                            : "fp16");
+        << (policy.kvarn.scale == hip::QwenKvarnScale::kBf16 ? "bf16" : "fp16");
   return value.str();
 }
 
@@ -292,12 +290,11 @@ std::string QwenKvStorageIdentity(
 std::string QwenStateAbiName(bool speculative,
                              const hip::QwenExecutionPolicy& policy) {
   if (!policy.UsesKvarn()) {
-    return std::string(QwenStateAbi(speculative,
-                                    policy.UsesFp16AttentionKv(),
+    return std::string(QwenStateAbi(speculative, policy.UsesFp16AttentionKv(),
                                     policy.UsesBf16RecurrentState()));
   }
-  std::string abi = speculative ? "qwen-gfx1151-dflash-state-v5-"
-                                : "qwen-gfx1151-state-v4-";
+  std::string abi =
+      speculative ? "qwen-gfx1151-dflash-state-v5-" : "qwen-gfx1151-state-v4-";
   abi += QwenKvStorageIdentity(policy);
   if (policy.UsesBf16RecurrentState()) {
     abi += "-bf16-recurrent";
@@ -398,8 +395,7 @@ std::vector<std::uint8_t> QwenCompatibilityIdentity(
     throw std::invalid_argument(
         "Qwen DFlash disk cache requires a draft artifact fingerprint");
   }
-  const std::string state_abi =
-      QwenStateAbiName(speculative, execution_policy);
+  const std::string state_abi = QwenStateAbiName(speculative, execution_policy);
   std::ostringstream identity;
   identity << "schema=gufo-text-continuation-v2\n"
            << "model_kind=qwen3.8\n"
@@ -418,8 +414,7 @@ std::vector<std::uint8_t> QwenCompatibilityIdentity(
            << hip::detail::kSplitKDecodeAttentionMinContext << '\n'
            << "attention_split_count="
            << hip::detail::kSplitKDecodeAttentionMaxSplits << '\n'
-           << "kv_storage="
-           << QwenKvStorageIdentity(execution_policy) << '\n'
+           << "kv_storage=" << QwenKvStorageIdentity(execution_policy) << '\n'
            << "recurrent_storage="
            << (execution_policy.UsesBf16RecurrentState() ? "bf16" : "fp32")
            << '\n'
@@ -3264,9 +3259,9 @@ bool InferenceBackend::load(std::shared_ptr<const hip::QwenGpuModel> model,
   const std::string_view kv_cache_name =
       kv_cache_explicit ? std::string_view(kv_cache_config.value)
                         : cli::kQwenKvFormat;
-  const std::string kv_cache_format = QwenKvCacheReport(
-      kv_cache_name, execution_policy, model->GetConfig(), max_context,
-      session_count);
+  const std::string kv_cache_format =
+      QwenKvCacheReport(kv_cache_name, execution_policy, model->GetConfig(),
+                        max_context, session_count);
 
   if (speculative_config.backend == TextSpeculativeBackend::kDSpark) {
     SetError(error, "DSpark HTTP decoding requires a DeepSeek model");

@@ -527,8 +527,7 @@ void CheckKvarnBatchDecode(
         std::array<gufo::hip::QwenGpuBatchItem, kSessions> items;
         for (std::size_t step = 0; step < kContinuation; ++step) {
           for (std::size_t row = 0; row < width; ++row)
-            items[row] = {sessions[row].get(),
-                          tokens[row][prompt_size + step],
+            items[row] = {sessions[row].get(), tokens[row][prompt_size + step],
                           static_cast<std::uint32_t>(prompt_size + step)};
           const auto predictions =
               Executor::ForwardTokenBatch(std::span(items).first(width));

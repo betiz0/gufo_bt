@@ -632,8 +632,8 @@ void TestKvarnRotationPreservesQkScore() {
   kvarn.ring_rows = ring_rows;
   gufo::hip::LaunchFusedQKNormRoPEKvWrite(
       d_qk, d_kk, d_vk, d_qw, d_kw, d_qk, d_kk, nullptr, nullptr, nullptr,
-      nullptr, layer_idx, d_pos, max_context, num_heads, num_kv_heads,
-      head_dim, rotary_dim, rope_theta, eps, nullptr, nullptr, kvarn);
+      nullptr, layer_idx, d_pos, max_context, num_heads, num_kv_heads, head_dim,
+      rotary_dim, rope_theta, eps, nullptr, nullptr, kvarn);
 
   HIP_CHECK(hipDeviceSynchronize());
 

@@ -28,7 +28,8 @@ namespace {
 
 namespace ref = gufo::models::qwen;
 
-constexpr std::uint32_t kRows = static_cast<std::uint32_t>(ref::kKvarnTileTokens);
+constexpr std::uint32_t kRows =
+    static_cast<std::uint32_t>(ref::kKvarnTileTokens);
 constexpr std::uint32_t kCols =
     static_cast<std::uint32_t>(ref::kKvarnTileChannels);
 constexpr std::uint32_t kElements = kRows * kCols;
@@ -48,10 +49,11 @@ void Expect(bool condition, std::string_view message) {
 
 void ExpectNear(double actual, double expected, const std::string& message) {
   const double tolerance =
-      kScaleLimit * std::max(1.0, std::max(std::abs(actual), std::abs(expected)));
+      kScaleLimit *
+      std::max(1.0, std::max(std::abs(actual), std::abs(expected)));
   if (std::abs(actual - expected) > tolerance) {
-    throw std::runtime_error(message + ": " + std::to_string(actual) +
-                             " vs " + std::to_string(expected));
+    throw std::runtime_error(message + ": " + std::to_string(actual) + " vs " +
+                             std::to_string(expected));
   }
 }
 
@@ -104,8 +106,9 @@ struct SealHarness {
                                    (k_tile_bytes + v_tile_bytes)));
     HIP_CHECK(hipMemset(sink, 0, 2 * sink_plane * sizeof(std::uint16_t)));
     HIP_CHECK(hipMemset(tail, 0, 2 * tail_plane * sizeof(std::uint16_t)));
-    HIP_CHECK(hipMemset(body, 0, static_cast<std::size_t>(tile_count) *
-                                      (k_tile_bytes + v_tile_bytes)));
+    HIP_CHECK(hipMemset(
+        body, 0,
+        static_cast<std::size_t>(tile_count) * (k_tile_bytes + v_tile_bytes)));
   }
 
   ~SealHarness() {
@@ -148,9 +151,8 @@ struct SealHarness {
 
   [[nodiscard]] ref::KvarnTilePayload Payload(bool is_value) const {
     ref::KvarnTilePayload payload{};
-    HIP_CHECK(hipMemcpy(&payload,
-                        body + (is_value ? k_tile_bytes : 0), sizeof(payload),
-                        hipMemcpyDeviceToHost));
+    HIP_CHECK(hipMemcpy(&payload, body + (is_value ? k_tile_bytes : 0),
+                        sizeof(payload), hipMemcpyDeviceToHost));
     return payload;
   }
 
@@ -180,26 +182,25 @@ void StageOne(const ref::KvarnTilePayload& payload, std::span<const float> raw,
         channel = p;
       } else {
         token = p / ref::kKvarnValueGroups;
-        channel = (p % ref::kKvarnValueGroups) * ref::kKvarnValueGroupChannels +
-                  n;
+        channel =
+            (p % ref::kKvarnValueGroups) * ref::kKvarnValueGroupChannels + n;
       }
       const double channel_scale =
           gufo::quant::Fp16ToFloat(payload.norm_channel_scale[channel]);
       const double token_scale =
           gufo::quant::Fp16ToFloat(payload.norm_token_scale[token]);
-      const float clamped = std::min(
-          std::max(raw[token * kCols + channel],
-                   -static_cast<float>(ref::kKvarnValueClamp)),
-          static_cast<float>(ref::kKvarnValueClamp));
+      const float clamped =
+          std::min(std::max(raw[token * kCols + channel],
+                            -static_cast<float>(ref::kKvarnValueClamp)),
+                   static_cast<float>(ref::kKvarnValueClamp));
       const double divisor = channel_scale * token_scale;
-      values[n] = divisor > 0.0
-                      ? static_cast<float>(static_cast<double>(clamped) /
-                                           divisor)
-                      : 0.0F;
+      values[n] =
+          divisor > 0.0
+              ? static_cast<float>(static_cast<double>(clamped) / divisor)
+              : 0.0F;
     }
     ref::KvarnEncodeAsymmetricRtn(
-        values, bits,
-        gufo::quant::Fp16ToFloat(payload.rtn_scale[p]),
+        values, bits, gufo::quant::Fp16ToFloat(payload.rtn_scale[p]),
         gufo::quant::Fp16ToFloat(payload.rtn_zero[p]), codes);
     for (std::size_t n = 0; n < set_size; ++n) {
       std::size_t token = 0, channel = 0;
@@ -208,11 +209,11 @@ void StageOne(const ref::KvarnTilePayload& payload, std::span<const float> raw,
         channel = p;
       } else {
         token = p / ref::kKvarnValueGroups;
-        channel = (p % ref::kKvarnValueGroups) * ref::kKvarnValueGroupChannels +
-                  n;
+        channel =
+            (p % ref::kKvarnValueGroups) * ref::kKvarnValueGroupChannels + n;
       }
-      const std::uint8_t actual = ref::KvarnUnpackTileCode(
-          payload, bits, token * kCols + channel);
+      const std::uint8_t actual =
+          ref::KvarnUnpackTileCode(payload, bits, token * kCols + channel);
       Expect(actual == codes[n],
              "stage 1: the oracle must reproduce the GPU code exactly");
     }
@@ -234,25 +235,24 @@ void StageTwo(const ref::KvarnTilePayload& payload, std::span<const float> raw,
       bits, &result, nullptr);
   const std::string plane = is_value ? "V" : "K";
   for (std::size_t c = 0; c < kCols; ++c) {
-    ExpectNear(gufo::quant::Fp16ToFloat(payload.norm_channel_scale[c]),
-               result.norm_channel_scale[c],
-               "stage 2: " + plane + " channel scale [" +
-                   std::to_string(c) + "]");
+    ExpectNear(
+        gufo::quant::Fp16ToFloat(payload.norm_channel_scale[c]),
+        result.norm_channel_scale[c],
+        "stage 2: " + plane + " channel scale [" + std::to_string(c) + "]");
   }
   for (std::size_t r = 0; r < kRows; ++r) {
-    ExpectNear(gufo::quant::Fp16ToFloat(payload.norm_token_scale[r]),
-               result.norm_token_scale[r],
-               "stage 2: " + plane + " token scale [" + std::to_string(r) +
-                   "]");
+    ExpectNear(
+        gufo::quant::Fp16ToFloat(payload.norm_token_scale[r]),
+        result.norm_token_scale[r],
+        "stage 2: " + plane + " token scale [" + std::to_string(r) + "]");
   }
   for (std::size_t p = 0; p < ref::kKvarnRtnParams; ++p) {
     ExpectNear(gufo::quant::Fp16ToFloat(payload.rtn_scale[p]),
                result.rtn_scale[p],
                "stage 2: " + plane + " RTN scale [" + std::to_string(p) + "]");
-    ExpectNear(gufo::quant::Fp16ToFloat(payload.rtn_zero[p]),
-               result.rtn_zero[p],
-               "stage 2: " + plane + " RTN zero point [" + std::to_string(p) +
-                   "]");
+    ExpectNear(
+        gufo::quant::Fp16ToFloat(payload.rtn_zero[p]), result.rtn_zero[p],
+        "stage 2: " + plane + " RTN zero point [" + std::to_string(p) + "]");
   }
 }
 
@@ -325,17 +325,15 @@ void TestNonFiniteFlag() {
   harness.Seal(tile, /*non_finite=*/true);
   Expect(harness.state.HasError(nullptr),
          "a non-finite tile must raise the session error flag");
-  Expect(!harness.Sealed(),
-         "a non-finite tile must not be recorded as sealed");
+  Expect(!harness.Sealed(), "a non-finite tile must not be recorded as sealed");
 }
 
 }  // namespace
 
 int main() {
 #if defined(ENGINE_ENABLE_HIP)
-  const int device_status =
-      gufo::test::GateHipDevice(gufo::test::HipDeviceRequirement::kOptional,
-                                "Qwen KVarN seal ops test");
+  const int device_status = gufo::test::GateHipDevice(
+      gufo::test::HipDeviceRequirement::kOptional, "Qwen KVarN seal ops test");
   if (device_status != gufo::test::kHipTestSuccess) {
     return device_status;
   }

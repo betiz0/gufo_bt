@@ -100,10 +100,10 @@ struct Harness {
     sink_plane = static_cast<std::size_t>(kKvHeads) * 128 * kHeadDim;
     tail_plane = static_cast<std::size_t>(kKvHeads) * ring_rows * kHeadDim;
     chunk_plane = static_cast<std::size_t>(context) * kKvHeads * kHeadDim;
-    const std::size_t body_bytes = std::max<std::size_t>(
-        static_cast<std::size_t>(tile_count) * kKvHeads *
-            (k_tile_bytes + v_tile_bytes),
-        1);
+    const std::size_t body_bytes =
+        std::max<std::size_t>(static_cast<std::size_t>(tile_count) * kKvHeads *
+                                  (k_tile_bytes + v_tile_bytes),
+                              1);
     HIP_CHECK(hipMalloc(&sink, 2 * sink_plane * sizeof(std::uint16_t)));
     HIP_CHECK(hipMalloc(&tail, 2 * tail_plane * sizeof(std::uint16_t)));
     HIP_CHECK(hipMalloc(&chunk, 2 * chunk_plane * sizeof(std::uint16_t)));
@@ -140,11 +140,11 @@ struct Harness {
           const std::size_t offset =
               (is_value ? chunk_plane : 0) +
               (static_cast<std::size_t>(row) * kKvHeads + head) * kHeadDim;
-          HIP_CHECK(hipMemcpy(
-              static_cast<std::uint8_t*>(chunk) +
-                  offset * sizeof(std::uint16_t),
-              values.data(), values.size() * sizeof(std::uint16_t),
-              hipMemcpyHostToDevice));
+          HIP_CHECK(hipMemcpy(static_cast<std::uint8_t*>(chunk) +
+                                  offset * sizeof(std::uint16_t),
+                              values.data(),
+                              values.size() * sizeof(std::uint16_t),
+                              hipMemcpyHostToDevice));
         }
       }
     }
@@ -263,8 +263,8 @@ std::vector<double> Reference(const Harness& harness, std::uint32_t pos,
     const double weight = scores[position] / sum;
     if (!quantized_at(position)) {
       for (std::uint32_t c = 0; c < kHeadDim; ++c) {
-        out[c] += weight * static_cast<double>(__half2float(
-                              __float2half_rn(KeyValue(position, kv_head, c, true))));
+        out[c] += weight * static_cast<double>(__half2float(__float2half_rn(
+                               KeyValue(position, kv_head, c, true))));
       }
     } else {
       const std::uint32_t tile = (position - 128) / 128;
@@ -304,14 +304,14 @@ struct PathOutputs {
 PathOutputs RunPaths(Harness& harness, std::uint32_t start, std::uint32_t rows,
                      std::uint32_t max_context, const std::vector<float>& q,
                      const std::vector<float>& gate) {
-    const std::size_t width =
+  const std::size_t width =
       static_cast<std::size_t>(rows) * kQueryHeads * kHeadDim;
   float* d_q = nullptr;
   float* d_gate = nullptr;
   HIP_CHECK(hipMalloc(&d_q, width * sizeof(float)));
   HIP_CHECK(hipMalloc(&d_gate, width * sizeof(float)));
-  HIP_CHECK(hipMemcpy(d_q, q.data(), width * sizeof(float),
-                      hipMemcpyHostToDevice));
+  HIP_CHECK(
+      hipMemcpy(d_q, q.data(), width * sizeof(float), hipMemcpyHostToDevice));
   HIP_CHECK(hipMemcpy(d_gate, gate.data(), width * sizeof(float),
                       hipMemcpyHostToDevice));
 
@@ -369,7 +369,8 @@ PathOutputs RunPaths(Harness& harness, std::uint32_t start, std::uint32_t rows,
   if (rows <= kMaxBatchedFallbackRows) {
     outputs.batched = read_into([&](float* out) {
       gufo::hip::LaunchBatchedAttention(
-          d_q, nullptr, nullptr, d_gate, nullptr, nullptr, nullptr, nullptr, out,
+          d_q, nullptr, nullptr, d_gate, nullptr, nullptr, nullptr, nullptr,
+          out,
           /*layer_idx=*/0, start, rows, max_context, kQueryHeads, kKvHeads,
           kHeadDim, nullptr, /*skip_kv_write=*/true, nullptr,
           harness.ReadParams());
@@ -383,8 +384,7 @@ PathOutputs RunPaths(Harness& harness, std::uint32_t start, std::uint32_t rows,
 
 /// Rows to check with the FP64 reference: the chunk's first and last query plus
 /// the rows next to each view threshold 256 + 128 t + L.
-std::vector<std::uint32_t> SelectedRows(std::uint32_t start,
-                                        std::uint32_t rows,
+std::vector<std::uint32_t> SelectedRows(std::uint32_t start, std::uint32_t rows,
                                         std::uint32_t tail_length) {
   std::vector<std::uint32_t> selected;
   if (rows == 0) {
@@ -392,8 +392,7 @@ std::vector<std::uint32_t> SelectedRows(std::uint32_t start,
   }
   selected.push_back(start);
   selected.push_back(start + rows - 1);
-  for (std::uint64_t threshold =
-           static_cast<std::uint64_t>(256) + tail_length;
+  for (std::uint64_t threshold = static_cast<std::uint64_t>(256) + tail_length;
        threshold <= static_cast<std::uint64_t>(start) + rows;
        threshold += 128) {
     if (threshold > start) {
@@ -419,9 +418,8 @@ void CheckChunk(Harness& harness, std::uint32_t start, std::uint32_t rows,
   double worst_wmma = 0.0, worst_tile = 0.0, worst_batched = 0.0;
   for (const std::uint32_t row : selected) {
     const std::uint32_t local = row - start;
-    const float* gate_row = gate_all.data() +
-                            static_cast<std::size_t>(row) * kQueryHeads *
-                                kHeadDim;
+    const float* gate_row = gate_all.data() + static_cast<std::size_t>(row) *
+                                                  kQueryHeads * kHeadDim;
     for (std::uint32_t head = 0; head < kQueryHeads; ++head) {
       const float* q_head =
           q.data() +
@@ -432,10 +430,10 @@ void CheckChunk(Harness& harness, std::uint32_t start, std::uint32_t rows,
         const std::size_t index =
             (static_cast<std::size_t>(local) * kQueryHeads + head) * kHeadDim +
             c;
-        const double dw = std::abs(static_cast<double>(outputs.wmma[index]) -
-                                   expected[c]);
-        const double dt = std::abs(static_cast<double>(outputs.tile[index]) -
-                                   expected[c]);
+        const double dw =
+            std::abs(static_cast<double>(outputs.wmma[index]) - expected[c]);
+        const double dt =
+            std::abs(static_cast<double>(outputs.tile[index]) - expected[c]);
         const double db =
             outputs.batched.empty()
                 ? 0.0
@@ -452,8 +450,8 @@ void CheckChunk(Harness& harness, std::uint32_t start, std::uint32_t rows,
                          const std::vector<float>& b, std::size_t* where) {
     double local_worst = 0.0;
     for (std::size_t i = 0; i < a.size(); ++i) {
-      const double diff = std::abs(static_cast<double>(a[i]) -
-                                   static_cast<double>(b[i]));
+      const double diff =
+          std::abs(static_cast<double>(a[i]) - static_cast<double>(b[i]));
       if (diff > local_worst) {
         local_worst = diff;
         *where = i;
@@ -489,8 +487,8 @@ void CheckChunk(Harness& harness, std::uint32_t start, std::uint32_t rows,
         " @ " + describe(where_tb) + ")");
   }
   std::cout << "T-03 prefill start " << start << " rows " << rows << " tail "
-            << harness.tail_length << " reference worst " << worst
-            << " cross " << cross_worst << '\n';
+            << harness.tail_length << " reference worst " << worst << " cross "
+            << cross_worst << '\n';
 }
 
 void CheckFlush(Harness& harness, std::uint32_t begin, std::uint32_t rows) {
@@ -513,12 +511,12 @@ void CheckFlush(Harness& harness, std::uint32_t begin, std::uint32_t rows) {
                   : ref::KvarnTailRowOffset(0, kKvHeads, head, position,
                                             harness.ring_rows);
       const void* source =
-          to_sink ? static_cast<const void*>(static_cast<const std::uint8_t*>(
-                                                harness.sink) +
-                                            offset * sizeof(std::uint16_t))
-                  : static_cast<const void*>(static_cast<const std::uint8_t*>(
-                                                harness.tail) +
-                                            offset * sizeof(std::uint16_t));
+          to_sink ? static_cast<const void*>(
+                        static_cast<const std::uint8_t*>(harness.sink) +
+                        offset * sizeof(std::uint16_t))
+                  : static_cast<const void*>(
+                        static_cast<const std::uint8_t*>(harness.tail) +
+                        offset * sizeof(std::uint16_t));
       HIP_CHECK(hipMemcpy(persisted.data(), source,
                           persisted.size() * sizeof(std::uint16_t),
                           hipMemcpyDeviceToHost));
@@ -574,12 +572,12 @@ void RunSingleChunk(std::uint8_t k_bits, std::uint8_t v_bits,
   std::cerr << "[case] single context=" << context << " tail=" << tail
             << std::endl;
   Harness harness(k_bits, v_bits, tail, context);
-    harness.FillChunk(0, context);
-    harness.Seal(0, context);
-      const auto q = MakeQuery(context);
+  harness.FillChunk(0, context);
+  harness.Seal(0, context);
+  const auto q = MakeQuery(context);
   const auto gate = MakeGate(context);
   const auto outputs = RunPaths(harness, 0, context, context, q, gate);
-    CheckChunk(harness, 0, context, q, gate, gate, outputs);
+  CheckChunk(harness, 0, context, q, gate, gate, outputs);
   CheckFlush(harness, 0, context);
 }
 
@@ -600,7 +598,7 @@ void RunMultiChunk(std::uint8_t k_bits, std::uint8_t v_bits, std::uint32_t tail,
             static_cast<std::size_t>(first_rows) * kQueryHeads * kHeadDim);
     const std::vector<float> q_chunk(
         q_all.begin(), q_all.begin() + static_cast<std::size_t>(first_rows) *
-                                            kQueryHeads * kHeadDim);
+                                           kQueryHeads * kHeadDim);
     harness.FillChunk(0, first_rows);
     harness.Seal(0, first_rows);
     const auto outputs =
@@ -612,17 +610,17 @@ void RunMultiChunk(std::uint8_t k_bits, std::uint8_t v_bits, std::uint32_t tail,
   const std::size_t offset =
       static_cast<std::size_t>(first_rows) * kQueryHeads * kHeadDim;
   const std::vector<float> q_chunk(
-      q_all.begin() + offset, q_all.begin() + offset +
-                                  static_cast<std::size_t>(second_rows) *
-                                      kQueryHeads * kHeadDim);
+      q_all.begin() + offset,
+      q_all.begin() + offset +
+          static_cast<std::size_t>(second_rows) * kQueryHeads * kHeadDim);
   const std::vector<float> gate_chunk(
       gate_all.begin() + offset,
       gate_all.begin() + offset +
           static_cast<std::size_t>(second_rows) * kQueryHeads * kHeadDim);
   harness.FillChunk(first_rows, second_rows);
   harness.Seal(first_rows, second_rows);
-  const auto outputs = RunPaths(harness, first_rows, second_rows, context,
-                                q_chunk, gate_chunk);
+  const auto outputs =
+      RunPaths(harness, first_rows, second_rows, context, q_chunk, gate_chunk);
   CheckChunk(harness, first_rows, second_rows, q_chunk, gate_chunk, gate_all,
              outputs);
   CheckFlush(harness, first_rows, second_rows);
@@ -632,9 +630,9 @@ void RunMultiChunk(std::uint8_t k_bits, std::uint8_t v_bits, std::uint32_t tail,
 
 int main() {
 #if defined(ENGINE_ENABLE_HIP)
-  const int device_status = gufo::test::GateHipDevice(
-      gufo::test::HipDeviceRequirement::kOptional,
-      "Qwen KVarN prefill read ops test");
+  const int device_status =
+      gufo::test::GateHipDevice(gufo::test::HipDeviceRequirement::kOptional,
+                                "Qwen KVarN prefill read ops test");
   if (device_status != gufo::test::kHipTestSuccess) {
     return device_status;
   }

@@ -85,8 +85,10 @@ struct RegionImage {
 void UploadRegions(QwenGpuArena& arena, std::uint8_t seed) {
   const auto& regions = arena.GetKvarnRegions();
   const auto sink = Pattern(regions.sink_bytes, seed);
-  const auto body = Pattern(regions.body_bytes, static_cast<std::uint8_t>(seed + 1));
-  const auto tail = Pattern(regions.tail_bytes, static_cast<std::uint8_t>(seed + 2));
+  const auto body =
+      Pattern(regions.body_bytes, static_cast<std::uint8_t>(seed + 1));
+  const auto tail =
+      Pattern(regions.tail_bytes, static_cast<std::uint8_t>(seed + 2));
   HIP_CHECK(hipMemcpy(arena.d_kvarn_sink, sink.data(), sink.size(),
                       hipMemcpyHostToDevice));
   HIP_CHECK(hipMemcpy(arena.d_kvarn_body, body.data(), body.size(),
@@ -110,12 +112,12 @@ RegionImage DownloadRegions(const QwenGpuArena& arena) {
   image.body.resize(regions.body_bytes);
   image.tail.resize(regions.tail_bytes);
   image.sealed.resize(16U * 4U);
-  HIP_CHECK(hipMemcpy(image.sink.data(), arena.d_kvarn_sink,
-                      image.sink.size(), hipMemcpyDeviceToHost));
-  HIP_CHECK(hipMemcpy(image.body.data(), arena.d_kvarn_body,
-                      image.body.size(), hipMemcpyDeviceToHost));
-  HIP_CHECK(hipMemcpy(image.tail.data(), arena.d_kvarn_tail,
-                      image.tail.size(), hipMemcpyDeviceToHost));
+  HIP_CHECK(hipMemcpy(image.sink.data(), arena.d_kvarn_sink, image.sink.size(),
+                      hipMemcpyDeviceToHost));
+  HIP_CHECK(hipMemcpy(image.body.data(), arena.d_kvarn_body, image.body.size(),
+                      hipMemcpyDeviceToHost));
+  HIP_CHECK(hipMemcpy(image.tail.data(), arena.d_kvarn_tail, image.tail.size(),
+                      hipMemcpyDeviceToHost));
   HIP_CHECK(hipMemcpy(image.sealed.data(), arena.GetKvarnSealState()->sealed(),
                       image.sealed.size() * sizeof(std::uint32_t),
                       hipMemcpyDeviceToHost));
@@ -138,10 +140,10 @@ void TestKvarnCompactRoundTrip(const char* preset, std::uint32_t tail,
   auto snapshot = source.SaveSnapshot(valid_context);
   Expect(snapshot->KvStorage() == QwenKvCacheStorage::kKvarn,
          "a KVarN snapshot must record the KVarN storage kind");
-  Expect(snapshot->CompactPayloadBytes() == source.SnapshotPayloadBytes(
-                                               valid_context) +
-                                               kKvarnCompactHeaderBytes,
-         "the KVarN v3 payload must be the state bytes plus its 128-byte header");
+  Expect(
+      snapshot->CompactPayloadBytes() ==
+          source.SnapshotPayloadBytes(valid_context) + kKvarnCompactHeaderBytes,
+      "the KVarN v3 payload must be the state bytes plus its 128-byte header");
   Expect(snapshot->PayloadBytes() >= source.GetKvarnRegions().total_bytes,
          "the KVarN payload must carry every region");
 
@@ -168,8 +170,7 @@ void TestKvarnCompactRoundTrip(const char* preset, std::uint32_t tail,
   // silently reinterpreted.
   QwenGpuArena other_tail(
       config, context,
-      KvarnPolicy(preset, tail == 0 ? std::uint32_t{2048}
-                                    : std::uint32_t{0}));
+      KvarnPolicy(preset, tail == 0 ? std::uint32_t{2048} : std::uint32_t{0}));
   HIP_CHECK(hipStreamSynchronize(other_tail.stream));
   bool rejected_tail = false;
   try {
@@ -177,8 +178,7 @@ void TestKvarnCompactRoundTrip(const char* preset, std::uint32_t tail,
   } catch (const std::exception&) {
     rejected_tail = true;
   }
-  Expect(rejected_tail,
-         "a snapshot with another tail length must be rejected");
+  Expect(rejected_tail, "a snapshot with another tail length must be rejected");
 
   // A canonical FP16 arena must not accept a KVarN payload, and a canonical
   // payload must not be read as KVarN.
@@ -276,9 +276,8 @@ void TestFp16KeepsVersionOne() {
 
 int main() {
 #if defined(ENGINE_ENABLE_HIP)
-  const int device_status =
-      gufo::test::GateHipDevice(gufo::test::HipDeviceRequirement::kOptional,
-                                "Qwen KVarN state ops test");
+  const int device_status = gufo::test::GateHipDevice(
+      gufo::test::HipDeviceRequirement::kOptional, "Qwen KVarN state ops test");
   if (device_status != 0) {
     return device_status;
   }

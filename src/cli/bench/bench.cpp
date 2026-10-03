@@ -1476,9 +1476,8 @@ int RunBench(std::span<const char* const> args) {
     const std::string_view kv_cache_name =
         opt.kv_cache.empty() ? kQwenKvFormat : std::string_view(opt.kv_cache);
     std::cout << "KV cache: "
-              << QwenKvCacheReport(
-                     kv_cache_name, execution_policy, config,
-                     static_cast<std::uint32_t>(required_context))
+              << QwenKvCacheReport(kv_cache_name, execution_policy, config,
+                                   static_cast<std::uint32_t>(required_context))
               << '\n';
   }
 
