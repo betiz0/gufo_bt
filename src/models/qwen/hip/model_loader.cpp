@@ -260,6 +260,15 @@ std::unique_ptr<QwenGpuExecutor> QwenGpuExecutor::Create(
   }
 
   const auto& config = model->GetConfig();
+  const std::string kvarn_error =
+      QwenKvarnShapeError(policy, config.num_attention_heads,
+                          config.num_key_value_heads, config.head_dim);
+  if (!kvarn_error.empty()) {
+    if (error_msg != nullptr) {
+      *error_msg = kvarn_error;
+    }
+    return nullptr;
+  }
   const std::uint32_t model_context =
       config.context_length > 0 ? config.context_length : max_context;
   if (max_context == 0 || max_context > model_context) {
@@ -269,8 +278,15 @@ std::unique_ptr<QwenGpuExecutor> QwenGpuExecutor::Create(
     return nullptr;
   }
 
-  return std::make_unique<QwenGpuExecutor>(std::move(model), max_context,
-                                           policy);
+  try {
+    return std::make_unique<QwenGpuExecutor>(std::move(model), max_context,
+                                             policy);
+  } catch (const std::exception& error) {
+    if (error_msg != nullptr) {
+      *error_msg = error.what();
+    }
+    return nullptr;
+  }
 }
 
 std::unique_ptr<QwenGpuExecutor> QwenGpuExecutor::CreateFromGguf(

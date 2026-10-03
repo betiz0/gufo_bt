@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "src/models/qwen/hip/kernels/kvarn_device.hpp"
 #include "src/models/qwen/hip/ops/attention.hpp"
 #include "src/models/qwen/hip/ops/token.hpp"
 #include "src/models/qwen/hip/quant_ops.hpp"
@@ -29,7 +30,7 @@ __launch_bounds__(256, 4) __global__ void BatchedFusedQKNormRoPEKvWriteKernel(
     std::uint32_t start_pos, std::size_t batch_size, std::uint32_t max_context,
     std::uint32_t num_heads, std::uint32_t num_kv_heads, std::uint32_t head_dim,
     std::uint32_t rotary_dim, float rope_theta, float eps,
-    const models::qwen::vision::DeviceRope* rope) {
+    const models::qwen::vision::DeviceRope* rope, KvarnWriteParams kvarn) {
   const std::size_t b = blockIdx.y;
   const std::uint32_t block = blockIdx.x;
   const std::size_t tid = threadIdx.x;
@@ -74,6 +75,30 @@ __launch_bounds__(256, 4) __global__ void BatchedFusedQKNormRoPEKvWriteKernel(
     }
     __syncthreads();
 
+    if (kvarn.enabled()) {
+      // design D3: rotate the normed+roped Q head in place, then the KVarN
+      // write stores the rotated K/V rows.
+      for (std::size_t p = tid; p < half_rot; p += blockDim.x) {
+        const float q0 = s_norm[p];
+        const float q1 = s_norm[p + half_rot];
+        const float exponent =
+            static_cast<float>(2 * p) / static_cast<float>(rotary_dim);
+        const float inv_freq = 1.0F / powf(rope_theta, exponent);
+        const float angle =
+            models::qwen::vision::RopePosition(rope, cur_pos, p) * inv_freq;
+        const float cos_val = cosf(angle);
+        const float sin_val = sinf(angle);
+        s_norm[p] = (q0 * cos_val) - (q1 * sin_val);
+        s_norm[p + half_rot] = (q0 * sin_val) + (q1 * cos_val);
+      }
+      __syncthreads();
+      KvarnFwhtRowShared(s_norm, static_cast<int>(tid));
+      __syncthreads();
+      for (std::size_t i = tid; i < head_dim; i += blockDim.x) {
+        q_out[head_base + i] = s_norm[i];
+      }
+      return;
+    }
     for (std::size_t p = tid; p < half_rot; p += blockDim.x) {
       const float q0 = s_norm[p];
       const float q1 = s_norm[p + half_rot];
@@ -134,6 +159,63 @@ __launch_bounds__(256, 4) __global__ void BatchedFusedQKNormRoPEKvWriteKernel(
        kv_total) +
       (static_cast<std::size_t>(kv_h) * head_dim);
 
+  if (kvarn.enabled()) {
+    // design D3/D1: RoPE the normed K head, rotate it, and store the rotated
+    // K and V rows into the KVarN sink or tail ring.
+    for (std::size_t p = tid; p < half_rot; p += blockDim.x) {
+      const float k0 = s_norm[p];
+      const float k1 = s_norm[p + half_rot];
+      const float exponent =
+          static_cast<float>(2 * p) / static_cast<float>(rotary_dim);
+      const float inv_freq = 1.0F / powf(rope_theta, exponent);
+      const float angle =
+          models::qwen::vision::RopePosition(rope, cur_pos, p) * inv_freq;
+      const float cos_val = cosf(angle);
+      const float sin_val = sinf(angle);
+      s_norm[p] = (k0 * cos_val) - (k1 * sin_val);
+      s_norm[p + half_rot] = (k0 * sin_val) + (k1 * cos_val);
+    }
+    __syncthreads();
+    KvarnFwhtRowShared(s_norm, static_cast<int>(tid));
+    __syncthreads();
+    const bool in_sink = cur_pos < models::qwen::kKvarnSinkRows;
+    __half* k_row = nullptr;
+    __half* v_row = nullptr;
+    if (kvarn.chunk != nullptr) {
+      // design D4/4.1: hold the chunk's rotated rows in the bounded per-chunk
+      // workspace. LaunchKvarnChunkFlush merges them into the sink and ring
+      // after attention, so the ring keeps the pre-chunk rows this chunk still
+      // reads as F16.
+      const std::size_t row =
+          (static_cast<std::size_t>(b) * num_kv_heads + kv_h) * head_dim;
+      k_row = kvarn.chunk + row;
+      v_row = kvarn.chunk + kvarn.chunk_plane_elements + row;
+    } else {
+      __half* const region = in_sink ? kvarn.sink : kvarn.tail;
+      const std::uint64_t plane_elements =
+          in_sink ? kvarn.sink_plane_elements : kvarn.tail_plane_elements;
+      const std::size_t row = KvarnF16RowOffset(layer_idx, num_kv_heads, kv_h,
+                                                cur_pos, kvarn.ring_rows);
+      k_row = KvarnPlaneRow(region, plane_elements, row, false);
+      v_row = KvarnPlaneRow(region, plane_elements, row, true);
+    }
+    for (std::size_t i = tid; i < head_dim; i += blockDim.x) {
+      k_out[head_base + i] = s_norm[i];
+      k_row[i] = __float2half_rn(s_norm[i]);
+    }
+    __syncthreads();
+    for (std::size_t i = tid; i < head_dim; i += blockDim.x) {
+      s_norm[i] = v[head_base + i];
+    }
+    __syncthreads();
+    KvarnFwhtRowShared(s_norm, static_cast<int>(tid));
+    __syncthreads();
+    for (std::size_t i = tid; i < head_dim; i += blockDim.x) {
+      v_row[i] = __float2half_rn(s_norm[i]);
+    }
+    return;
+  }
+
   for (std::size_t p = tid; p < half_rot; p += blockDim.x) {
     const float k0 = s_norm[p];
     const float k1 = s_norm[p + half_rot];
@@ -187,14 +269,14 @@ void LaunchBatchedFusedQKNormRoPEKvWrite(
     std::uint32_t max_context, std::uint32_t num_heads,
     std::uint32_t num_kv_heads, std::uint32_t head_dim,
     std::uint32_t rotary_dim, float rope_theta, float eps, hipStream_t stream,
-    const models::qwen::vision::DeviceRope* rope) {
+    const models::qwen::vision::DeviceRope* rope, KvarnWriteParams kvarn) {
   const dim3 grid(num_heads + num_kv_heads,
                   static_cast<unsigned int>(batch_size));
   BatchedFusedQKNormRoPEKvWriteKernel<<<grid, 256, 0, stream>>>(
       q, k, v, q_weight, k_weight, q_out, k_out, k_cache, v_cache,
       static_cast<__half*>(k_cache_f16), static_cast<__half*>(v_cache_f16),
       layer_idx, start_pos, batch_size, max_context, num_heads, num_kv_heads,
-      head_dim, rotary_dim, rope_theta, eps, rope);
+      head_dim, rotary_dim, rope_theta, eps, rope, kvarn);
 }
 
 __global__ void BatchedRoPEKernel(

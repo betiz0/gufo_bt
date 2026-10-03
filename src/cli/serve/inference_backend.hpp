@@ -57,6 +57,15 @@ struct TextDiskCacheConfig {
   std::string draft_model_artifact_fingerprint;
 };
 
+/// `--kv-cache` selection. An empty `value` means the option was not given, so
+/// the model keeps its own KV format; a non-empty value is validated against
+/// the selected model and rejected for models that do not offer the option.
+struct TextKvCacheConfig {
+  std::string value;
+  /// `--kv-cache-tail` tokens; 0 means the option was not given.
+  std::uint32_t tail_tokens{0};
+};
+
 /// Thread-safe HTTP inference facade over shared immutable GPU model resources
 /// and a bounded pool of request-owned executor sessions.
 class InferenceBackend final : public TextGenerationBackend {
@@ -80,6 +89,7 @@ public:
             TextSchedulerPolicy scheduler_policy = {},
             const TextSpeculativeConfig& speculative_config = {},
             const TextDiskCacheConfig& disk_cache_config = {},
+            const TextKvCacheConfig& kv_cache_config = {},
             const std::string& vision_model_path = {});
 
 #if defined(ENGINE_ENABLE_HIP)
@@ -89,7 +99,8 @@ public:
             TextPrefillPolicy prefill_policy = {},
             TextSchedulerPolicy scheduler_policy = {},
             TextSpeculativeConfig speculative_config = {},
-            TextDiskCacheConfig disk_cache_config = {});
+            TextDiskCacheConfig disk_cache_config = {},
+            TextKvCacheConfig kv_cache_config = {});
 
   /// Installs a previously loaded DeepSeek model with request-owned sessions.
   bool load(std::shared_ptr<models::deepseek_v4_flash::Model> model,
@@ -98,7 +109,8 @@ public:
             TextPrefillPolicy prefill_policy = {},
             TextSchedulerPolicy scheduler_policy = {},
             TextSpeculativeConfig speculative_config = {},
-            TextDiskCacheConfig disk_cache_config = {});
+            TextDiskCacheConfig disk_cache_config = {},
+            TextKvCacheConfig kv_cache_config = {});
 
   /// Installs a previously loaded Qwen3.8-Flash-Next model with
   /// request-owned sessions, the model's tokenizer, and host-memory
@@ -109,7 +121,8 @@ public:
             TextPrefillPolicy prefill_policy = {},
             TextSchedulerPolicy scheduler_policy = {},
             TextSpeculativeConfig speculative_config = {},
-            TextDiskCacheConfig disk_cache_config = {});
+            TextDiskCacheConfig disk_cache_config = {},
+            TextKvCacheConfig kv_cache_config = {});
 #endif
 
   /// Stable model identifier used in API responses.
@@ -117,6 +130,8 @@ public:
   [[nodiscard]] bool ready() const override;
   [[nodiscard]] SamplingDefaults sampling_defaults() const override;
   [[nodiscard]] std::uint32_t max_context() const override;
+  /// Attention KV format actually in use, for the startup log and bench output.
+  [[nodiscard]] std::string kv_cache_format() const;
   [[nodiscard]] ReasoningOptions reasoning_defaults() const override;
   [[nodiscard]] InitialOutputState initial_output_state(
       const ChatRequest& request) const override;

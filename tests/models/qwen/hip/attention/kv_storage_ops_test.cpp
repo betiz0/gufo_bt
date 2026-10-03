@@ -6,6 +6,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string_view>
+#include <tuple>
 #include <vector>
 
 #if defined(ENGINE_ENABLE_HIP)
@@ -15,6 +16,7 @@
 #include "src/models/qwen/hip/detail/attention_policy.hpp"
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen/hip/ops.hpp"
+#include "src/models/qwen/kvarn_reference.hpp"
 #include "tests/models/qwen/hip/support/device.hpp"
 #include "tests/models/qwen/hip/support/device_buffer.hpp"
 #include "tests/models/qwen/support/synthetic_weights.hpp"
@@ -603,6 +605,95 @@ void TestSplitKDecodeFp16Equivalence() {
   HIP_CHECK(hipFree(d_fp16_scratch));
 }
 
+void TestKvarnRegionAccounting() {
+  const auto config = ProductionQwen27BConfig();
+  // A context that is a whole number of 128-token tiles past the sink, so the
+  // expected byte counts below are exact.
+  constexpr std::uint32_t context = 65536;
+  const std::size_t heads = 16 * 4;
+  const std::size_t tiles = (context - 128) / 128;
+  const std::size_t expected_sink = heads * 128 * 256 * 2 * 2;
+  const std::size_t fp16_kv = 2U * config.FullAttentionLayerCount() * context *
+                              config.num_key_value_heads * config.head_dim *
+                              sizeof(std::uint16_t);
+  const auto fp16 = Fp16Policy();
+  const auto fp16_usage =
+      QwenGpuArena::EstimateMemoryUsage(config, context, fp16);
+  const auto tile_bytes = [](unsigned bits) {
+    return gufo::models::qwen::kKvarnPayloadMetadataBytes +
+           gufo::models::qwen::kKvarnLowPlaneBytes +
+           (bits > 4 ? gufo::models::qwen::kKvarnBitPlaneBytes : 0) +
+           (bits > 5 ? gufo::models::qwen::kKvarnBitPlaneBytes : 0);
+  };
+
+  for (const auto& [name, k_bits, v_bits] :
+       {std::tuple{"kvarn-k4v4", 4, 4}, std::tuple{"kvarn-k5v4", 5, 4},
+        std::tuple{"kvarn-k6v5", 6, 5}}) {
+    const std::size_t expected_body =
+        heads * tiles * (tile_bytes(k_bits) + tile_bytes(v_bits));
+    for (const std::uint32_t tail : {0U, 2048U}) {
+      const std::size_t tail_rows = tail == 0 ? gufo::hip::kQwenKvarnW : tail;
+      const std::size_t ring_rows = tail_rows + 128 + gufo::hip::kQwenKvarnW;
+      const std::size_t expected_tail = heads * ring_rows * 256 * 2 * 2;
+      // Design D4/4.1: the bounded per-chunk F16 workspace is a fixed session
+      // cap of one whole prefill chunk (two planes).
+      constexpr std::size_t kMaxPromptBatch = 4096;
+      const std::size_t chunk_rows = std::min<std::size_t>(context, kMaxPromptBatch);
+      const std::size_t expected_chunk =
+          2 * chunk_rows * config.num_key_value_heads * config.head_dim *
+          sizeof(std::uint16_t);
+      const std::size_t expected_total =
+          expected_sink + expected_body + expected_tail + expected_chunk;
+
+      auto policy = QwenExecutionPolicy::Production();
+      Expect(gufo::hip::ResolveQwenKvCache(name, tail, &policy),
+             "a KVarN preset must resolve");
+      const auto kvarn_usage =
+          QwenGpuArena::EstimateMemoryUsage(config, context, policy);
+      Expect(kvarn_usage.request_state_bytes ==
+                 fp16_usage.request_state_bytes - fp16_kv + expected_total,
+             "the estimate must swap the FP16 KV term for the KVarN regions");
+      Expect(kvarn_usage.temporary_scratch_bytes ==
+                 fp16_usage.temporary_scratch_bytes,
+             "KVarN must not change shared scratch accounting");
+
+      QwenGpuArena arena(config, context, policy);
+      HIP_CHECK(hipStreamSynchronize(arena.stream));
+      Expect(arena.d_kv_cache == nullptr && arena.d_attention_kv_f16 == nullptr,
+             "KVarN must not allocate the FP16 or FP32 planes");
+      Expect(arena.d_kvarn_sink != nullptr && arena.d_kvarn_body != nullptr &&
+                 arena.d_kvarn_tail != nullptr &&
+                 arena.d_kvarn_chunk != nullptr,
+             "KVarN must allocate its sink, body, tail and chunk regions");
+      const auto& regions = arena.GetKvarnRegions();
+      Expect(regions.sink_bytes == expected_sink &&
+                 regions.body_bytes == expected_body &&
+                 regions.tail_bytes == expected_tail &&
+                 regions.total_bytes == expected_sink + expected_body +
+                                            expected_tail,
+             "the allocated KVarN regions must match the design D5 formula");
+      Expect(regions.tile_count == tiles && regions.tail_rows == ring_rows,
+             "the KVarN layout must report the tile count and ring capacity");
+    }
+  }
+
+  // A shape KVarN does not support is a startup error, not a silent fallback.
+  auto policy = QwenExecutionPolicy::Production();
+  Expect(gufo::hip::ResolveQwenKvCache("kvarn-k4v4", 0, &policy),
+         "kvarn-k4v4 must resolve");
+  auto small = config;
+  small.num_attention_heads = 8;
+  small.num_key_value_heads = 2;
+  small.head_dim = 128;
+  bool rejected = false;
+  try {
+    QwenGpuArena unsupported(small, 4096, policy);
+  } catch (const std::exception&) {
+    rejected = true;
+  }
+  Expect(rejected, "KVarN must reject an unsupported attention shape");
+}
+
 }  // namespace
 #endif  // defined(ENGINE_ENABLE_HIP)
 
@@ -617,6 +708,7 @@ int main() {
   TestCausalDecodeRows();
   TestProductionMemoryScaling();
   TestCanonicalMemoryAccountingAndSnapshot();
+  TestKvarnRegionAccounting();
   TestCompactPersistentSnapshotRoundTrip();
   TestOnlineAndGraphDecodeFp16Equivalence();
   TestSplitKDecodeFp16Equivalence();

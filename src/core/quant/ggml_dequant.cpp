@@ -404,6 +404,29 @@ void DequantizeQ8_0(const void* src, float* dst, std::size_t k) {
   }
 }
 
+void DequantizeQ5_0(const void* src, float* dst, std::size_t k) {
+  const auto* blocks = static_cast<const block_q5_0*>(src);
+  const std::size_t nb = k / 32;
+
+  for (std::size_t b = 0; b < nb; ++b) {
+    const float d = Fp16ToFloat(blocks[b].d);
+    const auto high = static_cast<std::uint32_t>(blocks[b].qh[0]) |
+                      (static_cast<std::uint32_t>(blocks[b].qh[1]) << 8U) |
+                      (static_cast<std::uint32_t>(blocks[b].qh[2]) << 16U) |
+                      (static_cast<std::uint32_t>(blocks[b].qh[3]) << 24U);
+    for (std::size_t i = 0; i < 16; ++i) {
+      // Elements 0-15 take the low nibbles and bit i of the high-bit word,
+      // elements 16-31 the high nibbles and bit i + 16.
+      const auto lo = static_cast<int>((blocks[b].qs[i] & 0x0FU) |
+                                       (((high >> i) & 1U) << 4U));
+      const auto hi = static_cast<int>((blocks[b].qs[i] >> 4U) |
+                                       (((high >> (i + 16)) & 1U) << 4U));
+      dst[(b * 32) + i] = d * static_cast<float>(lo - 16);
+      dst[(b * 32) + 16 + i] = d * static_cast<float>(hi - 16);
+    }
+  }
+}
+
 float DotProductQ8_0(const void* row_data, std::span<const float> vec,
                      std::size_t k) {
   const auto* blocks = static_cast<const block_q8_0*>(row_data);

@@ -7,10 +7,13 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <stdexcept>
 
 #include "src/core/hip/detail/dispatch_telemetry.hpp"
 #include "src/core/hip/hip_utils.hpp"
 #include "src/models/qwen/hip/detail/attention_policy.hpp"
+#include "src/models/qwen/hip/kernels/kvarn_device.hpp"
+#include "src/models/qwen/hip/kernels/kvarn_read_device.hpp"
 #include "src/models/qwen/hip/ops/attention.hpp"
 
 namespace gufo::hip {
@@ -70,6 +73,67 @@ __device__ __forceinline__ float4 LoadBatchedHalf4(const __half* source) {
   return make_float4(lower.x, lower.y, upper.x, upper.y);
 }
 
+/// One 4-channel K block of key position `p` for a query row whose view reads
+/// `view_tiles` tiles quantized (design D2/D7): a sealed tile decodes in place
+/// with its channel and token scales folded in, an F16 row is read as stored.
+__device__ __forceinline__ float4 BatchedLoadK(
+    const float* k_cache, const __half* k_cache_f16,
+    const KvarnReadParams& kvarn, std::uint32_t layer_idx, std::uint32_t kv_h,
+    std::uint32_t num_kv_heads, std::uint32_t head_dim,
+    std::uint32_t max_context, std::uint32_t p, std::uint32_t view_tiles,
+    std::uint32_t chunk_begin, std::uint32_t chunk_end, std::size_t d) {
+  if (kvarn.enabled()) {
+    const std::uint32_t channel = static_cast<std::uint32_t>(d * 4);
+    return make_float4(
+        KvarnStoredKElement(kvarn, layer_idx, kv_h, p, view_tiles, chunk_begin, chunk_end, channel),
+        KvarnStoredKElement(kvarn, layer_idx, kv_h, p, view_tiles, chunk_begin, chunk_end, channel + 1),
+        KvarnStoredKElement(kvarn, layer_idx, kv_h, p, view_tiles, chunk_begin, chunk_end, channel + 2),
+        KvarnStoredKElement(kvarn, layer_idx, kv_h, p, view_tiles, chunk_begin,
+                            chunk_end, channel + 3));
+  }
+  const std::size_t kv_width = static_cast<std::size_t>(num_kv_heads) * head_dim;
+  if (k_cache == nullptr) {
+    const std::size_t offset =
+        ((static_cast<std::size_t>(layer_idx) * max_context + p) * kv_width) +
+        (static_cast<std::size_t>(kv_h) * head_dim);
+    return LoadBatchedHalf4(k_cache_f16 + offset + (d * 4));
+  }
+  const std::size_t offset =
+      (((static_cast<std::size_t>(layer_idx) * num_kv_heads + kv_h) *
+            max_context +
+        p) *
+       head_dim);
+  return reinterpret_cast<const float4*>(k_cache + offset)[d];
+}
+
+/// One V channel of key position `p` for a query row whose view reads
+/// `view_tiles` tiles quantized (design D2/D7), folded exactly like the decode
+/// read (channel and token scales).
+__device__ __forceinline__ float BatchedLoadV(
+    const float* v_cache, const __half* v_cache_f16,
+    const KvarnReadParams& kvarn, std::uint32_t layer_idx, std::uint32_t kv_h,
+    std::uint32_t num_kv_heads, std::uint32_t head_dim,
+    std::uint32_t max_context, std::uint32_t p, std::uint32_t view_tiles,
+    std::uint32_t chunk_begin, std::uint32_t chunk_end,
+    std::uint32_t channel) {
+  if (kvarn.enabled()) {
+    return KvarnStoredVElement(kvarn, layer_idx, kv_h, p, view_tiles, chunk_begin, chunk_end, channel);
+  }
+  const std::size_t kv_width = static_cast<std::size_t>(num_kv_heads) * head_dim;
+  if (v_cache == nullptr) {
+    const std::size_t offset =
+        ((static_cast<std::size_t>(layer_idx) * max_context + p) * kv_width) +
+        (static_cast<std::size_t>(kv_h) * head_dim);
+    return __half2float(v_cache_f16[offset + channel]);
+  }
+  const std::size_t offset =
+      (((static_cast<std::size_t>(layer_idx) * num_kv_heads + kv_h) *
+            max_context +
+        p) *
+       head_dim);
+  return v_cache[offset + channel];
+}
+
 __global__ void BatchedAttentionKernel(
     const float* __restrict__ q, const float* __restrict__ gate,
     const float* __restrict__ k_cache, const float* __restrict__ v_cache,
@@ -77,8 +141,8 @@ __global__ void BatchedAttentionKernel(
     const __half* __restrict__ v_cache_f16, float* __restrict__ out_context,
     hip_bfloat16* __restrict__ out_context_bf16, std::uint32_t layer_idx,
     std::uint32_t start_pos, std::size_t batch_size, std::uint32_t max_context,
-    std::uint32_t num_heads, std::uint32_t num_kv_heads,
-    std::uint32_t head_dim) {
+    std::uint32_t num_heads, std::uint32_t num_kv_heads, std::uint32_t head_dim,
+    KvarnReadParams kvarn) {
   const std::uint32_t h = blockIdx.x;
   const std::uint32_t t = blockIdx.y;
   if (h >= num_heads || t >= batch_size) {
@@ -88,15 +152,21 @@ __global__ void BatchedAttentionKernel(
   const std::size_t tid = threadIdx.x;
   const std::uint32_t kv_h = h / (num_heads / num_kv_heads);
   const float scale = 1.0F / sqrtf(static_cast<float>(head_dim));
-  const bool use_f16_cache = k_cache == nullptr;
-  const std::size_t kv_width =
-      static_cast<std::size_t>(num_kv_heads) * head_dim;
 
   __shared__ float s_scratch[256];
+  __shared__ float s_context[kKvarnHeadDim];
   extern __shared__ float s_scores[];
 
   const std::uint32_t cur_pos = start_pos + static_cast<std::uint32_t>(t);
   const std::size_t seq_len = static_cast<std::size_t>(cur_pos) + 1;
+  const std::uint32_t chunk_end =
+      start_pos + static_cast<std::uint32_t>(batch_size);
+  // One block owns one (query row, head), so the view is per row and needs no
+  // group split (design D2/D7).
+  const std::uint32_t view_tiles =
+      kvarn.enabled()
+          ? KvarnQuantizedTilesForQuery(cur_pos, kvarn.tail_length)
+          : 0U;
   const float* q_h =
       q + (t * num_heads * head_dim) + (static_cast<std::size_t>(h) * head_dim);
 
@@ -108,25 +178,13 @@ __global__ void BatchedAttentionKernel(
     const std::size_t wave_id = tid >> 5U;
     const std::size_t waves_per_block = blockDim.x >> 5U;
     for (std::size_t p = wave_id; p < seq_len; p += waves_per_block) {
-      const std::size_t p_offset =
-          (((static_cast<std::size_t>(layer_idx) * num_kv_heads + kv_h) *
-                max_context +
-            p) *
-           head_dim);
-      const std::size_t p_offset_f16 =
-          ((static_cast<std::size_t>(layer_idx) * max_context + p) * kv_width) +
-          (static_cast<std::size_t>(kv_h) * head_dim);
-      const auto* k_p_vec =
-          use_f16_cache ? nullptr
-                        : reinterpret_cast<const float4*>(k_cache + p_offset);
-      const __half* k_p_f16 =
-          use_f16_cache ? k_cache_f16 + p_offset_f16 : nullptr;
-
       float dot = 0.0F;
       for (std::size_t d = lane_id; d < num_vec; d += 32) {
         const float4 qv = q_h_vec[d];
-        const float4 kv =
-            use_f16_cache ? LoadBatchedHalf4(k_p_f16 + (d * 4)) : k_p_vec[d];
+        const float4 kv = BatchedLoadK(
+            k_cache, k_cache_f16, kvarn, layer_idx, kv_h, num_kv_heads,
+            head_dim, max_context, static_cast<std::uint32_t>(p), view_tiles,
+            start_pos, chunk_end, d);
         dot += (qv.x * kv.x) + (qv.y * kv.y) + (qv.z * kv.z) + (qv.w * kv.w);
       }
       for (int offset = 16; offset > 0; offset >>= 1) {
@@ -138,25 +196,13 @@ __global__ void BatchedAttentionKernel(
     }
   } else {
     for (std::size_t p = tid; p < seq_len; p += blockDim.x) {
-      const std::size_t p_offset =
-          (((static_cast<std::size_t>(layer_idx) * num_kv_heads + kv_h) *
-                max_context +
-            p) *
-           head_dim);
-      const std::size_t p_offset_f16 =
-          ((static_cast<std::size_t>(layer_idx) * max_context + p) * kv_width) +
-          (static_cast<std::size_t>(kv_h) * head_dim);
-      const auto* k_p_vec =
-          use_f16_cache ? nullptr
-                        : reinterpret_cast<const float4*>(k_cache + p_offset);
-      const __half* k_p_f16 =
-          use_f16_cache ? k_cache_f16 + p_offset_f16 : nullptr;
-
       float dot = 0.0F;
       for (std::size_t d = 0; d < num_vec; ++d) {
         const float4 qv = q_h_vec[d];
-        const float4 kv =
-            use_f16_cache ? LoadBatchedHalf4(k_p_f16 + (d * 4)) : k_p_vec[d];
+        const float4 kv = BatchedLoadK(
+            k_cache, k_cache_f16, kvarn, layer_idx, kv_h, num_kv_heads,
+            head_dim, max_context, static_cast<std::uint32_t>(p), view_tiles,
+            start_pos, chunk_end, d);
         dot += (qv.x * kv.x) + (qv.y * kv.y) + (qv.z * kv.z) + (qv.w * kv.w);
       }
       s_scores[p] = dot * scale;
@@ -206,20 +252,21 @@ __global__ void BatchedAttentionKernel(
   if (tid < head_dim) {
     float ctx = 0.0F;
     for (std::size_t p = 0; p < seq_len; ++p) {
-      const std::size_t p_offset =
-          (((static_cast<std::size_t>(layer_idx) * num_kv_heads + kv_h) *
-                max_context +
-            p) *
-           head_dim);
-      if (use_f16_cache) {
-        const std::size_t p_offset_f16 =
-            ((static_cast<std::size_t>(layer_idx) * max_context + p) *
-             kv_width) +
-            (static_cast<std::size_t>(kv_h) * head_dim);
-        ctx += s_scores[p] * __half2float(v_cache_f16[p_offset_f16 + tid]);
-      } else {
-        ctx += s_scores[p] * v_cache[p_offset + tid];
-      }
+      ctx += s_scores[p] *
+             BatchedLoadV(v_cache, v_cache_f16, kvarn, layer_idx, kv_h,
+                          num_kv_heads, head_dim, max_context,
+                          static_cast<std::uint32_t>(p), view_tiles, start_pos,
+                          chunk_end, static_cast<std::uint32_t>(tid));
+    }
+
+    if (kvarn.enabled()) {
+      // Inverse Hadamard rotation of the merged context, once, before the
+      // SiLU gate (design D3). The block owns all head_dim channels.
+      s_context[tid] = ctx;
+      __syncthreads();
+      KvarnFwhtRowShared(s_context, static_cast<int>(tid));
+      __syncthreads();
+      ctx = s_context[tid];
     }
 
     if (gate != nullptr) {
@@ -247,9 +294,11 @@ void LaunchBatchedAttention(const float* q, const float* k, const float* v,
                             std::uint32_t max_context, std::uint32_t num_heads,
                             std::uint32_t num_kv_heads, std::uint32_t head_dim,
                             hipStream_t stream, bool skip_kv_write,
-                            void* out_context_bf16) {
+                            void* out_context_bf16, KvarnReadParams kvarn) {
+  RequireAttentionKvSource(k_cache, v_cache, k_cache_f16, v_cache_f16,
+                           kvarn.enabled());
   const dim3 kv_grid(num_kv_heads, static_cast<unsigned int>(batch_size));
-  if (!skip_kv_write) {
+  if (!skip_kv_write && !kvarn.enabled()) {
     WriteBatchedKVCacheKernel<<<kv_grid, 256, 0, stream>>>(
         k, v, k_cache, v_cache, static_cast<__half*>(k_cache_f16),
         static_cast<__half*>(v_cache_f16), layer_idx, start_pos, batch_size,
@@ -264,7 +313,7 @@ void LaunchBatchedAttention(const float* q, const float* k, const float* v,
       q, gate, k_cache, v_cache, static_cast<const __half*>(k_cache_f16),
       static_cast<const __half*>(v_cache_f16), out_context,
       static_cast<hip_bfloat16*>(out_context_bf16), layer_idx, start_pos,
-      batch_size, max_context, num_heads, num_kv_heads, head_dim);
+      batch_size, max_context, num_heads, num_kv_heads, head_dim, kvarn);
 }
 
 __global__ void CausalSoftmaxKernel(float* __restrict__ scores,
@@ -339,7 +388,13 @@ void LaunchBatchedAttentionGemm(
     void* v_cache_f16, float* scores, float* out_context,
     std::uint32_t layer_idx, std::uint32_t start_pos, std::size_t batch_size,
     std::uint32_t max_context, std::uint32_t num_heads,
-    std::uint32_t num_kv_heads, std::uint32_t head_dim, hipStream_t stream) {
+    std::uint32_t num_kv_heads, std::uint32_t head_dim, hipStream_t stream,
+    KvarnReadParams kvarn) {
+  if (kvarn.enabled()) {
+    // Test/bench-only read path; never silently fall back to FP16/FP32.
+    throw std::runtime_error(
+        "KVarN KV storage does not support the GEMM attention path");
+  }
   if (batch_size == 0) {
     return;
   }

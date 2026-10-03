@@ -107,7 +107,8 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
       // (opt-c010-qk-rope-kv). The unfused chain stays wired behind the
       // policy toggle as the independent reference.
       const bool fused_qknorm_rope_kv =
-          route_plan.fuse_qk_norm_rope_kv &&
+          (route_plan.fuse_qk_norm_rope_kv ||
+           arena.GetKvarnWriteParams().enabled()) &&
           detail::IsFusedQkNormSupported(config.head_dim);
       if (fused_qknorm_rope_kv) {
         LaunchFusedQKNormRoPEKvWrite(
@@ -123,7 +124,7 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
             attn_layer_idx, d_in_pos, arena.GetMaxContext(),
             config.num_attention_heads, config.num_key_value_heads,
             config.head_dim, config.rotary_dim, config.rope_theta, 1e-6F,
-            arena.stream, rope);
+            arena.stream, rope, arena.GetKvarnWriteParams());
       } else {
         if (!layer.attn_q_norm.empty()) {
           LaunchPerHeadRMSNorm(
@@ -148,7 +149,23 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
       }
 
       // Softmax Attention + Gating
-      if (use_split_k_decode) {
+      const auto kvarn_read = arena.GetKvarnReadParams();
+      if (kvarn_read.enabled()) {
+        // Seal the tiles the view rule selects, then read the sink, sealed
+        // tiles and tail ring through one online softmax (design D4/D7).
+        const auto& regions = arena.GetKvarnRegions();
+        LaunchKvarnSeal(
+            *arena.GetKvarnSealState(), policy.kvarn, arena.d_kvarn_sink,
+            arena.d_kvarn_tail, regions.sink_elements, regions.tail_elements,
+            static_cast<std::uint32_t>(regions.tail_rows), arena.d_kvarn_body,
+            static_cast<std::uint32_t>(regions.tile_count), attn_layer_idx,
+            config.num_key_value_heads, pos, d_in_pos, 1, arena.stream);
+        LaunchKvarnDecodeAttention(
+            attention_scratch.q.data(), ssm_scratch.gate.data(),
+            ssm_scratch.out.data(), attn_layer_idx, pos, d_in_pos, 1,
+            config.num_attention_heads, config.num_key_value_heads, kvarn_read,
+            attention_scratch.split_k.data(), arena.stream);
+      } else if (use_split_k_decode) {
         LaunchAttention(
             attention_scratch.q.data(), attention_scratch.k.data(),
             attention_scratch.v.data(), ssm_scratch.gate.data(),

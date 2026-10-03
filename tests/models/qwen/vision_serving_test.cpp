@@ -1,5 +1,8 @@
 #include <unistd.h>
 
+#include <hip/hip_runtime.h>
+
+#include <algorithm>
 #include <array>
 #include <cctype>
 #include <cmath>
@@ -7,11 +10,15 @@
 #include <functional>
 #include <iostream>
 #include <memory>
+#include <span>
 #include <stdexcept>
+#include <vector>
 
 #include "src/cli/serve/inference_backend.hpp"
 #include "src/core/gguf_identity.hpp"
+#include "src/core/hip/hip_utils.hpp"
 #include "src/core/image.hpp"
+#include "src/models/qwen/hip/execution_policy.hpp"
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen38_flash_next/engine.hpp"
 
@@ -188,6 +195,76 @@ void CheckQwenIncrementalOracle(
   const auto cold_logits = incremental.CopyLastLogits();
   Require(std::ranges::equal(expected, cold_logits),
           "Qwen image prefill logits changed with chunk boundaries");
+}
+
+// Task 5.4 / spec "セッション状態の整合" (image scenario): KVarN under a context
+// that carries image tokens and M-RoPE positions. Generation must cross the
+// first tile view-switch position 256 + L (design D2/D4), and restoring a
+// snapshot taken before that generation must reproduce the uninterrupted
+// logits bit for bit.
+void CheckQwenKvarnImageSnapshotOracle(
+    const std::shared_ptr<const hip::QwenGpuModel>& model,
+    const server::ChatRequest& request, std::uint32_t context) {
+  Require(model->VisionEncoder() != nullptr,
+          "KVarN image check requires the vision sidecar");
+  hip::QwenExecutionPolicy policy;
+  if (!hip::ResolveQwenKvCache("kvarn-k4v4", /*tail_tokens=*/0, &policy)) {
+    std::cout << "SKIP: this build registers no KVarN production preset\n";
+    return;
+  }
+  const auto prompt = std::make_shared<models::qwen::vision::Prompt>(
+      models::qwen::vision::Prepare(
+          model->GetTokenizer(), request.messages, {},
+          tokenization::ResolveQwenChatOptions(request.reasoning,
+                                               request.add_vision_id),
+          model->VisionEncoder()->identity(), context));
+  Require(!prompt->tokens.empty() && !prompt->images.empty(),
+          "KVarN image fixture must carry image tokens");
+  const auto tokens = std::span(prompt->tokens);
+  const std::uint32_t first_seal_query =
+      256U + hip::QwenKvarnTailRows(policy.kvarn);
+  const std::size_t steps = tokens.size() < first_seal_query + 8U
+                                ? first_seal_query + 8U - tokens.size()
+                                : 8U;
+  Require(tokens.size() + steps + 1U <= context,
+          "KVarN image fixture must fit the context");
+
+  hip::QwenGpuExecutor reference(model, context, policy);
+  reference.ConfigureVision(prompt, model->VisionEncoder());
+  tokenization::TokenId next = reference.ForwardPromptBatch(tokens);
+  auto snapshot =
+      reference.SaveSnapshot(static_cast<std::uint32_t>(tokens.size()));
+  std::vector<tokenization::TokenId> generated;
+  std::vector<std::vector<float>> expected;
+  for (std::size_t step = 0; step < steps; ++step) {
+    generated.push_back(next);
+    const auto position = static_cast<std::uint32_t>(tokens.size() + step);
+    next = reference.ForwardToken(next, position);
+    const auto logits = reference.CopyLastLogits();
+    Require(
+        std::ranges::all_of(logits, [](float value) {
+          return std::isfinite(value);
+        }),
+        "KVarN image logits must be finite");
+    expected.emplace_back(logits.begin(), logits.end());
+  }
+  std::uint32_t sealed = 0;
+  HIP_CHECK(hipMemcpy(&sealed, reference.GetKvarnSealState()->sealed(),
+                      sizeof(sealed), hipMemcpyDeviceToHost));
+  Require(sealed > 0, "KVarN image fixture did not seal a tile");
+
+  hip::QwenGpuExecutor restored(model, context, policy);
+  restored.ConfigureVision(prompt, model->VisionEncoder());
+  restored.RestoreSnapshot(*snapshot);
+  for (std::size_t step = 0; step < generated.size(); ++step) {
+    const auto position = static_cast<std::uint32_t>(tokens.size() + step);
+    (void)restored.ForwardToken(generated[step], position);
+    Require(std::ranges::equal(restored.CopyLastLogits(), expected[step]),
+            "KVarN image snapshot restore changed logits");
+  }
+  std::cout << "KVarN image M-RoPE seal/snapshot exact prefix="
+            << tokens.size() << " steps=" << steps << " sealed=" << sealed
+            << '\n';
 }
 
 void CheckAppendSnapshotOracle(
@@ -534,6 +611,8 @@ int main(int argc, char** argv) {
     ar.reset();
     if (!flash)
       CheckQwenIncrementalOracle(qwen, continuation, references[0], continued);
+    if (!flash)
+      CheckQwenKvarnImageSnapshotOracle(qwen, continuation, context);
     if (flash)
       CheckFlashIncrementalOracle(qfn, continuation, continued);
 

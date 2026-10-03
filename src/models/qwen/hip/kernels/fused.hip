@@ -11,6 +11,7 @@
 #include "src/core/gguf_reader.hpp"
 #include "src/core/hip/detail/dispatch_telemetry.hpp"
 #include "src/core/hip/detail/gemv_dispatcher.hpp"
+#include "src/models/qwen/hip/kernels/kvarn_device.hpp"
 #include "src/models/qwen/hip/ops.hpp"
 #include "src/models/qwen/hip/quant_ops.hpp"
 
@@ -27,7 +28,7 @@ __launch_bounds__(256, 4) __global__ void FusedQKNormRoPEKvWriteKernel(
     const std::uint32_t* __restrict__ d_pos, std::uint32_t max_context,
     std::uint32_t num_heads, std::uint32_t num_kv_heads, std::uint32_t head_dim,
     std::uint32_t rotary_dim, float rope_theta, float eps,
-    const models::qwen::vision::DeviceRope* rope) {
+    const models::qwen::vision::DeviceRope* rope, KvarnWriteParams kvarn) {
   const std::uint32_t block = blockIdx.x;
   const std::size_t tid = threadIdx.x;
   const std::uint32_t half_rot = rotary_dim / 2;
@@ -61,6 +62,30 @@ __launch_bounds__(256, 4) __global__ void FusedQKNormRoPEKvWriteKernel(
       s_norm[i] = (x_head[i] * inv_rms) * w;
     }
     __syncthreads();
+
+    if (kvarn.enabled()) {
+      // Rotate Q after RoPE (design D3); the same rotation is applied to K so
+      // the QK score is unchanged.
+      for (std::size_t p = tid; p < half_rot; p += blockDim.x) {
+        const float q0 = s_norm[p];
+        const float q1 = s_norm[p + half_rot];
+        const float exponent =
+            static_cast<float>(2 * p) / static_cast<float>(rotary_dim);
+        const float inv_freq = 1.0F / powf(rope_theta, exponent);
+        const float angle =
+            models::qwen::vision::RopePosition(rope, pos, p) * inv_freq;
+        const float cos_val = cosf(angle);
+        const float sin_val = sinf(angle);
+        s_norm[p] = (q0 * cos_val) - (q1 * sin_val);
+        s_norm[p + half_rot] = (q0 * sin_val) + (q1 * cos_val);
+      }
+      __syncthreads();
+      KvarnFwhtRowShared(s_norm, static_cast<int>(tid));
+      for (std::size_t i = tid; i < head_dim; i += blockDim.x) {
+        q_out[head_base + i] = s_norm[i];
+      }
+      return;
+    }
 
     for (std::size_t p = tid; p < half_rot; p += blockDim.x) {
       const float q0 = s_norm[p];
@@ -110,6 +135,50 @@ __launch_bounds__(256, 4) __global__ void FusedQKNormRoPEKvWriteKernel(
     s_norm[i] = (x_head[i] * inv_rms) * w;
   }
   __syncthreads();
+
+  if (kvarn.enabled()) {
+    // Rotate K after RoPE and V directly, then store both into the KVarN sink
+    // or tail ring (design D1/D3). Q was rotated identically above, so the QK
+    // score is unchanged.
+    for (std::size_t p = tid; p < half_rot; p += blockDim.x) {
+      const float k0 = s_norm[p];
+      const float k1 = s_norm[p + half_rot];
+      const float exponent =
+          static_cast<float>(2 * p) / static_cast<float>(rotary_dim);
+      const float inv_freq = 1.0F / powf(rope_theta, exponent);
+      const float angle =
+          models::qwen::vision::RopePosition(rope, pos, p) * inv_freq;
+      const float cos_val = cosf(angle);
+      const float sin_val = sinf(angle);
+      s_norm[p] = (k0 * cos_val) - (k1 * sin_val);
+      s_norm[p + half_rot] = (k0 * sin_val) + (k1 * cos_val);
+    }
+    __syncthreads();
+    KvarnFwhtRowShared(s_norm, static_cast<int>(tid));
+    const std::size_t row = KvarnF16RowOffset(layer_idx, num_kv_heads, kv_h,
+                                              pos, kvarn.ring_rows);
+    __half* const region =
+        pos < models::qwen::kKvarnSinkRows ? kvarn.sink : kvarn.tail;
+    const std::uint64_t plane_elements =
+        pos < models::qwen::kKvarnSinkRows ? kvarn.sink_plane_elements
+                                           : kvarn.tail_plane_elements;
+    __half* const k_row = KvarnPlaneRow(region, plane_elements, row, false);
+    for (std::size_t i = tid; i < head_dim; i += blockDim.x) {
+      k_out[head_base + i] = s_norm[i];
+      k_row[i] = __float2half_rn(s_norm[i]);
+    }
+    __syncthreads();
+    for (std::size_t i = tid; i < head_dim; i += blockDim.x) {
+      s_norm[i] = v[head_base + i];
+    }
+    __syncthreads();
+    KvarnFwhtRowShared(s_norm, static_cast<int>(tid));
+    __half* const v_row = KvarnPlaneRow(region, plane_elements, row, true);
+    for (std::size_t i = tid; i < head_dim; i += blockDim.x) {
+      v_row[i] = __float2half_rn(s_norm[i]);
+    }
+    return;
+  }
 
   const std::size_t kv_offset =
       (((static_cast<std::size_t>(layer_idx) * num_kv_heads + kv_h) *
@@ -177,12 +246,12 @@ void LaunchFusedQKNormRoPEKvWrite(
     std::uint32_t max_context, std::uint32_t num_heads,
     std::uint32_t num_kv_heads, std::uint32_t head_dim,
     std::uint32_t rotary_dim, float rope_theta, float eps, hipStream_t stream,
-    const models::qwen::vision::DeviceRope* rope) {
+    const models::qwen::vision::DeviceRope* rope, KvarnWriteParams kvarn) {
   FusedQKNormRoPEKvWriteKernel<<<num_heads + num_kv_heads, 256, 0, stream>>>(
       q, k, v, q_weight, k_weight, q_out, k_out, k_cache, v_cache,
       static_cast<__half*>(k_cache_f16), static_cast<__half*>(v_cache_f16),
       layer_idx, d_pos, max_context, num_heads, num_kv_heads, head_dim,
-      rotary_dim, rope_theta, eps, rope);
+      rotary_dim, rope_theta, eps, rope, kvarn);
 }
 
 }  // namespace gufo::hip

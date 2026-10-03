@@ -18,6 +18,8 @@ namespace gufo::cli {
 struct PromptOptions {
   std::string model_path;
   std::string vision_model_path;
+  std::string kv_cache;
+  std::string kv_cache_tail;
   std::vector<std::string> image_paths;
   bool add_vision_id{false};
   std::string prompt_text;

@@ -20,6 +20,12 @@ target_compile_definitions(qwen_chat_template_test PRIVATE
 add_qwen_cpu_test(qwen_cpu_oracles_test
   tests/models/qwen/cpu/oracles_test.cpp
   "cpu;models;qwen;oracles")
+add_qwen_cpu_test(qwen_kvarn_quant_cpu_test
+  tests/models/qwen/cpu/kvarn_quant_test.cpp
+  "cpu;models;qwen;kvarn;oracles;opt-c207-kv-quant")
+add_qwen_cpu_test(qwen_kvarn_fwht_cpu_test
+  tests/models/qwen/cpu/kvarn_fwht_test.cpp
+  "cpu;models;qwen;kvarn;oracles;opt-c207-kv-quant")
 add_qwen_cpu_test(qwen_forward_test
   tests/models/qwen/cpu/forward_test.cpp
   "cpu;models;qwen;forward;reference")
@@ -81,12 +87,33 @@ if (ENGINE_ENABLE_HIP)
   add_qwen_hip_test(qwen_attention_long_context_ops_test
     tests/models/qwen/hip/attention/long_context_ops_test.cpp
     "hip;gpu;kernels;qwen;qwen-kernel-oracle;slow;attention;decode;long-context")
+  # Quality harness: a development tool, not a CTest case. It needs a model and
+  # takes hours at 128K; tools/qwen27b/kvarn_quality.py drives it.
+  add_executable(qwen_kvarn_quality_eval EXCLUDE_FROM_ALL
+    ${PROJECT_SOURCE_DIR}/tests/models/qwen/hip/quality/kvarn_quality_eval.cpp)
+  target_link_libraries(qwen_kvarn_quality_eval PRIVATE
+    gufo_core hip::host roc::hipblas roc::rocblas)
   add_qwen_hip_test(qwen_attention_kv_storage_ops_test
     tests/models/qwen/hip/attention/kv_storage_ops_test.cpp
     "hip;gpu;kernels;qwen;qwen-kernel-oracle;slow;attention;decode;long-context;snapshot;opt-c0133-fp16-kv")
   add_qwen_hip_test(qwen_attention_fusion_ops_test
     tests/models/qwen/hip/attention/qk_rope_kv_ops_test.cpp
     "hip;gpu;kernels;qwen;qwen-kernel-oracle;slow;attention;fusion;opt-c010-qk-rope-kv")
+  add_qwen_hip_test(qwen_attention_kvarn_seal_ops_test
+    tests/models/qwen/hip/attention/kvarn_seal_ops_test.cpp
+    "hip;gpu;kernels;qwen;qwen-kernel-oracle;slow;attention;kvarn;seal;opt-c207-kv-quant")
+  add_qwen_hip_test(qwen_attention_kvarn_read_ops_test
+    tests/models/qwen/hip/attention/kvarn_read_ops_test.cpp
+    "hip;gpu;kernels;qwen;qwen-kernel-oracle;slow;attention;kvarn;read;opt-c207-kv-quant")
+  add_qwen_hip_test(qwen_attention_kvarn_prefill_ops_test
+    tests/models/qwen/hip/attention/kvarn_prefill_ops_test.cpp
+    "hip;gpu;kernels;qwen;qwen-kernel-oracle;slow;attention;kvarn;prefill;opt-c207-kv-quant")
+  add_qwen_hip_test(qwen_attention_kvarn_prefill_read_ops_test
+    tests/models/qwen/hip/attention/kvarn_prefill_read_ops_test.cpp
+    "hip;gpu;kernels;qwen;qwen-kernel-oracle;slow;attention;kvarn;prefill;read;opt-c207-kv-quant")
+  add_qwen_hip_test(qwen_attention_kvarn_state_ops_test
+    tests/models/qwen/hip/attention/kvarn_state_ops_test.cpp
+    "hip;gpu;kernels;qwen;qwen-kernel-oracle;slow;attention;kvarn;state;snapshot;opt-c207-kv-quant")
   add_qwen_hip_test(qwen_attention_wmma_prefill_ops_test
     tests/models/qwen/hip/attention/wmma_prefill_ops_test.cpp
     "hip;gpu;kernels;qwen;qwen-kernel-oracle;slow;attention;prefill;opt-c177-attn-wmma")

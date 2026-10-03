@@ -7,6 +7,7 @@
 #include <iostream>
 #include <limits>
 #include <span>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -131,6 +132,24 @@ void TestBatchedAttentionEquivalence() {
   std::cout << "Attention Seq vs GEMM max diff: " << max_gemm_diff << "\n";
   if (max_diff >= 1e-4F || max_gemm_diff >= 1e-4F) {
     std::cerr << "Batched attention mismatch\n";
+    std::abort();
+  }
+
+  // A KVarN selection must be an explicit error on the GEMM path, never a
+  // silent switch to the FP16 or FP32 planes (design D7).
+  bool rejected_kvarn = false;
+  try {
+    gufo::hip::KvarnReadParams kvarn;
+    kvarn.sink = reinterpret_cast<const __half*>(d_cache_gemm);
+    gufo::hip::LaunchBatchedAttentionGemm(
+        hipblas_handle, d_q, d_k, d_v, d_gate, d_cache_gemm,
+        d_cache_gemm + total_k, nullptr, nullptr, d_scores, d_out_gemm, 0, 0,
+        batch, max_context, num_heads, num_kv_heads, head_dim, nullptr, kvarn);
+  } catch (const std::runtime_error&) {
+    rejected_kvarn = true;
+  }
+  if (!rejected_kvarn) {
+    std::cerr << "GEMM attention accepted a KVarN storage selection\n";
     std::abort();
   }
 

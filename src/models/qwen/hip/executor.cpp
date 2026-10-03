@@ -263,7 +263,22 @@ std::span<const float> QwenGpuExecutor::CopyLastLogits() {
   HIP_CHECK(hipMemcpyAsync(h_logits_.data(), scratch.decode.logits.data(),
                            h_logits_.size() * sizeof(float),
                            hipMemcpyDeviceToHost, arena_.stream));
+  // Enqueue the KVarN error-flag read alongside the logits copy so the check
+  // rides the existing synchronization and adds no host sync (design D15).
+  std::uint32_t kvarn_error = 0;
+  const KvarnSealState* const seal = arena_.GetKvarnSealState();
+  if (seal != nullptr) {
+    HIP_CHECK(hipMemcpyAsync(&kvarn_error, seal->error_flag(),
+                             sizeof(kvarn_error), hipMemcpyDeviceToHost,
+                             arena_.stream));
+  }
   HIP_CHECK(hipStreamSynchronize(arena_.stream));
+  if (kvarn_error != 0) {
+    kvarn_poisoned_ = true;
+    throw std::runtime_error(
+        "Qwen KVarN seal detected a non-finite KV value; the session is "
+        "discarded and must not be reused or snapshotted");
+  }
   return h_logits_;
 }
 
@@ -287,7 +302,20 @@ tokenization::TokenId QwenGpuExecutor::SampleLastLogits(
   tokenization::TokenId token = 0;
   HIP_CHECK(hipMemcpyAsync(&token, d_out_token, sizeof(token),
                            hipMemcpyDeviceToHost, arena_.stream));
+  std::uint32_t kvarn_error = 0;
+  const KvarnSealState* const seal = arena_.GetKvarnSealState();
+  if (seal != nullptr) {
+    HIP_CHECK(hipMemcpyAsync(&kvarn_error, seal->error_flag(),
+                             sizeof(kvarn_error), hipMemcpyDeviceToHost,
+                             arena_.stream));
+  }
   HIP_CHECK(hipStreamSynchronize(arena_.stream));
+  if (kvarn_error != 0) {
+    kvarn_poisoned_ = true;
+    throw std::runtime_error(
+        "Qwen KVarN seal detected a non-finite KV value; the session is "
+        "discarded and must not be reused or snapshotted");
+  }
   return CheckedSampleToken(token, weights_.config.vocab_size);
 }
 

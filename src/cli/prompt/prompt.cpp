@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "src/cli/arg_parser.hpp"
+#include "src/cli/kv_cache_options.hpp"
 #include "src/cli/sampling_options.hpp"
 #include "src/core/crypto/sha256.hpp"
 #include "src/core/gguf_reader.hpp"
@@ -89,6 +90,12 @@ static void RegisterTextOptions(ArgParser& parser, PromptOptions& opt,
   // Model
   parser.AddOption("-m", "--model", "PATH", "Path to GGUF model file", "Model",
                    &opt.model_path);
+  parser.AddOption(
+      "", "--kv-cache", "FORMAT",
+      "Attention KV cache format; supported values: " + KvCacheValueList(),
+      "Model", &opt.kv_cache);
+  parser.AddCustomOption("", "--kv-cache-tail", "N", KvCacheTailHelp(), "Model",
+                         KvCacheTailParser(&opt.kv_cache_tail));
   RegisterImageOptions(parser, opt);
 
   // Prompt & Formatting
@@ -251,6 +258,33 @@ bool IsDeepSeekV4Flash(const core::GgufReader& reader) {
   return reader.GetMetadataString("general.architecture") == "deepseek4";
 }
 
+/// Rejects `--kv-cache` for models that do not offer it, before any weights
+/// are loaded. Qwen3.8 27B is the only supported model in this build, and a
+/// value naming the model's own format is rejected just the same. Returns an
+/// empty string when the selection is acceptable.
+[[nodiscard]] std::string KvCacheModelError(const PromptOptions& opt,
+                                            const core::GgufReader& reader) {
+  if (opt.kv_cache.empty()) {
+    return {};
+  }
+  if (opt.force_cpu) {
+    return "--kv-cache requires the ROCm backend; remove --cpu";
+  }
+  std::string_view architecture =
+      reader.GetMetadataString("general.architecture").value_or("");
+  if (architecture == "deepseek4") {
+    return KvCacheUnsupportedModelError("DeepSeek V4 Flash", kDeepSeekKvFormat);
+  }
+  if (architecture == "qwen4exp") {
+    return KvCacheUnsupportedModelError("Qwen3.8-Flash-Next",
+                                        kFlashNextKvFormat);
+  }
+  if (reader.GetMetadataUint64("qwen35.embedding_length") != 5120) {
+    return "--kv-cache is supported only by Qwen3.8 27B";
+  }
+  return {};
+}
+
 std::optional<ReasoningEffort> ParseReasoningEffort(std::string_view value) {
   if (value == "minimal") {
     return ReasoningEffort::kMinimal;
@@ -310,6 +344,22 @@ void ResolvePromptSampling(const core::GgufReader& reader, PromptOptions* opt) {
 
 #if defined(ENGINE_ENABLE_HIP)
 constexpr std::uint32_t kDefaultContext = 4096;
+
+/// Resolves the Qwen execution policy named by `--kv-cache`. Returns nullopt
+/// only for a value the build rejects, which parse-time validation and the
+/// model gate already exclude.
+[[nodiscard]] std::optional<hip::QwenExecutionPolicy> QwenPolicyFor(
+    const PromptOptions& opt) {
+  hip::QwenExecutionPolicy policy = hip::QwenExecutionPolicy::Production();
+  if (opt.kv_cache.empty()) {
+    return policy;
+  }
+  if (!hip::ResolveQwenKvCache(opt.kv_cache,
+                               KvCacheTailTokens(opt.kv_cache_tail), &policy)) {
+    return std::nullopt;
+  }
+  return policy;
+}
 
 std::shared_ptr<models::deepseek_v4_flash::Model> LoadDeepSeekModel(
     const PromptOptions& opt, const core::GgufReader& reader,
@@ -854,6 +904,10 @@ static std::optional<PromptOptions> ParseTextOptions(
     }
     return std::nullopt;
   }
+  if ((!opt.kv_cache.empty() || !opt.kv_cache_tail.empty()) &&
+      !ValidateKvCacheSelection(opt.kv_cache, opt.kv_cache_tail, error_msg)) {
+    return std::nullopt;
+  }
   if ((!opt.image_paths.empty() || !opt.vision_model_path.empty()) &&
       (opt.force_cpu || !opt.use_chat_template)) {
     if (error_msg)
@@ -994,6 +1048,12 @@ int RunPrompt(std::span<const char* const> args) {
   }
   const std::shared_ptr<const gufo::core::GgufReader> reader(
       std::move(reader_owner));
+  if (const std::string kv_error = KvCacheModelError(opt, *reader);
+      !kv_error.empty()) {
+    std::cerr << "Error: " << kv_error << "\n";
+    PrintModelLoadTime(model_load_start, false);
+    return 2;
+  }
   ResolvePromptSampling(*reader, &opt);
 
 #if defined(ENGINE_ENABLE_HIP)
@@ -1066,7 +1126,15 @@ int RunPrompt(std::span<const char* const> args) {
   int dev_count = 0;
   if (!opt.force_cpu && hipGetDeviceCount(&dev_count) == hipSuccess &&
       dev_count > 0) {
-    auto gpu_exec = gufo::hip::QwenGpuExecutor::CreateFromGguf(reader, &err);
+    const auto qwen_policy = QwenPolicyFor(opt);
+    if (!qwen_policy.has_value()) {
+      std::cerr << "Error: unsupported --kv-cache value: " << opt.kv_cache
+                << '\n';
+      PrintModelLoadTime(model_load_start, false);
+      return 2;
+    }
+    auto gpu_exec = gufo::hip::QwenGpuExecutor::CreateFromGguf(
+        reader, &err, kDefaultContext, *qwen_policy);
     if (gpu_exec) {
       PrintModelLoadTime(model_load_start);
       auto prompt_tokens = gpu_exec->GetTokenizer().Encode(rendered_prompt);
@@ -1209,6 +1277,12 @@ int RunChat(std::span<const char* const> args) {
   }
   const std::shared_ptr<const gufo::core::GgufReader> reader(
       std::move(reader_owner));
+  if (const std::string kv_error = KvCacheModelError(opt, *reader);
+      !kv_error.empty()) {
+    std::cerr << "Error: " << kv_error << "\n";
+    PrintModelLoadTime(model_load_start, false);
+    return 2;
+  }
   ResolvePromptSampling(*reader, &opt);
 
 #if defined(ENGINE_ENABLE_HIP)
@@ -1255,7 +1329,15 @@ int RunChat(std::span<const char* const> args) {
   int device_count = 0;
   if (tokenizer == nullptr && !opt.force_cpu &&
       hipGetDeviceCount(&device_count) == hipSuccess && device_count > 0) {
-    gpu_executor = hip::QwenGpuExecutor::CreateFromGguf(reader, &err);
+    const auto qwen_policy = QwenPolicyFor(opt);
+    if (!qwen_policy.has_value()) {
+      std::cerr << "Error: unsupported --kv-cache value: " << opt.kv_cache
+                << '\n';
+      PrintModelLoadTime(model_load_start, false);
+      return 2;
+    }
+    gpu_executor = hip::QwenGpuExecutor::CreateFromGguf(
+        reader, &err, kDefaultContext, *qwen_policy);
     if (!gpu_executor) {
       std::cerr << "Error creating Qwen GPU executor: " << err << '\n';
       PrintModelLoadTime(model_load_start, false);

@@ -145,7 +145,6 @@ std::vector<tokenization::TokenId> QwenGpuExecutor::ForwardTokenBatch(
     throw std::invalid_argument(
         "Qwen GPU decode batch requires two to eight sessions");
   }
-
   QwenGpuExecutor* coordinator = items.front().executor;
   if (coordinator == nullptr) {
     throw std::invalid_argument(
@@ -267,23 +266,35 @@ std::vector<tokenization::TokenId> QwenGpuExecutor::ForwardTokenBatch(
                             config.num_attention_heads, config.head_dim,
                             arena.stream);
 
-      if (!layer.attn_q_norm.empty()) {
-        LaunchBatchedPerHeadRMSNorm(
-            scratch.attention.q.data(),
-            static_cast<const float*>(layer.attn_q_norm.data),
-            scratch.attention.q.data(), batch_size, config.num_attention_heads,
-            config.head_dim, 1e-6F, arena.stream);
-      }
-      if (!layer.attn_k_norm.empty()) {
-        LaunchBatchedPerHeadRMSNorm(
-            scratch.attention.k.data(),
-            static_cast<const float*>(layer.attn_k_norm.data),
-            scratch.attention.k.data(), batch_size, config.num_key_value_heads,
-            config.head_dim, 1e-6F, arena.stream);
-      }
-
       const std::uint32_t attention_layer =
           layer_index / config.full_attention_interval;
+      // KVarN sessions write K/V into the sink/ring and read the sealed tiles
+      // through the shared decode-read helper; the batched sessions share the
+      // fingerprint, so one check covers every row (design D2/D4/D7).
+      const bool kvarn_enabled = coordinator->arena_.GetKvarnWriteParams()
+                                     .enabled();
+      if (kvarn_enabled && !detail::IsFusedQkNormSupported(config.head_dim)) {
+        throw std::runtime_error(
+            "KVarN KV storage requires the fused QK-norm/RoPE/KV-write path");
+      }
+      if (!kvarn_enabled) {
+        if (!layer.attn_q_norm.empty()) {
+          LaunchBatchedPerHeadRMSNorm(
+              scratch.attention.q.data(),
+              static_cast<const float*>(layer.attn_q_norm.data),
+              scratch.attention.q.data(), batch_size,
+              config.num_attention_heads, config.head_dim, 1e-6F,
+              arena.stream);
+        }
+        if (!layer.attn_k_norm.empty()) {
+          LaunchBatchedPerHeadRMSNorm(
+              scratch.attention.k.data(),
+              static_cast<const float*>(layer.attn_k_norm.data),
+              scratch.attention.k.data(), batch_size,
+              config.num_key_value_heads, config.head_dim, 1e-6F,
+              arena.stream);
+        }
+      }
       for (std::size_t row = 0; row < batch_size; ++row) {
         auto& state_arena = items[row].executor->arena_;
         const std::size_t total_k = state_arena.GetAttentionKvPlaneElements();
@@ -293,6 +304,40 @@ std::vector<tokenization::TokenId> QwenGpuExecutor::ForwardTokenBatch(
         float* gate = scratch.ssm.gate.data() + (row * attention_size);
         float* context = scratch.ssm.out.data() + (row * attention_size);
         const std::uint32_t position = items[row].position;
+
+        if (kvarn_enabled) {
+          LaunchBatchedFusedQKNormRoPEKvWrite(
+              query, key, value,
+              static_cast<const float*>(layer.attn_q_norm.data),
+              static_cast<const float*>(layer.attn_k_norm.data), query, key,
+              state_arena.d_kv_cache,
+              OffsetIfPresent(state_arena.d_kv_cache, total_k),
+              state_arena.d_attention_kv_f16,
+              OffsetIfPresent(
+                  static_cast<std::uint16_t*>(state_arena.d_attention_kv_f16),
+                  total_k),
+              attention_layer, position, 1, state_arena.GetMaxContext(),
+              config.num_attention_heads, config.num_key_value_heads,
+              config.head_dim, config.rotary_dim, config.rope_theta, 1e-6F,
+              arena.stream, items[row].executor->vision_input_.rope(),
+              state_arena.GetKvarnWriteParams());
+          const auto& regions = state_arena.GetKvarnRegions();
+          LaunchKvarnSeal(
+              *state_arena.GetKvarnSealState(),
+              items[row].executor->policy_.kvarn, state_arena.d_kvarn_sink,
+              state_arena.d_kvarn_tail, regions.sink_elements,
+              regions.tail_elements,
+              static_cast<std::uint32_t>(regions.tail_rows),
+              state_arena.d_kvarn_body,
+              static_cast<std::uint32_t>(regions.tile_count), attention_layer,
+              config.num_key_value_heads, position, nullptr, 1, arena.stream);
+          LaunchKvarnDecodeAttention(
+              query, gate, context, attention_layer, position, nullptr, 1,
+              config.num_attention_heads, config.num_key_value_heads,
+              state_arena.GetKvarnReadParams(), arena.d_split_k_attention,
+              arena.stream);
+          continue;
+        }
 
         LaunchRoPE(query, key, config.num_attention_heads,
                    config.num_key_value_heads, config.head_dim,
@@ -587,8 +632,15 @@ QwenGpuExecutor::ForwardVerificationBatch(
 
       const std::uint32_t attention_layer =
           layer_index / config.full_attention_interval;
+      const bool kvarn_enabled =
+          !items.empty() &&
+          items.front().executor->arena_.GetKvarnWriteParams().enabled();
+      if (kvarn_enabled && !detail::IsFusedQkNormSupported(config.head_dim)) {
+        throw std::runtime_error(
+            "KVarN KV storage requires the fused QK-norm/RoPE/KV-write path");
+      }
       const bool fused_qknorm_rope_kv =
-          route_plan.fuse_qk_norm_rope_kv &&
+          (route_plan.fuse_qk_norm_rope_kv || kvarn_enabled) &&
           detail::IsFusedQkNormSupported(config.head_dim);
       if (!fused_qknorm_rope_kv) {
         if (!layer.attn_q_norm.empty()) {
@@ -635,7 +687,8 @@ QwenGpuExecutor::ForwardVerificationBatch(
               state_arena.GetMaxContext(), config.num_attention_heads,
               config.num_key_value_heads, config.head_dim, config.rotary_dim,
               config.rope_theta, 1e-6F, arena_.stream,
-              item.executor->vision_input_.rope());
+              item.executor->vision_input_.rope(),
+              state_arena.GetKvarnWriteParams());
           // Exact verification projections do not use weight dequantization
           // scratch. Reuse it for independent split-K rows without allocating
           // another buffer or changing the scalar decode workspace.
@@ -659,7 +712,7 @@ QwenGpuExecutor::ForwardVerificationBatch(
               attention_layer, start_pos, sequence_size,
               state_arena.GetMaxContext(), config.num_attention_heads,
               config.num_key_value_heads, config.head_dim, arena_.stream,
-              attention_scratch);
+              attention_scratch, state_arena.GetKvarnReadParams());
         } else {
           for (std::size_t row = 0; row < sequence_size; ++row) {
             float* const query =

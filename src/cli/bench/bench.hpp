@@ -15,6 +15,8 @@ namespace gufo::cli {
 
 struct BenchOptions {
   std::string model_path;
+  std::string kv_cache;
+  std::string kv_cache_tail;
   std::vector<std::size_t> n_prompts{2048};
   std::vector<std::size_t> n_gens{128};
   std::vector<std::size_t> n_depths{0};

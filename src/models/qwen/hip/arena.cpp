@@ -23,6 +23,43 @@ constexpr std::array<std::uint8_t, 8> kCompactSnapshotMagic = {
     'G', 'Q', 'K', 'V', 'S', 'N', 'P', '1'};
 constexpr std::uint32_t kCompactSnapshotVersion = 1;
 constexpr std::size_t kCompactSnapshotHeaderBytes = 80;
+// KVarN compact snapshot (design.md D9). v3 carries its own header length and
+// offsets; v1/v2 (FP16/FP32) keep their header and byte stream unchanged.
+constexpr std::uint32_t kKvarnCompactSnapshotVersion = 3;
+constexpr std::size_t kKvarnCompactSnapshotHeaderBytes = 128;
+/// Distinguishes the KVarN payload kind from any future v3 payload kind.
+constexpr std::uint32_t kKvarnCompactSnapshotKind = 1;
+
+// v3 header field offsets (little-endian). The region payloads follow the
+// header in this order: sink, body, tail, seal counters, convolution state,
+// DeltaNet state, then the vision image grids.
+constexpr std::size_t kKvarnSnapshotOffsetVersion = 8;
+constexpr std::size_t kKvarnSnapshotOffsetHeaderBytes = 12;
+constexpr std::size_t kKvarnSnapshotOffsetAttentionLayers = 16;
+constexpr std::size_t kKvarnSnapshotOffsetKvWidth = 20;
+constexpr std::size_t kKvarnSnapshotOffsetMaxContext = 24;
+constexpr std::size_t kKvarnSnapshotOffsetValidContext = 28;
+constexpr std::size_t kKvarnSnapshotOffsetKvStorage = 32;
+constexpr std::size_t kKvarnSnapshotOffsetRecurrentStorage = 36;
+constexpr std::size_t kKvarnSnapshotOffsetKind = 40;
+constexpr std::size_t kKvarnSnapshotOffsetKBits = 44;
+constexpr std::size_t kKvarnSnapshotOffsetVBits = 48;
+constexpr std::size_t kKvarnSnapshotOffsetTailLength = 52;
+constexpr std::size_t kKvarnSnapshotOffsetVerifyRows = 56;
+constexpr std::size_t kKvarnSnapshotOffsetSinkRows = 60;
+constexpr std::size_t kKvarnSnapshotOffsetBodyRows = 64;
+constexpr std::size_t kKvarnSnapshotOffsetTailRows = 68;
+constexpr std::size_t kKvarnSnapshotOffsetTailViewRows = 72;
+constexpr std::size_t kKvarnSnapshotOffsetScale = 76;
+constexpr std::size_t kKvarnSnapshotOffsetTileCount = 80;
+constexpr std::size_t kKvarnSnapshotOffsetTileRtnParams = 84;
+constexpr std::size_t kKvarnSnapshotOffsetTileNormScales = 88;
+constexpr std::size_t kKvarnSnapshotOffsetSealElements = 92;
+constexpr std::size_t kKvarnSnapshotOffsetImageCount = 96;
+constexpr std::size_t kKvarnSnapshotOffsetConvElements = 100;
+constexpr std::size_t kKvarnSnapshotOffsetDeltanetElements = 108;
+constexpr std::size_t kKvarnSnapshotOffsetTotalBytes = 116;
+constexpr std::size_t kKvarnSnapshotOffsetReserved = 124;
 
 std::size_t CheckedMultiply(std::size_t left, std::size_t right) {
   if (left != 0 && right > std::numeric_limits<std::size_t>::max() / left) {
@@ -85,6 +122,231 @@ std::size_t SizeFromU64(std::uint64_t value) {
     throw std::overflow_error("Qwen compact snapshot size overflows");
   }
   return static_cast<std::size_t>(value);
+}
+
+/// Reads the version of a compact snapshot payload after checking the magic.
+std::uint32_t CompactSnapshotVersion(std::span<const std::uint8_t> payload) {
+  if (payload.size() < kKvarnSnapshotOffsetVersion + sizeof(std::uint32_t) ||
+      !std::equal(kCompactSnapshotMagic.begin(), kCompactSnapshotMagic.end(),
+                  payload.begin())) {
+    throw std::invalid_argument("Qwen compact snapshot header is invalid");
+  }
+  return GetLittleEndian<std::uint32_t>(payload, kKvarnSnapshotOffsetVersion);
+}
+
+/// Byte layout of the KVarN compact snapshot (design.md D9). The region sizes
+/// come from `ComputeKvarnRegions`, the exact size the memory estimate and the
+/// D5 size formula use; the offsets are derived from those sizes alone.
+struct KvarnCompactSnapshotLayout {
+  std::uint32_t attention_layers{0};
+  std::uint32_t kv_width{0};
+  std::uint32_t max_context{0};
+  std::uint32_t valid_context{0};
+  QwenRecurrentStateStorage recurrent_state_storage{
+      QwenRecurrentStateStorage::kFp32};
+  std::uint8_t k_bits{0};
+  std::uint8_t v_bits{0};
+  QwenKvarnScale scale{QwenKvarnScale::kFp16};
+  std::uint32_t tail_length{0};
+  std::uint32_t verify_rows{0};
+  std::uint32_t tail_view_rows{0};
+  std::uint32_t sink_rows{0};
+  std::uint32_t body_rows{0};
+  std::uint32_t tail_rows{0};
+  std::uint32_t tile_count{0};
+  std::uint32_t tile_rtn_params{0};
+  std::uint32_t tile_norm_scales{0};
+  std::size_t seal_elements{0};
+  std::size_t conv_elements{0};
+  std::size_t deltanet_elements{0};
+  std::size_t sink_bytes{0};
+  std::size_t body_bytes{0};
+  std::size_t tail_bytes{0};
+  std::size_t seal_bytes{0};
+  std::size_t conv_bytes{0};
+  std::size_t deltanet_bytes{0};
+  std::size_t sink_offset{0};
+  std::size_t body_offset{0};
+  std::size_t tail_offset{0};
+  std::size_t seal_offset{0};
+  std::size_t conv_offset{0};
+  std::size_t deltanet_offset{0};
+  std::size_t rope_offset{0};
+  std::size_t total_bytes{0};
+  models::qwen::vision::RopeLayout rope;
+};
+
+KvarnCompactSnapshotLayout MakeKvarnCompactSnapshotLayout(
+    std::uint32_t attention_layers, std::uint32_t kv_width,
+    std::uint32_t max_context, std::uint32_t valid_context,
+    std::uint8_t k_bits, std::uint8_t v_bits, std::uint32_t tail_length,
+    QwenKvarnScale scale, QwenRecurrentStateStorage recurrent_state_storage,
+    std::size_t conv_elements, std::size_t deltanet_elements,
+    std::size_t image_count = 0) {
+  if (attention_layers == 0 || kv_width == 0 || max_context == 0 ||
+      valid_context > max_context ||
+      kv_width % models::qwen::kKvarnHeadDim != 0) {
+    throw std::invalid_argument(
+        "Qwen KVarN compact snapshot geometry is invalid");
+  }
+  const std::size_t kv_heads = kv_width / models::qwen::kKvarnHeadDim;
+  const std::uint32_t tail_view_rows =
+      tail_length == 0 ? kQwenKvarnW : tail_length;
+  const auto regions = models::qwen::ComputeKvarnRegions(
+      k_bits, v_bits, tail_view_rows, kQwenKvarnW, max_context,
+      attention_layers, kv_heads);
+
+  KvarnCompactSnapshotLayout layout;
+  layout.attention_layers = attention_layers;
+  layout.kv_width = kv_width;
+  layout.max_context = max_context;
+  layout.valid_context = valid_context;
+  layout.recurrent_state_storage = recurrent_state_storage;
+  layout.k_bits = k_bits;
+  layout.v_bits = v_bits;
+  layout.scale = scale;
+  layout.tail_length = tail_length;
+  layout.verify_rows = kQwenKvarnW;
+  layout.tail_view_rows = tail_view_rows;
+  layout.sink_rows = static_cast<std::uint32_t>(models::qwen::kKvarnSinkRows);
+  layout.body_rows = static_cast<std::uint32_t>(
+      CheckedMultiply(static_cast<std::size_t>(regions.tile_count),
+                      static_cast<std::size_t>(models::qwen::kKvarnTileTokens)));
+  layout.tail_rows = static_cast<std::uint32_t>(regions.tail_rows);
+  layout.tile_count = static_cast<std::uint32_t>(regions.tile_count);
+  layout.tile_rtn_params =
+      static_cast<std::uint32_t>(models::qwen::kKvarnRtnParams);
+  layout.tile_norm_scales = static_cast<std::uint32_t>(
+      models::qwen::kKvarnTileChannels + models::qwen::kKvarnTileTokens);
+  layout.seal_elements = CheckedMultiply(
+      static_cast<std::size_t>(attention_layers), kv_heads);
+  layout.conv_elements = conv_elements;
+  layout.deltanet_elements = deltanet_elements;
+  layout.sink_bytes = regions.sink_bytes;
+  layout.body_bytes = regions.body_bytes;
+  layout.tail_bytes = regions.tail_bytes;
+  layout.seal_bytes =
+      CheckedMultiply(layout.seal_elements, sizeof(std::uint32_t));
+  layout.conv_bytes = CheckedMultiply(conv_elements, sizeof(float));
+  layout.deltanet_bytes = CheckedMultiply(
+      deltanet_elements,
+      QwenRecurrentStateElementBytes(recurrent_state_storage));
+  layout.sink_offset = kKvarnCompactSnapshotHeaderBytes;
+  layout.body_offset = CheckedSum(layout.sink_offset, layout.sink_bytes);
+  layout.tail_offset = CheckedSum(layout.body_offset, layout.body_bytes);
+  layout.seal_offset = CheckedSum(layout.tail_offset, layout.tail_bytes);
+  layout.conv_offset = CheckedSum(layout.seal_offset, layout.seal_bytes);
+  layout.deltanet_offset = CheckedSum(layout.conv_offset, layout.conv_bytes);
+  layout.rope_offset =
+      CheckedSum(layout.deltanet_offset, layout.deltanet_bytes);
+  layout.total_bytes =
+      CheckedSum(layout.rope_offset, CheckedMultiply(image_count, 12));
+  return layout;
+}
+
+KvarnCompactSnapshotLayout ParseKvarnCompactSnapshotLayout(
+    std::span<const std::uint8_t> payload) {
+  if (payload.size() < kKvarnCompactSnapshotHeaderBytes ||
+      !std::equal(kCompactSnapshotMagic.begin(), kCompactSnapshotMagic.end(),
+                  payload.begin()) ||
+      GetLittleEndian<std::uint32_t>(payload, kKvarnSnapshotOffsetVersion) !=
+          kKvarnCompactSnapshotVersion ||
+      GetLittleEndian<std::uint32_t>(payload,
+                                     kKvarnSnapshotOffsetHeaderBytes) !=
+          kKvarnCompactSnapshotHeaderBytes ||
+      GetLittleEndian<std::uint32_t>(payload, kKvarnSnapshotOffsetReserved) !=
+          0) {
+    throw std::invalid_argument(
+        "Qwen KVarN compact snapshot version is invalid");
+  }
+
+  const std::uint32_t kv_storage_value =
+      GetLittleEndian<std::uint32_t>(payload, kKvarnSnapshotOffsetKvStorage);
+  const std::uint32_t recurrent_storage_value = GetLittleEndian<std::uint32_t>(
+      payload, kKvarnSnapshotOffsetRecurrentStorage);
+  const std::uint32_t kind =
+      GetLittleEndian<std::uint32_t>(payload, kKvarnSnapshotOffsetKind);
+  const std::uint32_t k_bits =
+      GetLittleEndian<std::uint32_t>(payload, kKvarnSnapshotOffsetKBits);
+  const std::uint32_t v_bits =
+      GetLittleEndian<std::uint32_t>(payload, kKvarnSnapshotOffsetVBits);
+  const std::uint32_t tail_length =
+      GetLittleEndian<std::uint32_t>(payload, kKvarnSnapshotOffsetTailLength);
+  const std::uint32_t verify_rows =
+      GetLittleEndian<std::uint32_t>(payload, kKvarnSnapshotOffsetVerifyRows);
+  const std::uint32_t sink_rows =
+      GetLittleEndian<std::uint32_t>(payload, kKvarnSnapshotOffsetSinkRows);
+  const std::uint32_t body_rows =
+      GetLittleEndian<std::uint32_t>(payload, kKvarnSnapshotOffsetBodyRows);
+  const std::uint32_t tail_rows =
+      GetLittleEndian<std::uint32_t>(payload, kKvarnSnapshotOffsetTailRows);
+  const std::uint32_t tail_view_rows = GetLittleEndian<std::uint32_t>(
+      payload, kKvarnSnapshotOffsetTailViewRows);
+  const std::uint32_t scale_value =
+      GetLittleEndian<std::uint32_t>(payload, kKvarnSnapshotOffsetScale);
+  const std::uint32_t tile_count =
+      GetLittleEndian<std::uint32_t>(payload, kKvarnSnapshotOffsetTileCount);
+  const std::uint32_t image_count =
+      GetLittleEndian<std::uint32_t>(payload, kKvarnSnapshotOffsetImageCount);
+  const std::uint64_t header_total =
+      GetLittleEndian<std::uint64_t>(payload, kKvarnSnapshotOffsetTotalBytes);
+  if (kv_storage_value != static_cast<std::uint32_t>(QwenKvCacheStorage::kKvarn) ||
+      recurrent_storage_value >
+          static_cast<std::uint32_t>(QwenRecurrentStateStorage::kBf16) ||
+      kind != kKvarnCompactSnapshotKind ||
+      k_bits < models::qwen::kKvarnMinBits ||
+      k_bits > models::qwen::kKvarnMaxBits ||
+      v_bits < models::qwen::kKvarnMinBits ||
+      v_bits > models::qwen::kKvarnMaxBits ||
+      scale_value > static_cast<std::uint32_t>(QwenKvarnScale::kBf16) ||
+      verify_rows != kQwenKvarnW || image_count > 256 ||
+      (tail_length != 0 && (tail_length < kQwenKvCacheTailMin ||
+                            tail_length > kQwenKvCacheTailMax)) ||
+      tail_view_rows != (tail_length == 0 ? verify_rows : tail_length) ||
+      GetLittleEndian<std::uint32_t>(payload,
+                                     kKvarnSnapshotOffsetTileRtnParams) !=
+          models::qwen::kKvarnRtnParams ||
+      GetLittleEndian<std::uint32_t>(payload,
+                                     kKvarnSnapshotOffsetTileNormScales) !=
+          models::qwen::kKvarnTileChannels +
+              models::qwen::kKvarnTileTokens) {
+    throw std::invalid_argument(
+        "Qwen KVarN compact snapshot configuration is invalid");
+  }
+
+  auto layout = MakeKvarnCompactSnapshotLayout(
+      GetLittleEndian<std::uint32_t>(payload,
+                                     kKvarnSnapshotOffsetAttentionLayers),
+      GetLittleEndian<std::uint32_t>(payload, kKvarnSnapshotOffsetKvWidth),
+      GetLittleEndian<std::uint32_t>(payload, kKvarnSnapshotOffsetMaxContext),
+      GetLittleEndian<std::uint32_t>(payload, kKvarnSnapshotOffsetValidContext),
+      static_cast<std::uint8_t>(k_bits), static_cast<std::uint8_t>(v_bits),
+      tail_length, static_cast<QwenKvarnScale>(scale_value),
+      static_cast<QwenRecurrentStateStorage>(recurrent_storage_value),
+      SizeFromU64(
+          GetLittleEndian<std::uint64_t>(payload,
+                                         kKvarnSnapshotOffsetConvElements)),
+      SizeFromU64(GetLittleEndian<std::uint64_t>(
+          payload, kKvarnSnapshotOffsetDeltanetElements)),
+      image_count);
+  if (layout.tail_length != tail_length ||
+      layout.tail_view_rows != tail_view_rows ||
+      layout.sink_rows != sink_rows || layout.body_rows != body_rows ||
+      layout.tail_rows != tail_rows || layout.tile_count != tile_count ||
+      layout.total_bytes != SizeFromU64(header_total) ||
+      layout.total_bytes != payload.size()) {
+    throw std::invalid_argument("Qwen KVarN compact snapshot size is invalid");
+  }
+  for (std::size_t i = 0; i < image_count; ++i) {
+    const auto offset = layout.rope_offset + i * 12;
+    layout.rope.images.push_back({GetLittleEndian<std::uint32_t>(payload, offset),
+                                  GetLittleEndian<std::uint32_t>(payload,
+                                                                offset + 4),
+                                  GetLittleEndian<std::uint32_t>(payload,
+                                                                offset + 8)});
+  }
+  layout.rope.Validate(layout.max_context);
+  return layout;
 }
 
 struct CompactSnapshotLayout {
@@ -209,6 +471,9 @@ CompactSnapshotLayout ParseCompactSnapshotLayout(
 
 models::qwen::vision::RopeLayout QwenGpuSnapshot::ReadRopeLayout(
     std::span<const std::uint8_t> payload) {
+  if (CompactSnapshotVersion(payload) == kKvarnCompactSnapshotVersion) {
+    return ParseKvarnCompactSnapshotLayout(payload).rope;
+  }
   return ParseCompactSnapshotLayout(payload).rope;
 }
 
@@ -225,9 +490,42 @@ QwenGpuSnapshot::~QwenGpuSnapshot() {
   if (d_ssm_deltanet_ != nullptr) {
     (void)hipFree(d_ssm_deltanet_);
   }
+  if (d_kvarn_sink_ != nullptr) {
+    (void)hipFree(d_kvarn_sink_);
+  }
+  if (d_kvarn_body_ != nullptr) {
+    (void)hipFree(d_kvarn_body_);
+  }
+  if (d_kvarn_tail_ != nullptr) {
+    (void)hipFree(d_kvarn_tail_);
+  }
+  if (d_kvarn_sealed_ != nullptr) {
+    (void)hipFree(d_kvarn_sealed_);
+  }
 }
 
 std::size_t QwenGpuSnapshot::CompactPayloadBytes() const {
+  if (kvarn_) {
+    const auto layout = MakeKvarnCompactSnapshotLayout(
+        attention_layers_, kv_width_, max_context_, valid_context_,
+        kvarn_k_bits_, kvarn_v_bits_, kvarn_tail_length_,
+        static_cast<QwenKvarnScale>(kvarn_scale_), recurrent_state_storage_,
+        conv_elements_, deltanet_elements_, vision_layout_.images.size());
+    // The v3 payload must carry exactly the D5 state size of the in-memory
+    // snapshot plus its own header.
+    if (layout.total_bytes !=
+            CheckedSum(PayloadBytes(), kKvarnCompactSnapshotHeaderBytes) ||
+        layout.sink_bytes != kvarn_sink_bytes_ ||
+        layout.body_bytes != kvarn_body_bytes_ ||
+        layout.tail_bytes != kvarn_tail_bytes_ ||
+        layout.tail_rows != kvarn_ring_rows_ ||
+        layout.tile_count != kvarn_tile_count_ ||
+        layout.seal_elements != kvarn_seal_elements_) {
+      throw std::logic_error(
+          "Qwen KVarN compact snapshot size is inconsistent with design D5");
+    }
+    return layout.total_bytes;
+  }
   const std::size_t recurrent_layers = num_layers_ - attention_layers_;
   return MakeCompactSnapshotLayout(
              attention_layers_, kv_width_, max_context_, valid_context_,
@@ -246,6 +544,130 @@ std::size_t QwenGpuSnapshot::SerializeCompact(
       deltanet_elements_ != CheckedMultiply(num_layers_ - attention_layers_,
                                             deltanet_elements_per_layer_)) {
     throw std::logic_error("Qwen compact snapshot metadata is invalid");
+  }
+  if (kvarn_) {
+    const auto layout = MakeKvarnCompactSnapshotLayout(
+        attention_layers_, kv_width_, max_context_, valid_context_,
+        kvarn_k_bits_, kvarn_v_bits_, kvarn_tail_length_,
+        static_cast<QwenKvarnScale>(kvarn_scale_), recurrent_state_storage_,
+        conv_elements_, deltanet_elements_, vision_layout_.images.size());
+    if (layout.total_bytes !=
+            CheckedSum(PayloadBytes(), kKvarnCompactSnapshotHeaderBytes) ||
+        layout.sink_bytes != kvarn_sink_bytes_ ||
+        layout.body_bytes != kvarn_body_bytes_ ||
+        layout.tail_bytes != kvarn_tail_bytes_ ||
+        layout.tail_rows != kvarn_ring_rows_ ||
+        layout.tile_count != kvarn_tile_count_ ||
+        layout.seal_elements != kvarn_seal_elements_ ||
+        kv_storage_ != QwenKvCacheStorage::kKvarn ||
+        (layout.sink_bytes != 0 && d_kvarn_sink_ == nullptr) ||
+        (layout.body_bytes != 0 && d_kvarn_body_ == nullptr) ||
+        (layout.tail_bytes != 0 && d_kvarn_tail_ == nullptr) ||
+        (layout.seal_bytes != 0 && d_kvarn_sealed_ == nullptr) ||
+        (layout.conv_bytes != 0 && d_ssm_conv_ == nullptr) ||
+        (layout.deltanet_bytes != 0 && d_ssm_deltanet_ == nullptr)) {
+      throw std::logic_error("Qwen KVarN compact snapshot metadata is invalid");
+    }
+    if (destination.size() != layout.total_bytes) {
+      throw std::invalid_argument(
+          "Qwen KVarN compact snapshot destination size is invalid");
+    }
+    std::fill(destination.begin(), destination.end(), std::uint8_t{0});
+    std::copy(kCompactSnapshotMagic.begin(), kCompactSnapshotMagic.end(),
+              destination.begin());
+    PutLittleEndian<std::uint32_t>(destination, kKvarnSnapshotOffsetVersion,
+                                   kKvarnCompactSnapshotVersion);
+    PutLittleEndian<std::uint32_t>(destination,
+                                   kKvarnSnapshotOffsetHeaderBytes,
+                                   kKvarnCompactSnapshotHeaderBytes);
+    PutLittleEndian<std::uint32_t>(destination,
+                                   kKvarnSnapshotOffsetAttentionLayers,
+                                   attention_layers_);
+    PutLittleEndian<std::uint32_t>(destination, kKvarnSnapshotOffsetKvWidth,
+                                   kv_width_);
+    PutLittleEndian<std::uint32_t>(destination, kKvarnSnapshotOffsetMaxContext,
+                                   max_context_);
+    PutLittleEndian<std::uint32_t>(destination,
+                                   kKvarnSnapshotOffsetValidContext,
+                                   valid_context_);
+    PutLittleEndian<std::uint32_t>(
+        destination, kKvarnSnapshotOffsetKvStorage,
+        static_cast<std::uint32_t>(QwenKvCacheStorage::kKvarn));
+    PutLittleEndian<std::uint32_t>(
+        destination, kKvarnSnapshotOffsetRecurrentStorage,
+        static_cast<std::uint32_t>(recurrent_state_storage_));
+    PutLittleEndian<std::uint32_t>(destination, kKvarnSnapshotOffsetKind,
+                                   kKvarnCompactSnapshotKind);
+    PutLittleEndian<std::uint32_t>(destination, kKvarnSnapshotOffsetKBits,
+                                   kvarn_k_bits_);
+    PutLittleEndian<std::uint32_t>(destination, kKvarnSnapshotOffsetVBits,
+                                   kvarn_v_bits_);
+    PutLittleEndian<std::uint32_t>(destination, kKvarnSnapshotOffsetTailLength,
+                                   kvarn_tail_length_);
+    PutLittleEndian<std::uint32_t>(destination, kKvarnSnapshotOffsetVerifyRows,
+                                   layout.verify_rows);
+    PutLittleEndian<std::uint32_t>(destination, kKvarnSnapshotOffsetSinkRows,
+                                   layout.sink_rows);
+    PutLittleEndian<std::uint32_t>(destination, kKvarnSnapshotOffsetBodyRows,
+                                   layout.body_rows);
+    PutLittleEndian<std::uint32_t>(destination, kKvarnSnapshotOffsetTailRows,
+                                   layout.tail_rows);
+    PutLittleEndian<std::uint32_t>(
+        destination, kKvarnSnapshotOffsetTailViewRows, layout.tail_view_rows);
+    PutLittleEndian<std::uint32_t>(
+        destination, kKvarnSnapshotOffsetScale,
+        static_cast<std::uint32_t>(layout.scale));
+    PutLittleEndian<std::uint32_t>(destination, kKvarnSnapshotOffsetTileCount,
+                                   layout.tile_count);
+    PutLittleEndian<std::uint32_t>(
+        destination, kKvarnSnapshotOffsetTileRtnParams, layout.tile_rtn_params);
+    PutLittleEndian<std::uint32_t>(
+        destination, kKvarnSnapshotOffsetTileNormScales,
+        layout.tile_norm_scales);
+    PutLittleEndian<std::uint32_t>(
+        destination, kKvarnSnapshotOffsetSealElements,
+        static_cast<std::uint32_t>(layout.seal_elements));
+    PutLittleEndian<std::uint32_t>(
+        destination, kKvarnSnapshotOffsetImageCount,
+        static_cast<std::uint32_t>(vision_layout_.images.size()));
+    PutLittleEndian<std::uint64_t>(
+        destination, kKvarnSnapshotOffsetConvElements,
+        static_cast<std::uint64_t>(layout.conv_elements));
+    PutLittleEndian<std::uint64_t>(
+        destination, kKvarnSnapshotOffsetDeltanetElements,
+        static_cast<std::uint64_t>(layout.deltanet_elements));
+    PutLittleEndian<std::uint64_t>(
+        destination, kKvarnSnapshotOffsetTotalBytes,
+        static_cast<std::uint64_t>(layout.total_bytes));
+
+    SnapshotTransfer transfer;
+    if (layout.sink_bytes != 0)
+      transfer.Copy(destination.data() + layout.sink_offset, d_kvarn_sink_,
+                    layout.sink_bytes);
+    if (layout.body_bytes != 0)
+      transfer.Copy(destination.data() + layout.body_offset, d_kvarn_body_,
+                    layout.body_bytes);
+    if (layout.tail_bytes != 0)
+      transfer.Copy(destination.data() + layout.tail_offset, d_kvarn_tail_,
+                    layout.tail_bytes);
+    if (layout.seal_bytes != 0)
+      transfer.Copy(destination.data() + layout.seal_offset, d_kvarn_sealed_,
+                    layout.seal_bytes);
+    if (layout.conv_bytes != 0)
+      transfer.Copy(destination.data() + layout.conv_offset, d_ssm_conv_,
+                    layout.conv_bytes);
+    if (layout.deltanet_bytes != 0)
+      transfer.Copy(destination.data() + layout.deltanet_offset,
+                    d_ssm_deltanet_, layout.deltanet_bytes);
+    vision_layout_.Validate(max_context_);
+    for (std::size_t i = 0; i < vision_layout_.images.size(); ++i) {
+      const auto& grid = vision_layout_.images[i];
+      const auto offset = layout.rope_offset + i * 12;
+      PutLittleEndian<std::uint32_t>(destination, offset, grid.offset);
+      PutLittleEndian<std::uint32_t>(destination, offset + 4, grid.height);
+      PutLittleEndian<std::uint32_t>(destination, offset + 8, grid.width);
+    }
+    return destination.size();
   }
   const std::size_t recurrent_layers = num_layers_ - attention_layers_;
   const auto layout = MakeCompactSnapshotLayout(
@@ -403,14 +825,31 @@ QwenGpuMemoryUsage QwenGpuArena::EstimateMemoryUsage(
   AddAllocation(maximum_weight, sizeof(hip_bfloat16), &scratch);
 
   auto& state = usage.request_state_bytes;
-  const std::size_t total_kv = CheckedMultiply(
-      CheckedMultiply(CheckedMultiply(config.FullAttentionLayerCount(), kv),
-                      context),
-      1);
-  AddAllocation(
-      CheckedMultiply(total_kv, 2),
-      policy.UsesFp16AttentionKv() ? sizeof(std::uint16_t) : sizeof(float),
-      &state);
+  if (policy.UsesKvarn()) {
+    const auto regions = models::qwen::ComputeKvarnRegions(
+        policy.kvarn.k_bits, policy.kvarn.v_bits,
+        QwenKvarnTailRows(policy.kvarn), kQwenKvarnW, context,
+        config.FullAttentionLayerCount(), config.num_key_value_heads);
+    // The bounded per-chunk F16 workspace (design D4/4.1) is a fixed
+    // session cap: two planes of one whole prefill chunk.
+    const std::size_t chunk_rows =
+        std::min<std::size_t>(context, kMaxPromptBatch);
+    const std::size_t chunk_bytes = CheckedMultiply(
+        CheckedMultiply(CheckedMultiply(chunk_rows, config.num_key_value_heads),
+                        config.head_dim),
+        2 * sizeof(std::uint16_t));
+    AddAllocation(regions.total_bytes, 1, &state);
+    AddAllocation(chunk_bytes, 1, &state);
+  } else {
+    const std::size_t total_kv = CheckedMultiply(
+        CheckedMultiply(CheckedMultiply(config.FullAttentionLayerCount(), kv),
+                        context),
+        1);
+    AddAllocation(
+        CheckedMultiply(total_kv, 2),
+        policy.UsesFp16AttentionKv() ? sizeof(std::uint16_t) : sizeof(float),
+        &state);
+  }
 
   const std::size_t total_conv = CheckedMultiply(
       CheckedMultiply(config.SsmLayerCount(), ssm_qkv), config.ssm_conv_kernel);
@@ -431,6 +870,33 @@ QwenGpuMemoryUsage QwenGpuArena::GetMemoryUsage() const {
 
 std::size_t QwenGpuArena::SnapshotPayloadBytes(
     std::uint32_t valid_context) const {
+  if (policy_.UsesKvarn()) {
+    if (valid_context > max_context_) {
+      throw std::length_error("Qwen snapshot exceeds the context length");
+    }
+    const std::size_t attention_layers = config_.FullAttentionLayerCount();
+    const std::size_t conv_elements = CheckedMultiply(
+        CheckedMultiply(config_.num_layers - attention_layers,
+                        config_.SsmQkvSize()),
+        config_.ssm_conv_kernel);
+    const std::size_t deltanet_elements = CheckedMultiply(
+        CheckedMultiply(CheckedMultiply(config_.num_layers - attention_layers,
+                                        config_.ssm_time_step_rank),
+                        config_.ssm_state_size),
+        config_.SsmValueSize());
+    return CheckedSum(
+        CheckedSum(CheckedSum(kvarn_regions_.sink_bytes,
+                              kvarn_regions_.body_bytes),
+                   CheckedSum(kvarn_regions_.tail_bytes,
+                              CheckedMultiply(attention_layers,
+                                              config_.num_key_value_heads) *
+                                  sizeof(std::uint32_t))),
+        CheckedSum(CheckedMultiply(conv_elements, sizeof(float)),
+                   CheckedMultiply(
+                       deltanet_elements,
+                       QwenRecurrentStateElementBytes(
+                           policy_.recurrent_state_storage))));
+  }
   if (valid_context > max_context_)
     throw std::length_error("Qwen snapshot exceeds the context length");
   const auto unused = CheckedMultiply(
@@ -445,6 +911,90 @@ std::size_t QwenGpuArena::SnapshotPayloadBytes(
 
 std::unique_ptr<QwenGpuSnapshot> QwenGpuArena::SaveSnapshot(
     std::uint32_t valid_context) {
+  if (policy_.UsesKvarn()) {
+    if (valid_context > max_context_) {
+      throw std::length_error("Qwen snapshot exceeds the context length");
+    }
+    auto snapshot = std::unique_ptr<QwenGpuSnapshot>(new QwenGpuSnapshot());
+    snapshot->num_layers_ = config_.num_layers;
+    snapshot->attention_layers_ = config_.FullAttentionLayerCount();
+    snapshot->full_attention_interval_ = config_.full_attention_interval;
+    snapshot->kv_width_ = config_.num_key_value_heads * config_.head_dim;
+    snapshot->max_context_ = max_context_;
+    snapshot->valid_context_ = valid_context;
+    snapshot->kv_storage_ = policy_.kv_cache_storage;
+    snapshot->recurrent_state_storage_ = policy_.recurrent_state_storage;
+    snapshot->kvarn_ = true;
+    snapshot->kvarn_k_bits_ = policy_.kvarn.k_bits;
+    snapshot->kvarn_v_bits_ = policy_.kvarn.v_bits;
+    snapshot->kvarn_tail_length_ = policy_.kvarn.tail_length;
+    snapshot->kvarn_ring_rows_ = static_cast<std::uint32_t>(
+        kvarn_regions_.tail_rows);
+    snapshot->kvarn_tile_count_ = static_cast<std::uint32_t>(
+        kvarn_regions_.tile_count);
+    snapshot->kvarn_scale_ = static_cast<std::uint8_t>(policy_.kvarn.scale);
+    snapshot->kvarn_sink_bytes_ = kvarn_regions_.sink_bytes;
+    snapshot->kvarn_body_bytes_ = kvarn_regions_.body_bytes;
+    snapshot->kvarn_tail_bytes_ = kvarn_regions_.tail_bytes;
+    snapshot->kvarn_seal_elements_ =
+        static_cast<std::size_t>(snapshot->attention_layers_) *
+        config_.num_key_value_heads;
+    snapshot->conv_elements_per_layer_ =
+        CheckedMultiply(config_.SsmQkvSize(), config_.ssm_conv_kernel);
+    snapshot->conv_elements_ =
+        CheckedMultiply(config_.num_layers - snapshot->attention_layers_,
+                        snapshot->conv_elements_per_layer_);
+    snapshot->deltanet_elements_per_layer_ = CheckedMultiply(
+        CheckedMultiply(config_.ssm_time_step_rank, config_.ssm_state_size),
+        config_.SsmValueSize());
+    snapshot->deltanet_elements_ =
+        CheckedMultiply(config_.num_layers - snapshot->attention_layers_,
+                        snapshot->deltanet_elements_per_layer_);
+
+    ThrowOnHipError(
+        hipMalloc(&snapshot->d_kvarn_sink_, snapshot->kvarn_sink_bytes_),
+        "failed to allocate Qwen KVarN sink snapshot");
+    ThrowOnHipError(
+        hipMalloc(&snapshot->d_kvarn_body_, snapshot->kvarn_body_bytes_),
+        "failed to allocate Qwen KVarN body snapshot");
+    ThrowOnHipError(
+        hipMalloc(&snapshot->d_kvarn_tail_, snapshot->kvarn_tail_bytes_),
+        "failed to allocate Qwen KVarN tail snapshot");
+    ThrowOnHipError(hipMalloc(&snapshot->d_kvarn_sealed_,
+                              snapshot->kvarn_seal_elements_ *
+                                  sizeof(std::uint32_t)),
+                    "failed to allocate Qwen KVarN seal snapshot");
+
+    SnapshotTransfer transfer;
+    transfer.Copy(snapshot->d_kvarn_sink_, d_kvarn_sink,
+                  snapshot->kvarn_sink_bytes_, hipMemcpyDeviceToDevice);
+    transfer.Copy(snapshot->d_kvarn_body_, d_kvarn_body,
+                  snapshot->kvarn_body_bytes_, hipMemcpyDeviceToDevice);
+    transfer.Copy(snapshot->d_kvarn_tail_, d_kvarn_tail,
+                  snapshot->kvarn_tail_bytes_, hipMemcpyDeviceToDevice);
+    transfer.Copy(snapshot->d_kvarn_sealed_, kvarn_seal_->sealed(),
+                  snapshot->kvarn_seal_elements_ * sizeof(std::uint32_t),
+                  hipMemcpyDeviceToDevice);
+    ThrowOnHipError(hipMalloc(&snapshot->d_ssm_conv_,
+                              snapshot->conv_elements_ * sizeof(float)),
+                    "failed to allocate Qwen convolution snapshot");
+    ThrowOnHipError(hipMalloc(&snapshot->d_ssm_deltanet_,
+                              snapshot->deltanet_elements_ *
+                                  QwenRecurrentStateElementBytes(
+                                      snapshot->recurrent_state_storage_)),
+                    "failed to allocate Qwen DeltaNet snapshot");
+    transfer.Copy(snapshot->d_ssm_conv_, d_ssm_conv_state,
+                  snapshot->conv_elements_ * sizeof(float),
+                  hipMemcpyDeviceToDevice);
+    transfer.Copy(
+        snapshot->d_ssm_deltanet_, d_ssm_deltanet_state,
+        snapshot->deltanet_elements_ *
+            QwenRecurrentStateElementBytes(snapshot->recurrent_state_storage_),
+        hipMemcpyDeviceToDevice);
+
+    snapshot->payload_bytes_ = SnapshotPayloadBytes(valid_context);
+    return snapshot;
+  }
   if (valid_context > max_context_) {
     throw std::length_error("Qwen snapshot exceeds the context length");
   }
@@ -537,6 +1087,68 @@ std::unique_ptr<QwenGpuSnapshot> QwenGpuArena::SaveSnapshot(
 }
 
 void QwenGpuArena::RestoreSnapshot(const QwenGpuSnapshot& snapshot) {
+  if (policy_.UsesKvarn()) {
+    const std::uint32_t attention_layers = config_.FullAttentionLayerCount();
+    const std::size_t conv_elements = CheckedMultiply(
+        CheckedMultiply(config_.num_layers - attention_layers,
+                        config_.SsmQkvSize()),
+        config_.ssm_conv_kernel);
+    const std::size_t deltanet_elements = CheckedMultiply(
+        CheckedMultiply(CheckedMultiply(config_.num_layers - attention_layers,
+                                        config_.ssm_time_step_rank),
+                        config_.ssm_state_size),
+        config_.SsmValueSize());
+    if (!snapshot.kvarn_ || snapshot.valid_context_ > max_context_ ||
+        snapshot.attention_layers_ != attention_layers ||
+        snapshot.kv_width_ != config_.num_key_value_heads * config_.head_dim ||
+        snapshot.max_context_ != max_context_ ||
+        snapshot.kv_storage_ != policy_.kv_cache_storage ||
+        snapshot.recurrent_state_storage_ != policy_.recurrent_state_storage ||
+        snapshot.kvarn_k_bits_ != policy_.kvarn.k_bits ||
+        snapshot.kvarn_v_bits_ != policy_.kvarn.v_bits ||
+        snapshot.kvarn_tail_length_ != policy_.kvarn.tail_length ||
+        snapshot.kvarn_ring_rows_ != kvarn_regions_.tail_rows ||
+        snapshot.kvarn_tile_count_ != kvarn_regions_.tile_count ||
+        snapshot.conv_elements_ != conv_elements ||
+        snapshot.deltanet_elements_ != deltanet_elements) {
+      throw std::invalid_argument(
+          "Qwen snapshot is incompatible with the arena");
+    }
+
+    Reset();
+    ThrowOnHipError(
+        hipMemcpyAsync(d_kvarn_sink, snapshot.d_kvarn_sink_,
+                       snapshot.kvarn_sink_bytes_, hipMemcpyDeviceToDevice,
+                       stream),
+        "failed to restore Qwen KVarN sink snapshot");
+    ThrowOnHipError(
+        hipMemcpyAsync(d_kvarn_body, snapshot.d_kvarn_body_,
+                       snapshot.kvarn_body_bytes_, hipMemcpyDeviceToDevice,
+                       stream),
+        "failed to restore Qwen KVarN body snapshot");
+    ThrowOnHipError(
+        hipMemcpyAsync(d_kvarn_tail, snapshot.d_kvarn_tail_,
+                       snapshot.kvarn_tail_bytes_, hipMemcpyDeviceToDevice,
+                       stream),
+        "failed to restore Qwen KVarN tail snapshot");
+    ThrowOnHipError(
+        hipMemcpyAsync(kvarn_seal_->sealed(), snapshot.d_kvarn_sealed_,
+                       snapshot.kvarn_seal_elements_ * sizeof(std::uint32_t),
+                       hipMemcpyDeviceToDevice, stream),
+        "failed to restore Qwen KVarN seal state");
+    ThrowOnHipError(hipMemcpyAsync(d_ssm_conv_state, snapshot.d_ssm_conv_,
+                                   snapshot.conv_elements_ * sizeof(float),
+                                   hipMemcpyDeviceToDevice, stream),
+                    "failed to restore Qwen convolution snapshot");
+    ThrowOnHipError(
+        hipMemcpyAsync(d_ssm_deltanet_state, snapshot.d_ssm_deltanet_,
+                       snapshot.deltanet_elements_ *
+                           QwenRecurrentStateElementBytes(
+                               policy_.recurrent_state_storage),
+                       hipMemcpyDeviceToDevice, stream),
+        "failed to restore Qwen DeltaNet snapshot");
+    return;
+  }
   const std::uint32_t attention_layers = config_.FullAttentionLayerCount();
   const std::uint32_t kv_width = config_.num_key_value_heads * config_.head_dim;
   const std::size_t conv_elements =
@@ -605,7 +1217,6 @@ void QwenGpuArena::RestoreSnapshot(const QwenGpuSnapshot& snapshot) {
 void QwenGpuArena::RestoreCompactSnapshot(
     std::span<const std::uint8_t> payload,
     std::uint32_t expected_valid_context) {
-  const auto layout = ParseCompactSnapshotLayout(payload);
   const std::uint32_t attention_layers = config_.FullAttentionLayerCount();
   const std::uint32_t kv_width = config_.num_key_value_heads * config_.head_dim;
   const std::size_t conv_elements_per_layer =
@@ -618,6 +1229,76 @@ void QwenGpuArena::RestoreCompactSnapshot(
       CheckedMultiply(recurrent_layers, conv_elements_per_layer);
   const std::size_t deltanet_elements =
       CheckedMultiply(recurrent_layers, deltanet_elements_per_layer);
+
+  const std::uint32_t version = CompactSnapshotVersion(payload);
+  if (policy_.UsesKvarn()) {
+    if (version != kKvarnCompactSnapshotVersion) {
+      throw std::invalid_argument(
+          "Qwen KVarN compact snapshot version is invalid");
+    }
+    const auto layout = ParseKvarnCompactSnapshotLayout(payload);
+    if (layout.valid_context != expected_valid_context ||
+        layout.valid_context > max_context_ ||
+        layout.attention_layers != attention_layers ||
+        layout.kv_width != kv_width || layout.max_context != max_context_ ||
+        layout.recurrent_state_storage != policy_.recurrent_state_storage ||
+        layout.conv_elements != conv_elements ||
+        layout.deltanet_elements != deltanet_elements ||
+        layout.k_bits != policy_.kvarn.k_bits ||
+        layout.v_bits != policy_.kvarn.v_bits ||
+        layout.tail_length != policy_.kvarn.tail_length ||
+        layout.scale != policy_.kvarn.scale ||
+        layout.tail_rows != kvarn_regions_.tail_rows ||
+        layout.tile_count != kvarn_regions_.tile_count ||
+        layout.sink_bytes != kvarn_regions_.sink_bytes ||
+        layout.body_bytes != kvarn_regions_.body_bytes ||
+        layout.tail_bytes != kvarn_regions_.tail_bytes) {
+      throw std::invalid_argument(
+          "Qwen KVarN compact snapshot is incompatible with the arena");
+    }
+
+    Reset();
+    if (layout.sink_bytes != 0)
+      ThrowOnHipError(
+          hipMemcpyAsync(d_kvarn_sink, payload.data() + layout.sink_offset,
+                         layout.sink_bytes, hipMemcpyHostToDevice, stream),
+          "failed to restore compact Qwen KVarN sink");
+    if (layout.body_bytes != 0)
+      ThrowOnHipError(
+          hipMemcpyAsync(d_kvarn_body, payload.data() + layout.body_offset,
+                         layout.body_bytes, hipMemcpyHostToDevice, stream),
+          "failed to restore compact Qwen KVarN body");
+    if (layout.tail_bytes != 0)
+      ThrowOnHipError(
+          hipMemcpyAsync(d_kvarn_tail, payload.data() + layout.tail_offset,
+                         layout.tail_bytes, hipMemcpyHostToDevice, stream),
+          "failed to restore compact Qwen KVarN tail");
+    ThrowOnHipError(
+        hipMemcpyAsync(kvarn_seal_->sealed(),
+                       payload.data() + layout.seal_offset, layout.seal_bytes,
+                       hipMemcpyHostToDevice, stream),
+        "failed to restore compact Qwen KVarN seal state");
+    if (layout.conv_bytes != 0)
+      ThrowOnHipError(
+          hipMemcpyAsync(d_ssm_conv_state, payload.data() + layout.conv_offset,
+                         layout.conv_bytes, hipMemcpyHostToDevice, stream),
+          "failed to restore compact Qwen convolution state");
+    if (layout.deltanet_bytes != 0)
+      ThrowOnHipError(
+          hipMemcpyAsync(d_ssm_deltanet_state,
+                         payload.data() + layout.deltanet_offset,
+                         layout.deltanet_bytes, hipMemcpyHostToDevice, stream),
+          "failed to restore compact Qwen DeltaNet state");
+    ThrowOnHipError(hipStreamSynchronize(stream),
+                    "failed to synchronize compact Qwen snapshot restore");
+    return;
+  }
+  if (version == kKvarnCompactSnapshotVersion) {
+    throw std::invalid_argument(
+        "Qwen KVarN compact snapshot requires a KVarN policy");
+  }
+
+  const auto layout = ParseCompactSnapshotLayout(payload);
   if (layout.valid_context != expected_valid_context ||
       layout.valid_context > max_context_ ||
       layout.attention_layers != attention_layers ||
@@ -766,13 +1447,22 @@ QwenGpuArena::QwenGpuArena(const core::ModelConfig& config,
         hipMalloc(&d_weights_bf16, max_weight_elems * sizeof(hip_bfloat16)));
 
     const std::size_t total_kv = GetAttentionKvPlaneElements();
-    if (policy_.UsesFp16AttentionKv()) {
-      HIP_CHECK(
-          hipMalloc(&d_attention_kv_f16, total_kv * sizeof(std::uint16_t) * 2));
+    if (!policy_.UsesKvarn()) {
+      if (policy_.UsesFp16AttentionKv()) {
+        HIP_CHECK(hipMalloc(&d_attention_kv_f16,
+                            total_kv * sizeof(std::uint16_t) * 2));
+      } else {
+        HIP_CHECK(hipMalloc(&d_kv_cache, total_kv * sizeof(float) * 2));
+      }
     } else {
-      HIP_CHECK(hipMalloc(&d_kv_cache, total_kv * sizeof(float) * 2));
+      const std::string shape_error =
+          QwenKvarnShapeError(policy_, config_.num_attention_heads,
+                              config_.num_key_value_heads, config_.head_dim);
+      if (!shape_error.empty()) {
+        throw std::runtime_error(shape_error);
+      }
+      AllocateKvarnRegions();
     }
-
     const std::size_t total_conv =
         num_layers * ssm_qkv_size * config_.ssm_conv_kernel;
     HIP_CHECK(hipMalloc(&d_ssm_conv_state, total_conv * sizeof(float)));
@@ -793,6 +1483,36 @@ QwenGpuArena::QwenGpuArena(const core::ModelConfig& config,
 
 QwenGpuArena::~QwenGpuArena() {
   FreeAll();
+}
+
+void QwenGpuArena::AllocateKvarnRegions() {
+  const QwenKvarnPreset& preset = policy_.kvarn;
+  kvarn_regions_ = models::qwen::ComputeKvarnRegions(
+      preset.k_bits, preset.v_bits, QwenKvarnTailRows(preset), kQwenKvarnW,
+      max_context_, config_.FullAttentionLayerCount(),
+      config_.num_key_value_heads);
+  if (kvarn_regions_.sink_bytes != 0) {
+    HIP_CHECK(hipMalloc(&d_kvarn_sink, kvarn_regions_.sink_bytes));
+  }
+  if (kvarn_regions_.body_bytes != 0) {
+    HIP_CHECK(hipMalloc(reinterpret_cast<void**>(&d_kvarn_body),
+                        kvarn_regions_.body_bytes));
+  }
+  if (kvarn_regions_.tail_bytes != 0) {
+    HIP_CHECK(hipMalloc(&d_kvarn_tail, kvarn_regions_.tail_bytes));
+  }
+  // Bounded per-chunk F16 workspace (design D4/4.1): a whole prefill chunk of
+  // K and V rows, so the sink and the L+128+W ring keep the pre-chunk rows a
+  // chunk's early queries still read as F16.
+  const std::uint64_t chunk_plane_elements =
+      static_cast<std::uint64_t>(max_batch_) * config_.num_key_value_heads *
+      config_.head_dim;
+  if (chunk_plane_elements != 0) {
+    HIP_CHECK(hipMalloc(&d_kvarn_chunk,
+                        chunk_plane_elements * sizeof(std::uint16_t) * 2));
+  }
+  kvarn_seal_ = std::make_unique<KvarnSealState>(
+      config_.FullAttentionLayerCount(), config_.num_key_value_heads);
 }
 
 QwenGpuScratchView QwenGpuArena::GetScratchView(
@@ -892,6 +1612,7 @@ QwenGpuArena::QwenGpuArena(QwenGpuArena&& other) noexcept
       max_batch_(other.max_batch_),
       policy_(other.policy_),
       target_layer_ids_(std::move(other.target_layer_ids_)) {
+  kvarn_seal_ = std::move(other.kvarn_seal_);
   d_hidden = other.d_hidden;
   d_normed = other.d_normed;
   d_q = other.d_q;
@@ -913,6 +1634,11 @@ QwenGpuArena::QwenGpuArena(QwenGpuArena&& other) noexcept
   d_logits = other.d_logits;
   d_attention_kv_f16 = other.d_attention_kv_f16;
   d_kv_cache = other.d_kv_cache;
+  d_kvarn_sink = other.d_kvarn_sink;
+  d_kvarn_body = other.d_kvarn_body;
+  d_kvarn_tail = other.d_kvarn_tail;
+  d_kvarn_chunk = other.d_kvarn_chunk;
+  kvarn_regions_ = other.kvarn_regions_;
   d_ssm_conv_state = other.d_ssm_conv_state;
   d_ssm_deltanet_state = other.d_ssm_deltanet_state;
   d_prompt_tokens = other.d_prompt_tokens;
@@ -957,6 +1683,11 @@ QwenGpuArena::QwenGpuArena(QwenGpuArena&& other) noexcept
   other.d_logits = nullptr;
   other.d_attention_kv_f16 = nullptr;
   other.d_kv_cache = nullptr;
+  other.d_kvarn_sink = nullptr;
+  other.d_kvarn_body = nullptr;
+  other.d_kvarn_tail = nullptr;
+  other.d_kvarn_chunk = nullptr;
+  other.kvarn_regions_ = {};
   other.d_ssm_conv_state = nullptr;
   other.d_ssm_deltanet_state = nullptr;
   other.d_prompt_tokens = nullptr;
@@ -988,6 +1719,7 @@ QwenGpuArena& QwenGpuArena::operator=(QwenGpuArena&& other) noexcept {
     max_batch_ = other.max_batch_;
     policy_ = other.policy_;
     target_layer_ids_ = std::move(other.target_layer_ids_);
+    kvarn_seal_ = std::move(other.kvarn_seal_);
     d_hidden = other.d_hidden;
     d_normed = other.d_normed;
     d_q = other.d_q;
@@ -1009,6 +1741,11 @@ QwenGpuArena& QwenGpuArena::operator=(QwenGpuArena&& other) noexcept {
     d_logits = other.d_logits;
     d_attention_kv_f16 = other.d_attention_kv_f16;
     d_kv_cache = other.d_kv_cache;
+    d_kvarn_sink = other.d_kvarn_sink;
+    d_kvarn_body = other.d_kvarn_body;
+    d_kvarn_tail = other.d_kvarn_tail;
+    d_kvarn_chunk = other.d_kvarn_chunk;
+    kvarn_regions_ = other.kvarn_regions_;
     d_ssm_conv_state = other.d_ssm_conv_state;
     d_ssm_deltanet_state = other.d_ssm_deltanet_state;
     d_prompt_tokens = other.d_prompt_tokens;
@@ -1053,6 +1790,11 @@ QwenGpuArena& QwenGpuArena::operator=(QwenGpuArena&& other) noexcept {
     other.d_logits = nullptr;
     other.d_attention_kv_f16 = nullptr;
     other.d_kv_cache = nullptr;
+    other.d_kvarn_sink = nullptr;
+    other.d_kvarn_body = nullptr;
+    other.d_kvarn_tail = nullptr;
+    other.d_kvarn_chunk = nullptr;
+    other.kvarn_regions_ = {};
     other.d_ssm_conv_state = nullptr;
     other.d_ssm_deltanet_state = nullptr;
     other.d_prompt_tokens = nullptr;
@@ -1079,6 +1821,9 @@ QwenGpuArena& QwenGpuArena::operator=(QwenGpuArena&& other) noexcept {
 }
 
 void QwenGpuArena::Reset() {
+  if (kvarn_seal_ != nullptr) {
+    kvarn_seal_->Reset(stream);
+  }
   const std::size_t num_layers = config_.SsmLayerCount();
   const std::size_t total_conv =
       num_layers * config_.SsmQkvSize() * config_.ssm_conv_kernel;
@@ -1154,6 +1899,14 @@ void QwenGpuArena::FreeAll() noexcept {
   }
   if (d_kv_cache != nullptr)
     LogCleanupError(hipFree(d_kv_cache));
+  if (d_kvarn_sink != nullptr)
+    LogCleanupError(hipFree(d_kvarn_sink));
+  if (d_kvarn_body != nullptr)
+    LogCleanupError(hipFree(d_kvarn_body));
+  if (d_kvarn_tail != nullptr)
+    LogCleanupError(hipFree(d_kvarn_tail));
+  if (d_kvarn_chunk != nullptr)
+    LogCleanupError(hipFree(d_kvarn_chunk));
   if (d_ssm_conv_state != nullptr)
     LogCleanupError(hipFree(d_ssm_conv_state));
   if (d_ssm_deltanet_state != nullptr)
@@ -1207,6 +1960,11 @@ void QwenGpuArena::FreeAll() noexcept {
   d_logits = nullptr;
   d_attention_kv_f16 = nullptr;
   d_kv_cache = nullptr;
+  d_kvarn_sink = nullptr;
+  d_kvarn_body = nullptr;
+  d_kvarn_tail = nullptr;
+  d_kvarn_chunk = nullptr;
+  kvarn_regions_ = {};
   d_ssm_conv_state = nullptr;
   d_ssm_deltanet_state = nullptr;
   d_prompt_tokens = nullptr;

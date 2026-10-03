@@ -10,9 +10,16 @@
 #include "src/core/hip/detail/dispatch_telemetry.hpp"
 #include "src/core/hip/hip_utils.hpp"
 #include "src/models/qwen/hip/detail/attention_policy.hpp"
+#include "src/models/qwen/hip/kernels/kvarn_read_device.hpp"
 #include "src/models/qwen/hip/ops/attention.hpp"
 
 namespace gufo::hip {
+
+// Inverse Hadamard rotation + SiLU gate of one context row (design D3).
+// Defined in kernels/attention_wmma.hip and shared by the prefill launchers.
+__global__ void KvarnContextRotateGateKernel(float* __restrict__ out_context,
+                                             const float* __restrict__ gate,
+                                             std::uint32_t num_heads);
 
 __global__ void SyncTiledAttentionKvPrefixKernel(
     const float* __restrict__ k_cache, const float* __restrict__ v_cache,
@@ -132,7 +139,10 @@ __launch_bounds__(256, 3) __global__ void QwenTiledAttentionKernel(
     const __half* __restrict__ k_cache_f16,
     const __half* __restrict__ v_cache_f16, float* __restrict__ out_context,
     std::uint32_t start_pos, std::size_t batch_size,
-    float* __restrict__ lse_out, std::uint32_t key_begin) {
+    float* __restrict__ lse_out, std::uint32_t key_begin,
+    KvarnReadParams kvarn, std::uint32_t layer_idx,
+    std::uint32_t quantized_tiles, std::uint32_t chunk_begin,
+    std::uint32_t chunk_end) {
   const std::uint32_t lane = threadIdx.x;
   const std::uint32_t wave = threadIdx.y;
   const std::uint32_t query_start = blockIdx.x * kTileAttentionQueryRows;
@@ -213,12 +223,26 @@ __launch_bounds__(256, 3) __global__ void QwenTiledAttentionKernel(
           __half2 packed =
               __halves2half2(__float2half_rn(0.0F), __float2half_rn(0.0F));
           if (key_position < context_end) {
-            const auto* layer_key =
-                reinterpret_cast<const __half2*>(k_cache_f16);
-            packed = layer_key
-                [(static_cast<std::size_t>(key_position) * kv_half2_stride) +
-                 (static_cast<std::size_t>(kv_head) * kTileAttentionHalf2Dim) +
-                 (key_dimension * kTileAttentionKeyHalf2Dim) + half2_index];
+            if (kvarn.enabled()) {
+              // Dequantize the K tile into the existing LDS staging (design
+              // D7). The view is fixed for the launch, so every row of the
+              // block reads the region the decode view selects.
+              const std::uint32_t channel =
+                  2 * ((key_dimension * kTileAttentionKeyHalf2Dim) +
+                       half2_index);
+              packed = __halves2half2(
+                  __float2half_rn(KvarnStoredKElement(kvarn, layer_idx, kv_head, key_position, quantized_tiles, chunk_begin, chunk_end, channel)),
+                  __float2half_rn(KvarnStoredKElement(kvarn, layer_idx, kv_head, key_position, quantized_tiles, chunk_begin, chunk_end, channel + 1)));
+            } else {
+              const auto* layer_key =
+                  reinterpret_cast<const __half2*>(k_cache_f16);
+              packed = layer_key
+                  [(static_cast<std::size_t>(key_position) *
+                    kv_half2_stride) +
+                   (static_cast<std::size_t>(kv_head) *
+                    kTileAttentionHalf2Dim) +
+                   (key_dimension * kTileAttentionKeyHalf2Dim) + half2_index];
+            }
           }
           kv_tile[(key_row * kTileAttentionKeyRowStride) + half2_index] =
               packed;
@@ -296,12 +320,21 @@ __launch_bounds__(256, 3) __global__ void QwenTiledAttentionKernel(
           __half2 packed =
               __halves2half2(__float2half_rn(0.0F), __float2half_rn(0.0F));
           if (key_position < context_end) {
-            const auto* layer_value =
-                reinterpret_cast<const __half2*>(v_cache_f16);
-            packed = layer_value
-                [(static_cast<std::size_t>(key_position) * kv_half2_stride) +
-                 (static_cast<std::size_t>(kv_head) * kTileAttentionHalf2Dim) +
-                 half2_index];
+            if (kvarn.enabled()) {
+              const std::uint32_t channel = 2 * half2_index;
+              packed = __halves2half2(
+                  __float2half_rn(KvarnStoredVElement(kvarn, layer_idx, kv_head, key_position, quantized_tiles, chunk_begin, chunk_end, channel)),
+                  __float2half_rn(KvarnStoredVElement(kvarn, layer_idx, kv_head, key_position, quantized_tiles, chunk_begin, chunk_end, channel + 1)));
+            } else {
+              const auto* layer_value =
+                  reinterpret_cast<const __half2*>(v_cache_f16);
+              packed = layer_value
+                  [(static_cast<std::size_t>(key_position) *
+                    kv_half2_stride) +
+                   (static_cast<std::size_t>(kv_head) *
+                    kTileAttentionHalf2Dim) +
+                   half2_index];
+            }
           }
           kv_tile[(value_row * kTileAttentionHalf2Dim) + half2_index] = packed;
         }
@@ -411,7 +444,8 @@ bool LaunchBatchedAttentionTile(
     float* out_context, std::uint32_t layer_idx, std::uint32_t start_pos,
     std::size_t batch_size, std::uint32_t max_context, std::uint32_t num_heads,
     std::uint32_t num_kv_heads, std::uint32_t head_dim, hipStream_t stream,
-    float* lse_out, std::uint32_t key_begin, bool skip_kv_write) {
+    float* lse_out, std::uint32_t key_begin, bool skip_kv_write,
+    KvarnReadParams kvarn) {
   const detail::AttentionSupportParams support_params{
       .batch_size = batch_size,
       .start_pos = start_pos,
@@ -421,6 +455,7 @@ bool LaunchBatchedAttentionTile(
       .head_dim = head_dim,
       .has_k_cache_f16 = k_cache_f16 != nullptr,
       .has_v_cache_f16 = v_cache_f16 != nullptr,
+      .has_kvarn = kvarn.enabled(),
   };
   if (!detail::IsTiledAttentionSupported(support_params)) {
     return false;
@@ -429,6 +464,56 @@ bool LaunchBatchedAttentionTile(
   constexpr std::size_t block_size = 256;
   constexpr std::size_t kv_width =
       kTileAttentionKvHeads * kTileAttentionHeadDim;
+  constexpr std::size_t attention_width =
+      kTileAttentionQueryHeads * kTileAttentionHeadDim;
+  const dim3 attention_block(32, 8);
+
+  if (kvarn.enabled()) {
+    // KVarN (design D2/D7): no canonical planes exist, so the pack and the
+    // prefix sync never run. The kernel dequantizes the K and V tiles into its
+    // existing LDS staging. One launch per query-row group keeps every row on
+    // its own view (KvarnQuantizedTilesForQuery), and the inverse rotation is
+    // applied once after the merge (design D3).
+    if (batch_size == 0 || key_begin != 0) {
+      return false;
+    }
+    const std::uint32_t chunk_end =
+        start_pos + static_cast<std::uint32_t>(batch_size);
+    for (std::uint32_t row_begin = 0; row_begin < batch_size;) {
+      const std::uint32_t group_begin =
+          start_pos + static_cast<std::uint32_t>(row_begin);
+      const std::uint32_t quantized_tiles =
+          KvarnQuantizedTilesForQuery(group_begin, kvarn.tail_length);
+      const std::uint64_t next_threshold =
+          256ULL + (128ULL * quantized_tiles) + kvarn.tail_length;
+      const std::uint32_t group_end =
+          next_threshold >= chunk_end
+              ? chunk_end
+              : static_cast<std::uint32_t>(next_threshold);
+      const std::uint32_t group_rows = group_end - group_begin;
+      const dim3 grid(
+          static_cast<unsigned int>((group_rows + kTileAttentionQueryRows - 1) /
+                                    kTileAttentionQueryRows),
+          kTileAttentionKvHeads *
+              (kTileAttentionGqa / kTileAttentionHeadsPerBlock));
+      QwenTiledAttentionKernel<<<grid, attention_block, 0, stream>>>(
+          q + (static_cast<std::size_t>(row_begin) * attention_width),
+          /*gate=*/nullptr, static_cast<const __half*>(k_cache_f16),
+          static_cast<const __half*>(v_cache_f16),
+          out_context + (static_cast<std::size_t>(row_begin) * attention_width),
+          group_begin, group_rows, /*lse_out=*/nullptr, key_begin, kvarn,
+          layer_idx, quantized_tiles, start_pos, chunk_end);
+      row_begin += group_rows;
+    }
+    if (lse_out == nullptr) {
+      KvarnContextRotateGateKernel<<<dim3(static_cast<unsigned int>(batch_size),
+                                          num_heads),
+                                     256, 0, stream>>>(out_context, gate,
+                                                       num_heads);
+    }
+    return true;
+  }
+
   const std::size_t layer_cache_offset =
       static_cast<std::size_t>(layer_idx) * max_context * kv_width;
   auto* layer_k = static_cast<__half*>(k_cache_f16) + layer_cache_offset;
@@ -458,10 +543,11 @@ bool LaunchBatchedAttentionTile(
                                 kTileAttentionQueryRows),
       kTileAttentionKvHeads *
           (kTileAttentionGqa / kTileAttentionHeadsPerBlock));
-  const dim3 attention_block(32, 8);
   QwenTiledAttentionKernel<<<attention_grid, attention_block, 0, stream>>>(
       q, gate, layer_k, layer_v, out_context, start_pos, batch_size, lse_out,
-      key_begin);
+      key_begin, /*kvarn=*/KvarnReadParams{}, /*layer_idx=*/0,
+      /*quantized_tiles=*/0, start_pos,
+      start_pos + static_cast<std::uint32_t>(batch_size));
   return true;
 }
 

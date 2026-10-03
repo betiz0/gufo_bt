@@ -14,6 +14,9 @@
 
 #include "src/core/crypto/sha256.hpp"
 #include "src/core/gguf_reader.hpp"
+#include "src/core/hip/hip_utils.hpp"
+#include "src/models/qwen/generator.hpp"
+#include "src/models/qwen/hip/execution_policy.hpp"
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/testing/compare/logit_comparator.hpp"
 
@@ -465,6 +468,277 @@ void CheckConcurrencyWidths(const Executor& owner) {
   std::cout << "appended verification: C8/4/2/1 logits/features/replay exact\n";
 }
 
+// Tasks 3.13: every production KVarN preset must reach the same greedy choice
+// in the C2/C8 batch decode as the C1 scalar decode, over a prompt context that
+// crosses a tile seal boundary (position 128..255 seals once the query reaches
+// 256 + L, design D4). KVarN is lossy, so rows are compared on the greedy token
+// rather than byte-equal logits.
+void CheckKvarnBatchDecode(
+    const std::shared_ptr<const gufo::hip::QwenGpuModel>& model) {
+  constexpr std::size_t kSessions = 8;
+  constexpr std::size_t kContinuation = 4;
+  constexpr std::uint32_t kMaxContext = 3072;
+  for (const char* name : {"kvarn-k4v4", "kvarn-k5v4", "kvarn-k6v5"}) {
+    for (const std::uint32_t tail : {0U, 2048U}) {
+      gufo::hip::QwenExecutionPolicy policy =
+          gufo::hip::QwenExecutionPolicy::Production();
+      gufo::hip::QwenKvarnPreset preset;
+      Expect(gufo::hip::ParseQwenKvarnPreset(name, &preset),
+             "production KVarN preset must parse");
+      preset.tail_length = tail;
+      policy.kvarn = preset;
+      policy.kv_cache_storage = gufo::hip::QwenKvCacheStorage::kKvarn;
+      const std::uint32_t tail_rows = gufo::hip::QwenKvarnTailRows(preset);
+      // The prompt must cross a seal boundary: `context > 128 + L + 128`.
+      const std::uint32_t boundary = 256U + tail_rows;
+      const std::uint32_t prompt_size = boundary + 4U;
+      Expect(prompt_size + kContinuation < kMaxContext,
+             "KVarN batch decode context must fit");
+      std::array<std::unique_ptr<Executor>, kSessions> sessions;
+      std::array<std::unique_ptr<gufo::hip::QwenGpuSnapshot>, kSessions>
+          snapshots;
+      std::array<std::vector<Token>, kSessions> tokens;
+      std::array<std::vector<Token>, kSessions> expected;
+      for (std::size_t row = 0; row < kSessions; ++row) {
+        sessions[row] = std::make_unique<Executor>(model, kMaxContext, policy);
+        const auto text = sessions[row]->GetTokenizer().Encode(
+            std::string(kTexts[row % kTexts.size()]) + "\n" +
+            kTexts[(row + 1) % kTexts.size()]);
+        Expect(!text.empty(), "KVarN batch fixture must tokenize");
+        tokens[row].resize(prompt_size + kContinuation);
+        for (std::size_t i = 0; i < tokens[row].size(); ++i)
+          tokens[row][i] = text[i % text.size()];
+        auto& session = *sessions[row];
+        session.Reset();
+        (void)session.ForwardPromptBatch(
+            std::span(tokens[row]).first(prompt_size));
+        snapshots[row] = session.SaveSnapshot(prompt_size);
+        // Scalar C1 reference: greedy predictions over the continuation.
+        for (std::size_t step = 0; step < kContinuation; ++step) {
+          const auto position = prompt_size + step;
+          expected[row].push_back(
+              session.ForwardToken(tokens[row][position], position));
+          (void)Logits(session);
+        }
+      }
+      for (const std::size_t width : {2U, 8U}) {
+        for (std::size_t row = 0; row < width; ++row)
+          sessions[row]->RestoreSnapshot(*snapshots[row]);
+        std::array<gufo::hip::QwenGpuBatchItem, kSessions> items;
+        for (std::size_t step = 0; step < kContinuation; ++step) {
+          for (std::size_t row = 0; row < width; ++row)
+            items[row] = {sessions[row].get(),
+                          tokens[row][prompt_size + step],
+                          static_cast<std::uint32_t>(prompt_size + step)};
+          const auto predictions =
+              Executor::ForwardTokenBatch(std::span(items).first(width));
+          Expect(predictions.size() == width,
+                 "KVarN batch decode returned the wrong number of rows");
+          for (std::size_t row = 0; row < width; ++row) {
+            Expect(predictions[row] == expected[row][step],
+                   "KVarN batch decode changed the greedy prediction");
+            (void)Logits(*sessions[row]);
+          }
+        }
+      }
+      std::cout << "KVarN batch decode preset=" << name << " tail=" << tail
+                << " boundary=" << boundary << " C1/C2/C8 greedy exact\n";
+    }
+  }
+}
+
+gufo::hip::QwenExecutionPolicy KvarnPolicy(const char* name,
+                                           std::uint32_t tail_length) {
+  gufo::hip::QwenExecutionPolicy policy =
+      gufo::hip::QwenExecutionPolicy::Production();
+  Expect(gufo::hip::ResolveQwenKvCache(name, tail_length, &policy),
+         "production KVarN preset and tail must resolve");
+  return policy;
+}
+
+// Device read of the per-session sealed-tile counter for layer 0 / KV head 0.
+std::uint32_t SealedTileCount(Executor& executor) {
+  Expect(executor.GetKvarnSealState() != nullptr,
+         "KVarN session must own seal state");
+  std::uint32_t sealed = 0;
+  HIP_CHECK(hipMemcpy(&sealed, executor.GetKvarnSealState()->sealed(),
+                      sizeof(sealed), hipMemcpyDeviceToHost));
+  return sealed;
+}
+
+std::vector<Token> RepeatedFixture(
+    const std::shared_ptr<const gufo::hip::QwenGpuModel>& model,
+    std::size_t count) {
+  const std::string text =
+      std::string(kTexts[0]) + "\n" + kTexts[1] + "\n" + kTexts[2];
+  const auto source = model->GetTokenizer().Encode(text);
+  Expect(!source.empty(), "KVarN fixture must tokenize");
+  std::vector<Token> tokens(count);
+  for (std::size_t i = 0; i < count; ++i)
+    tokens[i] = source[i % source.size()];
+  return tokens;
+}
+
+// Task 5.3 / T-07: a speculative verification whose window contains the first
+// KVarN view-switch position 256 + L (design D2/D4; tile 0 ends at e_0 = 255
+// and a query q reads it quantized once q - L - 1 >= e_0). Sealing happens
+// during the verification from committed rows, the speculative chunk is then
+// cancelled, and saving plus restoring the post-cancel session must reproduce
+// the uninterrupted autoregressive logits bit for bit.
+void CheckKvarnRollbackCancel(
+    const std::shared_ptr<const gufo::hip::QwenGpuModel>& model) {
+  constexpr std::uint32_t kContext = 3072;
+  constexpr std::size_t kVerifyWidth = 4;
+  constexpr std::size_t kContinuation = 4;
+  for (const char* name : {"kvarn-k4v4", "kvarn-k6v5"}) {
+    for (const std::uint32_t tail : {0U, 2048U}) {
+      const auto policy = KvarnPolicy(name, tail);
+      const std::uint32_t tail_rows =
+          gufo::hip::QwenKvarnTailRows(policy.kvarn);
+      const std::uint32_t first_seal_query = 256U + tail_rows;
+      const std::uint32_t prompt_size = first_seal_query - 2U;
+      Expect(prompt_size + kContinuation + kVerifyWidth <= kContext,
+             "KVarN rollback fixture must fit the context");
+      const auto tokens = RepeatedFixture(model, kContext);
+
+      Executor reference(model, kContext, policy);
+      reference.Reset();
+      (void)reference.ForwardPromptBatch(std::span(tokens).first(prompt_size));
+      std::array<std::vector<float>, kContinuation + 1> expected;
+      expected[0] = Logits(reference);
+      for (std::size_t step = 0; step < kContinuation; ++step) {
+        (void)reference.ForwardToken(tokens[prompt_size + step],
+                                     prompt_size + step);
+        expected[step + 1] = Logits(reference);
+      }
+
+      // The verification window [prompt_size, prompt_size + 3] includes
+      // first_seal_query = prompt_size + 2.
+      Executor cancelled(model, kContext, policy);
+      cancelled.Reset();
+      (void)cancelled.ForwardPromptBatch(std::span(tokens).first(prompt_size));
+      cancelled.SaveState(prompt_size);
+      const auto predictions = cancelled.ForwardVerificationChunk(
+          std::span(tokens).subspan(prompt_size, kVerifyWidth), prompt_size,
+          true);
+      Expect(predictions.size() == kVerifyWidth,
+             "KVarN cancellation fixture returned the wrong draft width");
+      cancelled.RestoreState();
+      auto snapshot = cancelled.SaveSnapshot(prompt_size);
+      Expect(SealedTileCount(cancelled) > 0,
+             "cancellation must keep the tiles sealed by the verification");
+
+      Executor restored(model, kContext, policy);
+      restored.RestoreSnapshot(*snapshot);
+      for (std::size_t step = 0; step < kContinuation; ++step) {
+        (void)restored.ForwardToken(tokens[prompt_size + step],
+                                    prompt_size + step);
+        Expect(ByteEqual(Logits(restored), expected[step + 1]),
+               "KVarN cancel/save/restore changed continuation logits");
+      }
+      std::cout << "KVarN cancel preset=" << name << " tail=" << tail
+                << " seal_query=" << first_seal_query << " logits exact\n";
+    }
+  }
+}
+
+// Task 5.3 / T-07: two continuation branches forked from the same 32K-token
+// KVarN context must each reproduce their isolated oracle while running
+// interleaved, so neither branch's sealed tiles nor tail leaks into the other.
+void CheckKvarnForkIndependence(
+    const std::shared_ptr<const gufo::hip::QwenGpuModel>& model) {
+  constexpr std::uint32_t kPrefix = 32768;
+  constexpr std::uint32_t kContext = kPrefix + 64;
+  constexpr std::size_t kBranch = 4;
+  // The 32K prefill dominates the cost, so the fork uses the memory-first
+  // preset; the rollback and replay checks cover the 5/6-bit presets.
+  for (const char* name : {"kvarn-k4v4"}) {
+    for (const std::uint32_t tail : {0U, 2048U}) {
+      const auto policy = KvarnPolicy(name, tail);
+      const auto tokens = RepeatedFixture(model, kPrefix + kBranch);
+      const std::vector<Token> branch_a(tokens.begin() + kPrefix,
+                                        tokens.begin() + kPrefix + kBranch);
+      // Rotate the second branch so the two decode different tokens.
+      std::vector<Token> branch_b(kBranch);
+      for (std::size_t i = 0; i < kBranch; ++i)
+        branch_b[i] = tokens[kPrefix + (i + 1) % kBranch];
+
+      Executor oracle(model, kContext, policy);
+      oracle.Reset();
+      (void)oracle.ForwardPromptBatch(std::span(tokens).first(kPrefix));
+      auto snapshot = oracle.SaveSnapshot(kPrefix);
+      Expect(SealedTileCount(oracle) > 0,
+             "the 32K KVarN context must seal tiles before the fork");
+      std::array<std::vector<float>, kBranch> expected_a;
+      std::array<std::vector<float>, kBranch> expected_b;
+      for (std::size_t step = 0; step < kBranch; ++step) {
+        (void)oracle.ForwardToken(branch_a[step], kPrefix + step);
+        expected_a[step] = Logits(oracle);
+      }
+      oracle.RestoreSnapshot(*snapshot);
+      for (std::size_t step = 0; step < kBranch; ++step) {
+        (void)oracle.ForwardToken(branch_b[step], kPrefix + step);
+        expected_b[step] = Logits(oracle);
+      }
+
+      Executor fork_a(model, kContext, policy);
+      Executor fork_b(model, kContext, policy);
+      fork_a.RestoreSnapshot(*snapshot);
+      fork_b.RestoreSnapshot(*snapshot);
+      Expect(SealedTileCount(fork_a) > 0 && SealedTileCount(fork_b) > 0,
+             "restored 32K forks must keep their sealed tiles");
+      for (std::size_t step = 0; step < kBranch; ++step) {
+        (void)fork_a.ForwardToken(branch_a[step], kPrefix + step);
+        (void)fork_b.ForwardToken(branch_b[step], kPrefix + step);
+        Expect(ByteEqual(Logits(fork_a), expected_a[step]),
+               "KVarN fork A was affected by branch B");
+        Expect(ByteEqual(Logits(fork_b), expected_b[step]),
+               "KVarN fork B was affected by branch A");
+      }
+      std::cout << "KVarN 32K fork preset=" << name << " tail=" << tail
+                << " branches exact\n";
+    }
+  }
+}
+
+// Task 5.5 / spec "決定性": the same seed and settings must replay the same
+// sampled token sequence across a KVarN seal boundary.
+void CheckKvarnSeededReplay(
+    const std::shared_ptr<const gufo::hip::QwenGpuModel>& model) {
+  constexpr std::uint32_t kContext = 3072;
+  constexpr std::uint32_t kNewTokens = 8;
+  for (const char* name : {"kvarn-k4v4", "kvarn-k6v5"}) {
+    for (const std::uint32_t tail : {0U, 2048U}) {
+      const auto policy = KvarnPolicy(name, tail);
+      const std::uint32_t tail_rows =
+          gufo::hip::QwenKvarnTailRows(policy.kvarn);
+      // The first sampled token is decoded at 256 + L, so the seal runs
+      // before its attention and the rest of the sequence reads tile 0
+      // quantized.
+      const std::uint32_t prompt_size = 256U + tail_rows;
+      Expect(prompt_size + kNewTokens <= kContext,
+             "KVarN replay fixture must fit the context");
+      const auto tokens = RepeatedFixture(model, prompt_size);
+      gufo::models::GenerationOptions options;
+      options.max_new_tokens = kNewTokens;
+      options.sampling.temperature = 0.8F;
+      options.sampling.top_k = 40;
+      options.sampling.top_p = 0.9F;
+      options.sampling.seed = 47;
+      Executor first(model, kContext, policy);
+      Executor second(model, kContext, policy);
+      const auto a = first.Generate(tokens, options);
+      const auto b = second.Generate(tokens, options);
+      Expect(a == b && a.size() >= 2,
+             "same-seed KVarN sampling replay changed the token sequence");
+      Expect(SealedTileCount(first) > 0,
+             "same-seed KVarN replay did not cross a seal boundary");
+      std::cout << "KVarN seeded replay preset=" << name << " tail=" << tail
+                << " tokens=" << a.size() << " exact\n";
+    }
+  }
+}
+
 void CheckWideCache(Executor& reference) {
   // Exercise the 2^32-element K/V boundary without filling the context.
   Executor wide(reference.GetSharedModel(), 262144);
@@ -504,7 +778,7 @@ void CheckWideCache(Executor& reference) {
       << "context=262144: prefill, scalar and verification logits exact\n";
 }
 
-enum class CheckMode { kAll, kPrefill, kConcurrency };
+enum class CheckMode { kAll, kPrefill, kConcurrency, kKvarn };
 
 std::vector<Case> Capture(const char* path, bool check_replay,
                           CheckMode mode = CheckMode::kAll) {
@@ -524,6 +798,13 @@ std::vector<Case> Capture(const char* path, bool check_replay,
   }
   if (mode == CheckMode::kConcurrency) {
     CheckConcurrencyWidths(*executor);
+    return {};
+  }
+  if (mode == CheckMode::kKvarn) {
+    CheckKvarnBatchDecode(executor->GetSharedModel());
+    CheckKvarnRollbackCancel(executor->GetSharedModel());
+    CheckKvarnForkIndependence(executor->GetSharedModel());
+    CheckKvarnSeededReplay(executor->GetSharedModel());
     return {};
   }
   if (check_replay) {
@@ -640,6 +921,10 @@ std::vector<Case> Capture(const char* path, bool check_replay,
     CheckMixedContextBatch(*executor, false);
     CheckMixedContextBatch(*executor, true);
     CheckConcurrencyWidths(*executor);
+    CheckKvarnBatchDecode(executor->GetSharedModel());
+    CheckKvarnRollbackCancel(executor->GetSharedModel());
+    CheckKvarnForkIndependence(executor->GetSharedModel());
+    CheckKvarnSeededReplay(executor->GetSharedModel());
     CheckWideCache(*executor);
     CheckPrefillReplay(executor->GetSharedModel());
   }
@@ -710,6 +995,10 @@ int main(int argc, const char* const* argv) {
     }
     if (argc == 3 && std::string_view(argv[2]) == "--concurrency-only") {
       (void)Capture(model, true, CheckMode::kConcurrency);
+      return 0;
+    }
+    if (argc == 3 && std::string_view(argv[2]) == "--kvarn-only") {
+      (void)Capture(model, true, CheckMode::kKvarn);
       return 0;
     }
     // Reference mode measures quantization on fixed histories. Replay,

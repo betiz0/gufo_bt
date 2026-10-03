@@ -20,6 +20,7 @@
 #include <type_traits>
 #include <utility>
 
+#include "src/cli/kv_cache_options.hpp"
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/text_generation_scheduler.hpp"
 #include "src/cli/serve/text_model_runner.hpp"
@@ -230,6 +231,80 @@ bool DiskCacheEnabled(const TextDiskCacheConfig& config) noexcept {
   return !config.directory.empty();
 }
 
+/// Canonical `kv_storage=` spelling for the disk-cache identity (design D9).
+/// FP16/FP32 keep their existing strings; KVarN names its preset, K/V widths,
+/// tail length (distinguishing unset from an explicit W) and scale type, so a
+/// cache built with another preset or tail is never reused.
+std::string QwenKvStorageIdentity(
+    const hip::QwenExecutionPolicy& policy) {
+  if (!policy.UsesKvarn()) {
+    return policy.UsesFp16AttentionKv() ? "fp16" : "fp32";
+  }
+  std::ostringstream value;
+  value << "kvarn-k" << static_cast<int>(policy.kvarn.k_bits) << "v"
+        << static_cast<int>(policy.kvarn.v_bits);
+  if (policy.kvarn.tail_length == 0) {
+    value << "-tail-none";
+  } else {
+    value << "-tail-" << policy.kvarn.tail_length;
+  }
+  value << "-s"
+        << (policy.kvarn.scale == hip::QwenKvarnScale::kBf16 ? "bf16"
+                                                            : "fp16");
+  return value.str();
+}
+
+/// Startup/benchmark KV report for Qwen3.8 27B (task 5.6, spec "KV 容量見積と
+/// 実効ビット数の報告"): the preset name, the tail length (`none` when the
+/// option was not given), the effective body and total bpv, and the
+/// per-session and whole-server KV capacity from the design D5 size formula.
+/// FP16/FP32 keep their existing one-word spelling, so nothing changes for
+/// them.
+[[nodiscard]] std::string QwenKvCacheReport(
+    std::string_view name, const hip::QwenExecutionPolicy& policy,
+    const core::ModelConfig& config, std::uint32_t capacity_tokens,
+    std::size_t session_count) {
+  if (!policy.UsesKvarn()) {
+    return std::string(name);
+  }
+  const auto estimate = models::qwen::EstimateKvarnMemory(
+      policy.kvarn.k_bits, policy.kvarn.v_bits,
+      hip::QwenKvarnTailRows(policy.kvarn), hip::kQwenKvarnW, capacity_tokens,
+      config.FullAttentionLayerCount(), config.num_key_value_heads);
+  std::ostringstream report;
+  report << name << " kv_cache_tail=";
+  if (policy.kvarn.tail_length == 0) {
+    report << "none";
+  } else {
+    report << policy.kvarn.tail_length;
+  }
+  report << std::fixed << std::setprecision(4)
+         << " kv_bpv_body=" << estimate.body_bpv
+         << " kv_bpv_total=" << estimate.total_bpv << std::setprecision(3)
+         << " kv_session_gib=" << estimate.session_gib << " kv_capacity_gib="
+         << estimate.session_gib * static_cast<double>(session_count);
+  return report.str();
+}
+
+/// State ABI string for the disk-cache identity (design D9). FP16/FP32 keep
+/// their existing spellings; KVarN gets a distinct ABI that carries the preset
+/// identity, so a KVarN session can never load a canonical-cache state.
+std::string QwenStateAbiName(bool speculative,
+                             const hip::QwenExecutionPolicy& policy) {
+  if (!policy.UsesKvarn()) {
+    return std::string(QwenStateAbi(speculative,
+                                    policy.UsesFp16AttentionKv(),
+                                    policy.UsesBf16RecurrentState()));
+  }
+  std::string abi = speculative ? "qwen-gfx1151-dflash-state-v5-"
+                                : "qwen-gfx1151-state-v4-";
+  abi += QwenKvStorageIdentity(policy);
+  if (policy.UsesBf16RecurrentState()) {
+    abi += "-bf16-recurrent";
+  }
+  return abi;
+}
+
 bool IsSha256Hex(std::string_view value) noexcept {
   return value.size() == 64 && std::ranges::all_of(value, [](char character) {
            return (character >= '0' && character <= '9') ||
@@ -323,9 +398,8 @@ std::vector<std::uint8_t> QwenCompatibilityIdentity(
     throw std::invalid_argument(
         "Qwen DFlash disk cache requires a draft artifact fingerprint");
   }
-  const std::string_view state_abi =
-      QwenStateAbi(speculative, execution_policy.UsesFp16AttentionKv(),
-                   execution_policy.UsesBf16RecurrentState());
+  const std::string state_abi =
+      QwenStateAbiName(speculative, execution_policy);
   std::ostringstream identity;
   identity << "schema=gufo-text-continuation-v2\n"
            << "model_kind=qwen3.8\n"
@@ -345,7 +419,7 @@ std::vector<std::uint8_t> QwenCompatibilityIdentity(
            << "attention_split_count="
            << hip::detail::kSplitKDecodeAttentionMaxSplits << '\n'
            << "kv_storage="
-           << (execution_policy.UsesFp16AttentionKv() ? "fp16" : "fp32") << '\n'
+           << QwenKvStorageIdentity(execution_policy) << '\n'
            << "recurrent_storage="
            << (execution_policy.UsesBf16RecurrentState() ? "bf16" : "fp32")
            << '\n'
@@ -880,13 +954,15 @@ public:
       std::shared_ptr<const hip::QwenGpuModel> model, std::uint32_t max_context,
       std::shared_ptr<const hip::QwenDFlashGpuModel> dflash_model = nullptr,
       speculative::SpeculativeOptions speculative_options = {},
+      hip::QwenExecutionPolicy execution_policy =
+          hip::QwenExecutionPolicy::Production(),
       std::string artifact_fingerprint = {},
       std::string draft_artifact_fingerprint = {})
       : model_(std::move(model)),
         dflash_model_(std::move(dflash_model)),
         max_context_(max_context),
         speculative_options_(speculative_options),
-        execution_policy_(hip::QwenExecutionPolicy::Production()) {
+        execution_policy_(execution_policy) {
     if (!artifact_fingerprint.empty()) {
       const bool speculative = dflash_model_ != nullptr;
       persistence_ = TextRunnerPersistenceDescriptor{
@@ -2841,6 +2917,7 @@ struct InferenceBackend::Impl {
   struct State {
     std::shared_ptr<TextGenerationScheduler> scheduler;
     std::string model_id;
+    std::string kv_cache_format;
     SamplingDefaults sampling_defaults;
     std::uint32_t max_context{0};
     ReasoningOptions reasoning_defaults;
@@ -2938,6 +3015,7 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
                             TextSchedulerPolicy scheduler_policy,
                             const TextSpeculativeConfig& speculative_config,
                             const TextDiskCacheConfig& disk_cache_config,
+                            const TextKvCacheConfig& kv_cache_config,
                             const std::string& vision_model_path) {
 #if defined(ENGINE_ENABLE_HIP)
   TextDiskCacheConfig resolved_disk_cache_config = disk_cache_config;
@@ -2965,6 +3043,11 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
   if (reader->GetMetadataString("general.architecture") == "deepseek4") {
     if (!vision_model_path.empty()) {
       SetError(error, "DeepSeek does not support --mmproj");
+      return false;
+    }
+    if (!kv_cache_config.value.empty()) {
+      SetError(error, cli::KvCacheUnsupportedModelError(
+                          "DeepSeek V4 Flash", cli::kDeepSeekKvFormat));
       return false;
     }
     if (speculative_config.backend != TextSpeculativeBackend::kDisabled &&
@@ -3015,9 +3098,14 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
     }
     return load(std::move(model), error, max_context, session_count,
                 prefill_policy, scheduler_policy, speculative_config,
-                std::move(resolved_disk_cache_config));
+                std::move(resolved_disk_cache_config), kv_cache_config);
   }
   if (reader->GetMetadataString("general.architecture") == "qwen4exp") {
+    if (!kv_cache_config.value.empty()) {
+      SetError(error, cli::KvCacheUnsupportedModelError(
+                          "Qwen3.8-Flash-Next", cli::kFlashNextKvFormat));
+      return false;
+    }
     if (speculative_config.backend != TextSpeculativeBackend::kDisabled &&
         speculative_config.backend != TextSpeculativeBackend::kMtp) {
       SetError(error,
@@ -3085,9 +3173,14 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
     }
     return load(std::move(model), error, max_context, session_count,
                 prefill_policy, scheduler_policy, speculative_config,
-                std::move(resolved_disk_cache_config));
+                std::move(resolved_disk_cache_config), kv_cache_config);
   }
   std::shared_ptr<models::qwen::vision::Encoder> vision;
+  if (!kv_cache_config.value.empty() &&
+      reader->GetMetadataUint64("qwen35.embedding_length") != 5120) {
+    SetError(error, "--kv-cache is supported only by Qwen3.8 27B");
+    return false;
+  }
   try {
     if (reader->GetMetadataUint64("qwen35.embedding_length") == 5120) {
       vision = models::qwen::vision::Encoder::Open(model_path,
@@ -3117,7 +3210,7 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
   }
   return load(std::move(model), error, max_context, session_count,
               prefill_policy, scheduler_policy, speculative_config,
-              std::move(resolved_disk_cache_config));
+              std::move(resolved_disk_cache_config), kv_cache_config);
 #else
   (void)model_path;
   (void)max_context;
@@ -3126,6 +3219,7 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
   (void)scheduler_policy;
   (void)speculative_config;
   (void)disk_cache_config;
+  (void)kv_cache_config;
   (void)vision_model_path;
   SetError(error, "HTTP inference requires the HIP backend");
   return false;
@@ -3139,10 +3233,24 @@ bool InferenceBackend::load(std::shared_ptr<const hip::QwenGpuModel> model,
                             TextPrefillPolicy prefill_policy,
                             TextSchedulerPolicy scheduler_policy,
                             TextSpeculativeConfig speculative_config,
-                            TextDiskCacheConfig disk_cache_config) {
+                            TextDiskCacheConfig disk_cache_config,
+                            TextKvCacheConfig kv_cache_config) {
   if (model == nullptr) {
     SetError(error, "Qwen GPU model must not be null");
     return false;
+  }
+  // Resolve --kv-cache before any graph capture or session allocation. The
+  // CLI validated the value; the resolver is the single name-to-storage map.
+  hip::QwenExecutionPolicy execution_policy =
+      hip::QwenExecutionPolicy::Production();
+  const bool kv_cache_explicit = !kv_cache_config.value.empty();
+  if (kv_cache_explicit) {
+    if (!hip::ResolveQwenKvCache(kv_cache_config.value,
+                                 kv_cache_config.tail_tokens,
+                                 &execution_policy)) {
+      SetError(error, "Unsupported --kv-cache value: " + kv_cache_config.value);
+      return false;
+    }
   }
   if (max_context == 0)
     max_context = model->GetConfig().context_length;
@@ -3150,6 +3258,15 @@ bool InferenceBackend::load(std::shared_ptr<const hip::QwenGpuModel> model,
     SetError(error, "HTTP context exceeds the loaded Qwen model context");
     return false;
   }
+  // The report needs the resolved context: build it once the effective
+  // capacity is known. KVarN adds tail, bpv and capacity fields (task 5.6);
+  // FP16/FP32 keep the previous one-word spelling.
+  const std::string_view kv_cache_name =
+      kv_cache_explicit ? std::string_view(kv_cache_config.value)
+                        : cli::kQwenKvFormat;
+  const std::string kv_cache_format = QwenKvCacheReport(
+      kv_cache_name, execution_policy, model->GetConfig(), max_context,
+      session_count);
 
   if (speculative_config.backend == TextSpeculativeBackend::kDSpark) {
     SetError(error, "DSpark HTTP decoding requires a DeepSeek model");
@@ -3244,9 +3361,11 @@ bool InferenceBackend::load(std::shared_ptr<const hip::QwenGpuModel> model,
     new_state->sampling_defaults.supplied = {};
     auto runner = std::make_shared<QwenTextRunner>(
         std::move(model), max_context, std::move(dflash_model),
-        speculative_options, disk_cache_config.model_artifact_fingerprint,
+        speculative_options, execution_policy,
+        disk_cache_config.model_artifact_fingerprint,
         disk_cache_config.draft_model_artifact_fingerprint);
     new_state->model_id = runner->Descriptor().model_id;
+    new_state->kv_cache_format = kv_cache_format;
     new_state->max_context = max_context;
     std::optional<TextRunnerDiskCacheOptions> runner_disk_cache;
     if (DiskCacheEnabled(disk_cache_config)) {
@@ -3278,9 +3397,14 @@ bool InferenceBackend::load(
     std::uint32_t max_context, std::size_t session_count,
     TextPrefillPolicy prefill_policy, TextSchedulerPolicy scheduler_policy,
     TextSpeculativeConfig speculative_config,
-    TextDiskCacheConfig disk_cache_config) {
+    TextDiskCacheConfig disk_cache_config, TextKvCacheConfig kv_cache_config) {
   if (model == nullptr) {
     SetError(error, "DeepSeek model must not be null");
+    return false;
+  }
+  if (!kv_cache_config.value.empty()) {
+    SetError(error, cli::KvCacheUnsupportedModelError("DeepSeek V4 Flash",
+                                                      cli::kDeepSeekKvFormat));
     return false;
   }
   if (max_context == 0)
@@ -3334,6 +3458,7 @@ bool InferenceBackend::load(
         disk_cache_config.model_artifact_fingerprint,
         disk_cache_config.draft_model_artifact_fingerprint);
     new_state->model_id = runner->Descriptor().model_id;
+    new_state->kv_cache_format = std::string(cli::kDeepSeekKvFormat);
     new_state->max_context = max_context;
     std::optional<TextRunnerDiskCacheOptions> runner_disk_cache;
     if (DiskCacheEnabled(disk_cache_config)) {
@@ -3363,9 +3488,14 @@ bool InferenceBackend::load(
     std::uint32_t max_context, std::size_t session_count,
     TextPrefillPolicy prefill_policy, TextSchedulerPolicy scheduler_policy,
     TextSpeculativeConfig speculative_config,
-    TextDiskCacheConfig disk_cache_config) {
+    TextDiskCacheConfig disk_cache_config, TextKvCacheConfig kv_cache_config) {
   if (model == nullptr) {
     SetError(error, "Qwen3.8-Flash-Next model must not be null");
+    return false;
+  }
+  if (!kv_cache_config.value.empty()) {
+    SetError(error, cli::KvCacheUnsupportedModelError("Qwen3.8-Flash-Next",
+                                                      cli::kFlashNextKvFormat));
     return false;
   }
   if (max_context == 0)
@@ -3417,6 +3547,7 @@ bool InferenceBackend::load(
         disk_cache_config.model_artifact_fingerprint,
         disk_cache_config.draft_model_artifact_fingerprint);
     new_state->model_id = runner->Descriptor().model_id;
+    new_state->kv_cache_format = std::string(cli::kFlashNextKvFormat);
     new_state->max_context = max_context;
     std::optional<TextRunnerDiskCacheOptions> runner_disk_cache;
     if (DiskCacheEnabled(disk_cache_config)) {
@@ -3465,6 +3596,15 @@ std::uint32_t InferenceBackend::max_context() const {
   return state != nullptr ? state->max_context : 0;
 #else
   return 0;
+#endif
+}
+
+std::string InferenceBackend::kv_cache_format() const {
+#if defined(ENGINE_ENABLE_HIP)
+  const auto state = impl_->Snapshot();
+  return state != nullptr ? state->kv_cache_format : std::string{};
+#else
+  return {};
 #endif
 }
 

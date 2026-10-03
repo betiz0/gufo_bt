@@ -258,7 +258,8 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
       // (opt-c010-qk-rope-kv). The unfused chain stays wired behind the policy
       // toggle as the independent reference.
       const bool fused_qknorm_rope_kv =
-          route_plan.fuse_qk_norm_rope_kv &&
+          (route_plan.fuse_qk_norm_rope_kv ||
+           arena_.GetKvarnWriteParams().enabled()) &&
           detail::IsFusedQkNormSupported(config.head_dim);
       if (fused_qknorm_rope_kv) {
         LaunchBatchedFusedQKNormRoPEKvWrite(
@@ -274,7 +275,7 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
             attn_layer_idx, start_pos, batch_size, arena_.GetMaxContext(),
             config.num_attention_heads, config.num_key_value_heads,
             config.head_dim, config.rotary_dim, config.rope_theta, eps,
-            arena_.stream, vision_input_.rope());
+            arena_.stream, vision_input_.rope(), arena_.GetKvarnWriteParams());
       } else {
         if (!layer.attn_q_norm.empty()) {
           LaunchBatchedPerHeadRMSNorm(
@@ -293,6 +294,21 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
             arena_.d_q, arena_.d_k, batch_size, config.num_attention_heads,
             config.num_key_value_heads, config.head_dim, config.rotary_dim,
             start_pos, config.rope_theta, arena_.stream, vision_input_.rope());
+      }
+
+      if (arena_.GetKvarnWriteParams().enabled()) {
+        // design D4: the chunk's KV write is followed by sealing the tiles its
+        // q_max selects, before any attention reads this layer (design D4).
+        const auto kvarn_write = arena_.GetKvarnWriteParams();
+        const auto& regions = arena_.GetKvarnRegions();
+        LaunchKvarnSeal(
+            *arena_.GetKvarnSealState(), policy_.kvarn, arena_.d_kvarn_sink,
+            arena_.d_kvarn_tail, regions.sink_elements, regions.tail_elements,
+            static_cast<std::uint32_t>(regions.tail_rows), arena_.d_kvarn_body,
+            static_cast<std::uint32_t>(regions.tile_count), attn_layer_idx,
+            config.num_key_value_heads, start_pos, nullptr,
+            static_cast<std::uint32_t>(batch_size), arena_.stream,
+            kvarn_write.chunk, kvarn_write.chunk_plane_elements);
       }
 
       const std::size_t visible_context =
@@ -319,7 +335,7 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
           config.num_key_value_heads, config.head_dim, arena_.stream,
           /*lse_out=*/nullptr, /*key_begin=*/0,
           /*skip_kv_write=*/kv_already_written, attention_workspace.gate,
-          attention_workspace.up);
+          attention_workspace.up, arena_.GetKvarnReadParams());
       if (wmma_attention) {
         detail::EmitAttentionDispatch("prefill_wmma", "");
       }
@@ -339,7 +355,10 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
                       total_k),
                   arena_.d_ssm_out, attn_layer_idx, start_pos, batch_size,
                   arena_.GetMaxContext(), config.num_attention_heads,
-                  config.num_key_value_heads, config.head_dim, arena_.stream);
+                  config.num_key_value_heads, config.head_dim, arena_.stream,
+                  /*lse_out=*/nullptr, /*key_begin=*/0,
+                  /*skip_kv_write=*/kv_already_written,
+                  arena_.GetKvarnReadParams());
               return tiled_attention;
             },
             [&] {
@@ -354,7 +373,8 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
                   arena_.d_ssm_out, attn_layer_idx, start_pos, batch_size,
                   arena_.GetMaxContext(), config.num_attention_heads,
                   config.num_key_value_heads, config.head_dim, arena_.stream,
-                  fused_qknorm_rope_kv);
+                  fused_qknorm_rope_kv, /*out_context_bf16=*/nullptr,
+                  arena_.GetKvarnReadParams());
             });
         if (tiled_attention) {
           detail::EmitAttentionDispatch("prefill_tiled", "");
@@ -365,6 +385,16 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
                   ? "prefill_tiled: rejected"
                   : "prefill_tiled: below_threshold");
         }
+      }
+
+      if (arena_.GetKvarnWriteParams().enabled()) {
+        // design D4/4.1: after this layer's attention, merge the bounded
+        // per-chunk F16 workspace into the sink and ring, so the next step
+        // reads the same rows as a sequential decode.
+        LaunchKvarnChunkFlush(
+            arena_.GetKvarnWriteParams(), attn_layer_idx,
+            config.num_key_value_heads, start_pos,
+            static_cast<std::uint32_t>(batch_size), arena_.stream);
       }
 
       // opt-c172-fp32-quant: the Q8_0 route reads only the quantized

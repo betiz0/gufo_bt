@@ -2,6 +2,7 @@ target_sources(gufo_core PRIVATE
   ${PROJECT_SOURCE_DIR}/src/models/qwen/vision/prompt.cpp
   ${PROJECT_SOURCE_DIR}/src/models/qwen/tokenizer.cpp
   ${PROJECT_SOURCE_DIR}/src/models/qwen/chat_template.cpp
+  ${PROJECT_SOURCE_DIR}/src/models/qwen/kvarn_reference.cpp
   ${PROJECT_SOURCE_DIR}/src/models/qwen/oracles.cpp
   ${PROJECT_SOURCE_DIR}/src/models/qwen/state.cpp
   ${PROJECT_SOURCE_DIR}/src/models/qwen/weights.cpp
@@ -51,6 +52,8 @@ if (ENGINE_ENABLE_HIP)
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/gemv.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/gemv_quant.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/fused.hip
+    ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/kvarn_seal.hip
+    ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/kvarn_read.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/qkv.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/ssm.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/ssm_decode_recurrence.hip

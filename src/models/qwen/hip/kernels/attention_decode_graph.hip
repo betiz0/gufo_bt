@@ -298,6 +298,7 @@ void LaunchAttention(const float* q, const float* k, const float* v,
                      std::uint32_t max_context, std::uint32_t num_heads,
                      std::uint32_t num_kv_heads, std::uint32_t head_dim,
                      hipStream_t stream, bool skip_kv_write) {
+  RequireAttentionKvSource(k_cache, v_cache, k_cache_f16, v_cache_f16, false);
   if (!skip_kv_write) {
     WriteKVCachePtrKernel<<<num_kv_heads, 256, 0, stream>>>(
         k, v, k_cache, v_cache, static_cast<__half*>(k_cache_f16),

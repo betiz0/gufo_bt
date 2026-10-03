@@ -7,6 +7,7 @@
 #include <iostream>
 #include <limits>
 #include <span>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -536,6 +537,179 @@ void TestBatchedFusedQKNormRoPEKvWriteEquivalence() {
   HIP_CHECK(hipFree(d_out_fus));
 }
 
+// T-02 (design D3): the fused write rotates Q and K with the same normalized
+// Hadamard, so the FP32 QK score is unchanged, and the rotated K lands in the
+// KVarN sink. The declared limit is recorded in QUALITY.md.
+void TestKvarnRotationPreservesQkScore() {
+  constexpr std::uint32_t num_heads = 4;
+  constexpr std::uint32_t num_kv_heads = 2;
+  constexpr std::uint32_t head_dim = 256;
+  constexpr std::uint32_t rotary_dim = 64;
+  constexpr float rope_theta = 1000000.0F;
+  constexpr float eps = 1e-6F;
+  constexpr std::uint32_t layer_idx = 1;
+  constexpr std::uint32_t max_context = 16;
+  constexpr std::uint32_t pos = 3;
+  constexpr std::uint32_t ring_rows = 256 + 128 + 9;
+  // Declared limit of QUALITY.md (T-02): rotation preserves the QK score.
+  constexpr double kQkScoreLimit = 1e-4;
+
+  const std::size_t q_size = num_heads * head_dim;
+  const std::size_t kv_size = num_kv_heads * head_dim;
+  const std::size_t layers = layer_idx + 1;
+  const std::size_t f16_elems = layers * max_context * kv_size;
+  const std::size_t sink_plane = layers * num_kv_heads * 128 * head_dim;
+  const std::size_t tail_plane = layers * num_kv_heads * ring_rows * head_dim;
+
+  std::vector<float> h_q(q_size), h_k(kv_size), h_v(kv_size);
+  std::vector<float> h_q_w(head_dim), h_k_w(head_dim);
+  for (std::size_t i = 0; i < q_size; ++i)
+    h_q[i] = 0.18F * std::sin(static_cast<float>(i + 1) * 0.05F);
+  for (std::size_t i = 0; i < kv_size; ++i) {
+    h_k[i] = 0.11F * std::cos(static_cast<float>(i + 1) * 0.07F);
+    h_v[i] = 0.24F * std::sin(static_cast<float>(i + 1) * 0.04F);
+  }
+  for (std::size_t i = 0; i < head_dim; ++i) {
+    h_q_w[i] = 0.9F + 0.04F * static_cast<float>(i % 17);
+    h_k_w[i] = 1.1F - 0.03F * static_cast<float>(i % 13);
+  }
+
+  float *d_q16 = nullptr, *d_k16 = nullptr, *d_v16 = nullptr;
+  float *d_qk = nullptr, *d_kk = nullptr, *d_vk = nullptr;
+  float *d_qw = nullptr, *d_kw = nullptr;
+  void *d_kc16 = nullptr, *d_vc16 = nullptr;
+  void *d_sink = nullptr, *d_tail = nullptr;
+  std::uint32_t* d_pos = nullptr;
+  HIP_CHECK(hipMalloc(&d_q16, q_size * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_k16, kv_size * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_v16, kv_size * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_qk, q_size * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_kk, kv_size * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_vk, kv_size * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_qw, head_dim * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_kw, head_dim * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_kc16, f16_elems * sizeof(std::uint16_t)));
+  HIP_CHECK(hipMalloc(&d_vc16, f16_elems * sizeof(std::uint16_t)));
+  HIP_CHECK(hipMalloc(&d_sink, 2 * sink_plane * sizeof(std::uint16_t)));
+  HIP_CHECK(hipMalloc(&d_tail, 2 * tail_plane * sizeof(std::uint16_t)));
+  HIP_CHECK(hipMalloc(&d_pos, sizeof(std::uint32_t)));
+
+  HIP_CHECK(hipMemcpy(d_q16, h_q.data(), q_size * sizeof(float),
+                      hipMemcpyHostToDevice));
+  HIP_CHECK(hipMemcpy(d_k16, h_k.data(), kv_size * sizeof(float),
+                      hipMemcpyHostToDevice));
+  HIP_CHECK(hipMemcpy(d_v16, h_v.data(), kv_size * sizeof(float),
+                      hipMemcpyHostToDevice));
+  HIP_CHECK(hipMemcpy(d_qk, h_q.data(), q_size * sizeof(float),
+                      hipMemcpyHostToDevice));
+  HIP_CHECK(hipMemcpy(d_kk, h_k.data(), kv_size * sizeof(float),
+                      hipMemcpyHostToDevice));
+  HIP_CHECK(hipMemcpy(d_vk, h_v.data(), kv_size * sizeof(float),
+                      hipMemcpyHostToDevice));
+  HIP_CHECK(hipMemcpy(d_qw, h_q_w.data(), head_dim * sizeof(float),
+                      hipMemcpyHostToDevice));
+  HIP_CHECK(hipMemcpy(d_kw, h_k_w.data(), head_dim * sizeof(float),
+                      hipMemcpyHostToDevice));
+  HIP_CHECK(
+      hipMemcpy(d_pos, &pos, sizeof(std::uint32_t), hipMemcpyHostToDevice));
+  HIP_CHECK(hipMemset(d_kc16, 0, f16_elems * sizeof(std::uint16_t)));
+  HIP_CHECK(hipMemset(d_vc16, 0, f16_elems * sizeof(std::uint16_t)));
+  HIP_CHECK(hipMemset(d_sink, 0, 2 * sink_plane * sizeof(std::uint16_t)));
+  HIP_CHECK(hipMemset(d_tail, 0, 2 * tail_plane * sizeof(std::uint16_t)));
+
+  // FP16 path: no rotation.
+  gufo::hip::LaunchFusedQKNormRoPEKvWrite(
+      d_q16, d_k16, d_v16, d_qw, d_kw, d_q16, d_k16, nullptr, nullptr, d_kc16,
+      d_vc16, layer_idx, d_pos, max_context, num_heads, num_kv_heads, head_dim,
+      rotary_dim, rope_theta, eps);
+
+  // KVarN path: rotate Q/K/V and store K/V in the sink.
+  gufo::hip::KvarnWriteParams kvarn;
+  kvarn.sink = static_cast<__half*>(d_sink);
+  kvarn.tail = static_cast<__half*>(d_tail);
+  kvarn.sink_plane_elements = sink_plane;
+  kvarn.tail_plane_elements = tail_plane;
+  kvarn.ring_rows = ring_rows;
+  gufo::hip::LaunchFusedQKNormRoPEKvWrite(
+      d_qk, d_kk, d_vk, d_qw, d_kw, d_qk, d_kk, nullptr, nullptr, nullptr,
+      nullptr, layer_idx, d_pos, max_context, num_heads, num_kv_heads,
+      head_dim, rotary_dim, rope_theta, eps, nullptr, nullptr, kvarn);
+
+  HIP_CHECK(hipDeviceSynchronize());
+
+  std::vector<float> q16(q_size), k16(kv_size);
+  std::vector<float> qk(q_size), kk(kv_size);
+  HIP_CHECK(hipMemcpy(q16.data(), d_q16, q_size * sizeof(float),
+                      hipMemcpyDeviceToHost));
+  HIP_CHECK(hipMemcpy(k16.data(), d_k16, kv_size * sizeof(float),
+                      hipMemcpyDeviceToHost));
+  HIP_CHECK(hipMemcpy(qk.data(), d_qk, q_size * sizeof(float),
+                      hipMemcpyDeviceToHost));
+  HIP_CHECK(hipMemcpy(kk.data(), d_kk, kv_size * sizeof(float),
+                      hipMemcpyDeviceToHost));
+
+  const std::size_t group = num_heads / num_kv_heads;
+  double worst = 0.0;
+  for (std::uint32_t head = 0; head < num_heads; ++head) {
+    const std::uint32_t kv_h = head / static_cast<std::uint32_t>(group);
+    double reference = 0.0, rotated = 0.0;
+    for (std::uint32_t d = 0; d < head_dim; ++d) {
+      reference += static_cast<double>(q16[head * head_dim + d]) *
+                   static_cast<double>(k16[kv_h * head_dim + d]);
+      rotated += static_cast<double>(qk[head * head_dim + d]) *
+                 static_cast<double>(kk[kv_h * head_dim + d]);
+    }
+    worst = std::max(worst, std::abs(reference - rotated) /
+                                std::max(1.0, std::abs(reference)));
+  }
+  if (worst > kQkScoreLimit) {
+    throw std::runtime_error(
+        "the KVarN rotation must preserve the QK score within the declared "
+        "limit");
+  }
+
+  // The sink holds the rotated K; the tail stays untouched at pos < 128.
+  std::vector<std::uint16_t> sink(2 * sink_plane);
+  std::vector<std::uint16_t> tail(2 * tail_plane);
+  HIP_CHECK(hipMemcpy(sink.data(), d_sink, sink.size() * sizeof(std::uint16_t),
+                      hipMemcpyDeviceToHost));
+  HIP_CHECK(hipMemcpy(tail.data(), d_tail, tail.size() * sizeof(std::uint16_t),
+                      hipMemcpyDeviceToHost));
+  for (std::uint32_t kv_h = 0; kv_h < num_kv_heads; ++kv_h) {
+    const std::size_t row =
+        ((static_cast<std::size_t>(layer_idx) * num_kv_heads + kv_h) * 128 +
+         pos) *
+        head_dim;
+    for (std::uint32_t d = 0; d < head_dim; ++d) {
+      const float rotated = kk[kv_h * head_dim + d];
+      if (sink[row + d] != __half_as_ushort(__float2half_rn(rotated))) {
+        throw std::runtime_error("the KVarN sink must hold the rotated K");
+      }
+    }
+  }
+  for (std::uint16_t value : tail) {
+    if (value != 0) {
+      throw std::runtime_error("the KVarN tail must stay untouched");
+    }
+  }
+
+  HIP_CHECK(hipFree(d_q16));
+  HIP_CHECK(hipFree(d_k16));
+  HIP_CHECK(hipFree(d_v16));
+  HIP_CHECK(hipFree(d_qk));
+  HIP_CHECK(hipFree(d_kk));
+  HIP_CHECK(hipFree(d_vk));
+  HIP_CHECK(hipFree(d_qw));
+  HIP_CHECK(hipFree(d_kw));
+  HIP_CHECK(hipFree(d_kc16));
+  HIP_CHECK(hipFree(d_vc16));
+  HIP_CHECK(hipFree(d_sink));
+  HIP_CHECK(hipFree(d_tail));
+  HIP_CHECK(hipFree(d_pos));
+  std::cout << "KVarN rotation worst relative QK score change " << worst
+            << " (limit " << kQkScoreLimit << ")\n";
+}
+
 #endif  // defined(ENGINE_ENABLE_HIP)
 
 int main() {
@@ -549,6 +723,7 @@ int main() {
 
   TestFusedQKNormRoPEKvWriteEquivalence();
   TestBatchedFusedQKNormRoPEKvWriteEquivalence();
+  TestKvarnRotationPreservesQkScore();
   TestNormRoPEWithoutCache();
   std::cout
       << "Qwen QK norm, RoPE, and KV fusion ops test passed on gfx1151.\n";

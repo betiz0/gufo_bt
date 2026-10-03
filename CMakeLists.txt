@@ -382,6 +382,14 @@ if (BUILD_TESTING)
   add_subdirectory(tests/models/qwen38_flash_next)
 
   if(ENGINE_ENABLE_HIP)
+    # Model gating of --kv-cache in serve needs the HIP-only load path.
+    add_test(NAME kv_cache_cli_test
+      COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/cli/kv_cache_test.py
+        $<TARGET_FILE:gufo>)
+    set_tests_properties(kv_cache_cli_test PROPERTIES
+      LABELS "hip;server;cli;opt-c207-kv-quant" TIMEOUT 120)
+
     add_executable(chat_template_hf_token_golden_test
       tests/models/chat_template_hf_token_golden_test.cpp)
     target_link_libraries(chat_template_hf_token_golden_test PRIVATE gufo_core)

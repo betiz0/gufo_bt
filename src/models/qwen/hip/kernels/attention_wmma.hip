@@ -67,9 +67,36 @@
 #include <type_traits>
 
 #include "src/models/qwen/hip/detail/attention_policy.hpp"
+#include "src/models/qwen/hip/kernels/kvarn_device.hpp"
+#include "src/models/qwen/hip/kernels/kvarn_read_device.hpp"
 #include "src/models/qwen/hip/ops/attention.hpp"
 
 namespace gufo::hip {
+
+// Inverse Hadamard rotation of one attention context row, then the SiLU gate
+// (design D3). KVarN prefill writes the merged, normalized context from the
+// attention kernel and this pass rotates each (row, head) 256-dim row exactly
+// once before the gate, matching the decode read. Defined here and shared with
+// the tile and batched prefill launchers through its external linkage.
+__global__ void KvarnContextRotateGateKernel(float* __restrict__ out_context,
+                                             const float* __restrict__ gate,
+                                             std::uint32_t num_heads) {
+  const std::uint32_t head = blockIdx.y;
+  const std::uint32_t row = blockIdx.x;
+  const std::uint32_t tid = threadIdx.x;
+  __shared__ float s_row[256];
+  const std::size_t base =
+      (static_cast<std::size_t>(row) * num_heads + head) * 256;
+  s_row[tid] = out_context[base + tid];
+  __syncthreads();
+  KvarnFwhtRowShared(s_row, static_cast<int>(tid));
+  if (gate != nullptr) {
+    const float g = gate[base + tid];
+    out_context[base + tid] = s_row[tid] * (1.0F / (1.0F + __expf(-g)));
+  } else {
+    out_context[base + tid] = s_row[tid];
+  }
+}
 
 // Defined in kernels/attention_tile.hip; the WMMA route reuses the same FP16
 // cache and the same pack/sync pair unchanged.
@@ -632,6 +659,84 @@ __global__ void PackAttentionHeads(const __half* keys, const __half* values,
   }
 }
 
+namespace {
+
+// KVarN variant of PackAttentionHeads (design D7): dequantizes the sink, the
+// sealed tiles and the F16 tail ring into the same bounded temporary FP16
+// workspace the FP16 path uses, so WmmaCausalAttention<..., true> consumes it
+// unchanged. `quantized_tiles` is the view of the row group this launch feeds
+// (design D2), so every row in the group reads each tile from the region the
+// decode view selects. Persistent KV is never written back.
+__global__ void PackKvarnAttentionHeads(const KvarnReadParams kvarn,
+                                        std::uint32_t layer_idx,
+                                        std::uint32_t head_base,
+                                        __half* __restrict__ packed_keys,
+                                        __half* __restrict__ packed_values,
+                                        std::uint32_t length,
+                                        std::uint32_t quantized_tiles,
+                                        std::uint32_t chunk_begin,
+                                        std::uint32_t chunk_end) {
+  __shared__ __half tile[16][kHeadDim + 8];
+  // The workspace holds only this group's heads, so the packed destination uses
+  // the local head index while the KVarN source uses the global one.
+  const std::uint32_t local_head = blockIdx.x;
+  const std::uint32_t head = head_base + local_head;
+  const std::uint32_t base = blockIdx.y * 16;
+  for (std::uint32_t i = threadIdx.x; i < 16 * kHeadDim / 8; i += 256) {
+    const std::uint32_t key = i / (kHeadDim / 8);
+    const std::uint32_t dim = (i % (kHeadDim / 8)) * 8;
+    const std::uint32_t position = base + key;
+    union {
+      uint4 packed;
+      __half halves[8];
+    } v_value;
+    if (position < length) {
+      union {
+        uint4 packed;
+        __half halves[8];
+      } k_value;
+#pragma unroll
+      for (std::uint32_t j = 0; j < 8; ++j) {
+        k_value.halves[j] = __float2half_rn(KvarnStoredKElement(
+            kvarn, layer_idx, head, position, quantized_tiles, chunk_begin,
+            chunk_end, dim + j));
+        v_value.halves[j] = __float2half_rn(KvarnStoredVElement(
+            kvarn, layer_idx, head, position, quantized_tiles, chunk_begin,
+            chunk_end, dim + j));
+      }
+      // Only real rows are written: the temporary K layout is exactly
+      // `length * kHeadDim` per head, so padding K rows would run into the next
+      // head. V is padded to a whole 16-row tile by construction.
+      const std::size_t dst =
+          (static_cast<std::size_t>(local_head) * length + position) * kHeadDim +
+          dim;
+      *reinterpret_cast<uint4*>(packed_keys + dst) = k_value.packed;
+    } else {
+      v_value.packed = make_uint4(0u, 0u, 0u, 0u);
+    }
+    *reinterpret_cast<uint4*>(&tile[key][dim]) = v_value.packed;
+  }
+  __syncthreads();
+  const std::size_t padded = (length + 15u) & ~std::size_t{15};
+  for (std::uint32_t i = threadIdx.x; i < 16 * kHeadDim / 8; i += 256) {
+    const std::uint32_t dim = i / 2, key = (i % 2) * 8;
+    union {
+      uint4 packed;
+      __half halves[8];
+    } value;
+#pragma unroll
+    for (std::uint32_t j = 0; j < 8; ++j)
+      value.halves[j] = tile[key + j][dim];
+    *reinterpret_cast<uint4*>(
+        packed_values + static_cast<std::size_t>(local_head) * padded *
+                            kHeadDim +
+        static_cast<std::size_t>(base) * kHeadDim + dim * 16 + key) =
+        value.packed;
+  }
+}
+
+}  // namespace
+
 bool LaunchQwenWmmaAttention(
     const float* q, const float* k, const float* v, const float* gate,
     float* k_cache, float* v_cache, void* k_cache_f16, void* v_cache_f16,
@@ -639,7 +744,8 @@ bool LaunchQwenWmmaAttention(
     std::size_t batch_size, std::uint32_t max_context, std::uint32_t num_heads,
     std::uint32_t num_kv_heads, std::uint32_t head_dim, hipStream_t stream,
     float* lse_out, std::uint32_t key_begin, bool skip_kv_write,
-    std::span<float> packed_k_workspace, std::span<float> packed_v_workspace) {
+    std::span<float> packed_k_workspace, std::span<float> packed_v_workspace,
+    KvarnReadParams kvarn) {
   const detail::AttentionSupportParams support_params{
       .batch_size = batch_size,
       .start_pos = start_pos,
@@ -649,12 +755,93 @@ bool LaunchQwenWmmaAttention(
       .head_dim = head_dim,
       .has_k_cache_f16 = k_cache_f16 != nullptr,
       .has_v_cache_f16 = v_cache_f16 != nullptr,
+      .has_kvarn = kvarn.enabled(),
   };
   if (!detail::IsTiledAttentionSupported(support_params)) {
     return false;
   }
 
   constexpr std::size_t block_size = 256;
+
+  if (kvarn.enabled()) {
+    // KVarN (design D2/D7): the canonical FP16 planes do not exist, so never
+    // run the pack or the prefix sync. Dequantize the sink, the sealed tiles
+    // and the F16 tail ring into the same bounded temporary FP16 pack
+    // workspace the FP16 path uses, once per query-row group. A group ends at
+    // the next view threshold 256 + 128 t + L, so every row of a group has the
+    // same view and its tile reads match the AR decode exactly
+    // (KvarnQuantizedTilesForQuery). Persistent KV is never written back.
+    auto* packed_k = reinterpret_cast<__half*>(packed_k_workspace.data());
+    auto* packed_v = reinterpret_cast<__half*>(packed_v_workspace.data());
+    if (packed_k == nullptr || packed_v == nullptr || batch_size == 0 ||
+        key_begin != 0) {
+      return false;
+    }
+    const std::uint32_t chunk_end =
+        start_pos + static_cast<std::uint32_t>(batch_size);
+    for (std::uint32_t row_begin = 0; row_begin < batch_size;) {
+      const std::uint32_t group_begin =
+          start_pos + static_cast<std::uint32_t>(row_begin);
+      const std::uint32_t quantized_tiles =
+          KvarnQuantizedTilesForQuery(group_begin, kvarn.tail_length);
+      const std::uint64_t next_threshold =
+          256ULL + (128ULL * quantized_tiles) + kvarn.tail_length;
+      const std::uint32_t group_end =
+          next_threshold >= chunk_end
+              ? chunk_end
+              : static_cast<std::uint32_t>(next_threshold);
+      const std::uint32_t group_rows = group_end - group_begin;
+      const std::uint32_t length = group_end;
+      const std::size_t key_head_bytes =
+          static_cast<std::size_t>(length) * kHeadDim * sizeof(__half);
+      const std::size_t value_head_bytes =
+          ((static_cast<std::size_t>(length) + 15u) & ~std::size_t{15}) *
+          kHeadDim * sizeof(__half);
+      const auto heads_per_group = static_cast<std::uint32_t>(std::min(
+          {std::size_t{kKvHeads},
+           packed_k_workspace.size_bytes() / key_head_bytes,
+           packed_v_workspace.size_bytes() / value_head_bytes}));
+      if (heads_per_group == 0) {
+        return false;
+      }
+      const dim3 group_grid(
+          static_cast<unsigned int>((group_rows + kWmmaQueryRows - 1) /
+                                    kWmmaQueryRows),
+          kKvHeads * (kGqa / kWmmaHeads));
+      for (std::uint32_t first = 0; first < kKvHeads;
+           first += heads_per_group) {
+        const auto heads = std::min(heads_per_group, kKvHeads - first);
+        const std::size_t query_offset =
+            static_cast<std::size_t>(first) * kGqa * kHeadDim;
+        PackKvarnAttentionHeads<<<dim3(heads, (length + 15u) / 16u),
+                                  block_size, 0, stream>>>(
+            kvarn, layer_idx, first, packed_k, packed_v, length,
+            quantized_tiles, start_pos, chunk_end);
+        const dim3 head_grid(group_grid.x, heads * (kGqa / kWmmaHeads));
+        WmmaCausalAttention<kWmmaQueryRows, kWmmaKeys, true>
+            <<<head_grid, block_size, 0, stream>>>(
+                q + query_offset +
+                    (static_cast<std::size_t>(row_begin) * kAttnWidth),
+                /*gate=*/nullptr, packed_k, packed_v,
+                out_context + query_offset +
+                    (static_cast<std::size_t>(row_begin) * kAttnWidth),
+                group_begin, group_rows, /*lse_out=*/nullptr, key_begin);
+      }
+      row_begin += group_rows;
+    }
+    if (lse_out == nullptr) {
+      // The inverse Hadamard rotation is applied once, after every sink, tile
+      // and tail contribution is merged, before the SiLU gate (design D3),
+      // exactly as the decode read does. The lse halves stay unrotated for the
+      // merge step to rotate once.
+      KvarnContextRotateGateKernel<<<dim3(static_cast<unsigned int>(batch_size),
+                                          num_heads),
+                                     256, 0, stream>>>(out_context, gate,
+                                                       num_heads);
+    }
+    return true;
+  }
+
   const std::size_t layer_cache_offset =
       static_cast<std::size_t>(layer_idx) * max_context * kKvWidth;
   auto* layer_k = static_cast<__half*>(k_cache_f16) + layer_cache_offset;

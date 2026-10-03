@@ -901,6 +901,7 @@ void LaunchAttention(const float* q, const float* k, const float* v,
                      std::uint32_t num_kv_heads, std::uint32_t head_dim,
                      hipStream_t stream, float* split_k_scratch,
                      bool skip_kv_write) {
+  RequireAttentionKvSource(k_cache, v_cache, k_cache_f16, v_cache_f16, false);
   // 1. Write K and V into every non-null selected KV representation across all
   // num_kv_heads. May be skipped when a fused kernel already wrote the cache
   // (opt-c010-qk-rope-kv).
@@ -982,11 +983,34 @@ void LaunchCausalDecodeAttention(
     std::uint32_t layer_idx, std::uint32_t start_pos, std::size_t batch_size,
     std::uint32_t max_context, std::uint32_t num_heads,
     std::uint32_t num_kv_heads, std::uint32_t head_dim, hipStream_t stream,
-    std::span<float> scratch) {
+    std::span<float> scratch, KvarnReadParams kvarn) {
+  RequireAttentionKvSource(k_cache, v_cache, k_cache_f16, v_cache_f16,
+                           kvarn.enabled());
   const std::size_t row_scratch =
       detail::DecodeAttentionScratchElements(num_heads, head_dim);
   float* const split_k_scratch =
       scratch.size() >= row_scratch ? scratch.data() : nullptr;
+  // KVarN verification rows read the sink, sealed tiles and tail ring through
+  // the shared LDS staging kernel, keeping every row bit-identical to the AR
+  // decode at the same position (design D7, T-05).
+  if (kvarn.enabled() && head_dim == 256 && batch_size > 0) {
+    if (split_k_scratch != nullptr &&
+        scratch.size() / batch_size >= row_scratch) {
+      LaunchKvarnCausalDecodeAttention(
+          q, gate, out_context, layer_idx, start_pos, batch_size, num_heads,
+          num_kv_heads, kvarn, split_k_scratch, stream);
+      return;
+    }
+    const std::size_t width = static_cast<std::size_t>(num_heads) * head_dim;
+    for (std::size_t row = 0; row < batch_size; ++row) {
+      LaunchKvarnDecodeAttention(
+          q + row * width, gate == nullptr ? nullptr : gate + row * width,
+          out_context + row * width, layer_idx,
+          start_pos + static_cast<std::uint32_t>(row), nullptr, 1, num_heads,
+          num_kv_heads, kvarn, split_k_scratch, stream);
+    }
+    return;
+  }
   if (batch_size > 1 && scratch.size() / batch_size >= row_scratch &&
       split_k_scratch != nullptr &&
       detail::IsSplitKDecodeAttentionSupported(

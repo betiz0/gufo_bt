@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "src/cli/arg_parser.hpp"
+#include "src/cli/kv_cache_options.hpp"
 #include "src/cli/sampling_options.hpp"
 #include "src/core/crypto/sha256.hpp"
 #include "src/core/gguf_reader.hpp"
@@ -40,6 +41,30 @@
 namespace gufo::cli {
 
 namespace {
+
+/// Rejects `--kv-cache` for models that do not offer it, before any weights are
+/// loaded. Qwen3.8 27B is the only supported model in this build, and a value
+/// naming the model's own format is rejected just the same. Returns an empty
+/// string when the selection is acceptable.
+[[nodiscard]] std::string KvCacheModelError(const BenchOptions& opt,
+                                            const core::GgufReader& reader) {
+  if (opt.kv_cache.empty()) {
+    return {};
+  }
+  std::string_view architecture =
+      reader.GetMetadataString("general.architecture").value_or("");
+  if (architecture == "deepseek4") {
+    return KvCacheUnsupportedModelError("DeepSeek V4 Flash", kDeepSeekKvFormat);
+  }
+  if (architecture == "qwen4exp") {
+    return KvCacheUnsupportedModelError("Qwen3.8-Flash-Next",
+                                        kFlashNextKvFormat);
+  }
+  if (reader.GetMetadataUint64("qwen35.embedding_length") != 5120) {
+    return "--kv-cache is supported only by Qwen3.8 27B";
+  }
+  return {};
+}
 
 void PrintModelLoadTime(std::chrono::steady_clock::time_point start,
                         bool success = true) {
@@ -81,6 +106,12 @@ void RegisterBenchOptions(ArgParser& parser, BenchOptions& opt,
   parser.AddOption("-m", "--model", "PATH",
                    "Path to GGUF model file (required)", "Model",
                    &opt.model_path);
+  parser.AddOption(
+      "", "--kv-cache", "FORMAT",
+      "Attention KV cache format; supported values: " + KvCacheValueList(),
+      "Model", &opt.kv_cache);
+  parser.AddCustomOption("", "--kv-cache-tail", "N", KvCacheTailHelp(), "Model",
+                         KvCacheTailParser(&opt.kv_cache_tail));
 
   parser.AddCustomOption(
       "-p", "--n-prompt", "n,n,...",
@@ -867,6 +898,36 @@ int RunDeepSeekBenchmark(
   return 0;
 }
 
+/// `gufo bench` KV report for Qwen3.8 27B (task 5.6, spec "KV 容量見積と実効
+/// ビット数の報告"): the preset name, the tail length (`none` when unset), the
+/// effective body and total bpv, and the per-session KV capacity from the
+/// design D5 size formula. FP16/FP32 keep their existing one-word spelling.
+/// The bench measures one session, so the server capacity equals the session
+/// capacity here.
+[[nodiscard]] std::string QwenKvCacheReport(
+    std::string_view name, const hip::QwenExecutionPolicy& policy,
+    const core::ModelConfig& config, std::uint32_t capacity_tokens) {
+  if (!policy.UsesKvarn()) {
+    return std::string(name);
+  }
+  const auto estimate = models::qwen::EstimateKvarnMemory(
+      policy.kvarn.k_bits, policy.kvarn.v_bits,
+      hip::QwenKvarnTailRows(policy.kvarn), hip::kQwenKvarnW, capacity_tokens,
+      config.FullAttentionLayerCount(), config.num_key_value_heads);
+  std::ostringstream report;
+  report << name << " kv_cache_tail=";
+  if (policy.kvarn.tail_length == 0) {
+    report << "none";
+  } else {
+    report << policy.kvarn.tail_length;
+  }
+  report << std::fixed << std::setprecision(4)
+         << " kv_bpv_body=" << estimate.body_bpv
+         << " kv_bpv_total=" << estimate.total_bpv << std::setprecision(3)
+         << " kv_session_gib=" << estimate.session_gib;
+  return report.str();
+}
+
 bool IsQwen38FlashNext(const core::GgufReader& reader) {
   return reader.GetMetadataString("general.architecture") == "qwen4exp";
 }
@@ -1193,6 +1254,10 @@ std::optional<BenchOptions> ParseBenchOptions(std::span<const char* const> args,
   if (!speculative_explicit && !opt.dspark_model_path.empty()) {
     opt.speculative_backend = "dspark";
   }
+  if ((!opt.kv_cache.empty() || !opt.kv_cache_tail.empty()) &&
+      !ValidateKvCacheSelection(opt.kv_cache, opt.kv_cache_tail, error_msg)) {
+    return std::nullopt;
+  }
 
   if (opt.draft_tokens == 0 || opt.min_draft_tokens == 0 ||
       opt.min_draft_tokens > opt.draft_tokens) {
@@ -1260,6 +1325,13 @@ int RunBench(std::span<const char* const> args) {
   const std::shared_ptr<const gufo::core::GgufReader> reader(
       std::move(reader_owner));
 
+  if (const std::string kv_error = KvCacheModelError(opt, *reader);
+      !kv_error.empty()) {
+    std::cerr << "Error: " << kv_error << "\n";
+    PrintModelLoadTime(model_load_start, false);
+    return 2;
+  }
+
 #if defined(ENGINE_ENABLE_HIP)
   if (IsDeepSeekV4Flash(*reader)) {
     return RunDeepSeekBenchmark(opt, reader, model_load_start);
@@ -1314,8 +1386,23 @@ int RunBench(std::span<const char* const> args) {
   const std::size_t required_context =
       std::max<std::size_t>(4096, max_depth + max_test_tokens);
 
+  // `--kv-cache` was validated and gated before any weights were loaded; this
+  // is the single name-to-storage mapping shared with serving.
+  hip::QwenExecutionPolicy execution_policy =
+      hip::QwenExecutionPolicy::Production();
+  if (!opt.kv_cache.empty()) {
+    if (!hip::ResolveQwenKvCache(opt.kv_cache,
+                                 KvCacheTailTokens(opt.kv_cache_tail),
+                                 &execution_policy)) {
+      std::cerr << "Error: unsupported --kv-cache value: " << opt.kv_cache
+                << "\n";
+      PrintModelLoadTime(model_load_start, false);
+      return 2;
+    }
+  }
   auto gpu_exec = hip::QwenGpuExecutor::CreateFromGguf(
-      reader, &err, static_cast<std::uint32_t>(required_context));
+      reader, &err, static_cast<std::uint32_t>(required_context),
+      execution_policy);
   if (!gpu_exec) {
     std::cerr << "Error creating Qwen GPU executor: " << err << "\n";
     PrintModelLoadTime(model_load_start, false);
@@ -1384,6 +1471,16 @@ int RunBench(std::span<const char* const> args) {
   }
   const double model_params_b =
       static_cast<double>(parameter_count) / 1'000'000'000.0;
+
+  {
+    const std::string_view kv_cache_name =
+        opt.kv_cache.empty() ? kQwenKvFormat : std::string_view(opt.kv_cache);
+    std::cout << "KV cache: "
+              << QwenKvCacheReport(
+                     kv_cache_name, execution_policy, config,
+                     static_cast<std::uint32_t>(required_context))
+              << '\n';
+  }
 
   if (opt.validate_prefill_tokens > 0 &&
       !ValidatePrefill(*gpu_exec, opt.validate_prefill_tokens)) {

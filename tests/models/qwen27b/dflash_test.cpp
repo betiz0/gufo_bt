@@ -713,6 +713,93 @@ void CaptureAcceptanceTrace(
   Expect(file.good(), "write acceptance trace");
 }
 
+// Tasks 3.14: DFlash2 speculative verification under the memory-first KVarN
+// preset must reproduce the AR greedy continuation. The prompt is sized so the
+// verification window starts exactly at a tile seal boundary position
+// (`e_t + L + 1 = 256 + L`, design D4), i.e. tile 0 seals during the first
+// verification step. Both paths read the same lossy quantized cache, so the
+// emitted tokens must agree (greedy equality, not byte equality).
+void CheckKvarnDflashMatchesAutoregressive(
+    const std::shared_ptr<const gufo::hip::QwenGpuModel>& target_model,
+    const std::shared_ptr<const gufo::hip::QwenDFlashGpuModel>& draft_model) {
+  using QwenGpuExecutor = gufo::hip::QwenGpuExecutor;
+  using Token = gufo::tokenization::TokenId;
+  constexpr std::uint32_t kMaxContext = 4096;
+  constexpr std::size_t kOutput = 16;
+  std::string error;
+  for (const std::uint32_t tail : {0U, 2048U}) {
+    gufo::hip::QwenExecutionPolicy policy =
+        gufo::hip::QwenExecutionPolicy::Production();
+    gufo::hip::QwenKvarnPreset preset;
+    Expect(gufo::hip::ParseQwenKvarnPreset("kvarn-k4v4", &preset),
+           "kvarn-k4v4 must parse");
+    preset.tail_length = tail;
+    policy.kvarn = preset;
+    policy.kv_cache_storage = gufo::hip::QwenKvCacheStorage::kKvarn;
+    // First tile seal boundary position for this tail length.
+    const std::uint32_t boundary = 256U + gufo::hip::QwenKvarnTailRows(preset);
+    const auto& tokenizer = target_model->GetTokenizer();
+    const auto base = tokenizer.Encode(
+        "Virtual memory gives each process its own address space. The "
+        "operating system maps virtual pages to physical memory and handles "
+        "page faults.");
+    Expect(!base.empty(), "DFlash KVarN fixture must tokenize");
+    std::vector<Token> prompt(boundary);
+    for (std::size_t i = 0; i < prompt.size(); ++i)
+      prompt[i] = base[i % base.size()];
+    auto executor =
+        QwenGpuExecutor::Create(target_model, &error, kMaxContext, policy);
+    Expect(executor != nullptr, error);
+    gufo::models::GenerationOptions generation;
+    generation.max_new_tokens = kOutput;
+    const auto reference = executor->Generate(prompt, generation);
+    Expect(!reference.empty(), "DFlash KVarN AR reference must generate");
+    auto backend = gufo::hip::QwenDFlashGpuDraftBackend::Create(
+        draft_model, {.max_context = kMaxContext, .max_draft_tokens = 7},
+        &error);
+    Expect(backend != nullptr, error);
+    gufo::speculative::SpeculativeVerifier verifier(
+        *executor, std::move(backend),
+        {.max_draft_tokens = 7,
+         .initial_draft_tokens = 7,
+         .enable_adaptive_draft_length = false,
+         .use_batched_verification = true});
+    Token current = verifier.Prime(prompt);
+    std::vector<Token> sequence = prompt;
+    sequence.push_back(current);
+    std::vector<Token> output{current};
+    // The verification window covers [cur_pos, cur_pos + drafts]; setting the
+    // anchor to the boundary makes it contain `e_t + L + 1`.
+    Expect(static_cast<std::uint32_t>(sequence.size() - 1) == boundary,
+           "DFlash KVarN verification window must contain the seal boundary");
+    bool first_step = true;
+    while (output.size() < kOutput) {
+      const auto budget = static_cast<std::uint32_t>(kOutput - output.size());
+      const auto step = verifier.VerifyStep(
+          sequence, static_cast<std::uint32_t>(sequence.size() - 1), current,
+          tokenizer.GetEosTokenId(), budget);
+      if (first_step) {
+        Expect(step.draft_count > 0,
+               "DFlash KVarN verification must draft across the boundary");
+        first_step = false;
+      }
+      for (std::size_t index = 0; index < step.emitted_tokens.size(); ++index) {
+        if (step.hit_eos && index + 1 == step.emitted_tokens.size())
+          break;
+        output.push_back(step.emitted_tokens[index]);
+        sequence.push_back(step.emitted_tokens[index]);
+      }
+      if (step.hit_eos)
+        break;
+      current = step.next_token;
+    }
+    Expect(output == reference,
+           "DFlash2 under KVarN must reproduce the AR greedy sequence");
+    std::cout << "KVarN DFlash2 tail=" << tail << " boundary=" << boundary
+              << " tokens=" << output.size() << " matches AR greedy\n";
+  }
+}
+
 }  // namespace
 
 int main(int argc, const char* const* argv) {
@@ -757,6 +844,9 @@ int main(int argc, const char* const* argv) {
     }
     TestConcurrentBlocks(target_model, dflash_model);
     if (argc == 4 && std::string_view(argv[3]) == "--concurrency-only")
+      return 0;
+    CheckKvarnDflashMatchesAutoregressive(target_model, dflash_model);
+    if (argc == 4 && std::string_view(argv[3]) == "--kvarn-only")
       return 0;
 
     gufo::hip::QwenDFlashGpuDraftConfig config{

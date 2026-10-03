@@ -60,6 +60,15 @@ struct block_q8_0 {
   std::int8_t qs[32];
 };
 
+// Q5_0: fp16 scale, 32 high bits (bit j is the fifth bit of element j) and 32
+// 4-bit quants packed as Q4_0's nibbles (low nibbles are elements 0-15, high
+// nibbles 16-31); the value is `d * (quant - 16)`.
+struct block_q5_0 {
+  std::uint16_t d;
+  std::uint8_t qh[4];
+  std::uint8_t qs[16];
+};
+
 // IQ4_NL: fp16 scale + 32 non-linear 4-bit codebook indices (QK=32). The
 // codebook is kValuesIq4Nl; the index nibble order matches Q4_0 (low nibbles
 // give the first 16 elements, high nibbles the second 16).
@@ -96,6 +105,7 @@ static_assert(sizeof(block_q6_K) == 210, "block_q6_K must be 210 bytes");
 static_assert(sizeof(block_q3_K) == 110, "block_q3_K must be 110 bytes");
 static_assert(sizeof(block_q8_K) == 292, "block_q8_K must be 292 bytes");
 static_assert(sizeof(block_q8_0) == 34, "block_q8_0 must be 34 bytes");
+static_assert(sizeof(block_q5_0) == 22, "block_q5_0 must be 22 bytes");
 static_assert(sizeof(block_iq4_nl) == 18, "block_iq4_nl must be 18 bytes");
 static_assert(sizeof(block_iq4_xs) == 136, "block_iq4_xs must be 136 bytes");
 static_assert(sizeof(block_iq3_s) == 110, "block_iq3_s must be 110 bytes");
@@ -175,6 +185,9 @@ float DotProductQ8_K(const void* row_data, std::span<const float> vec,
 
 // Dequantize row of Q8_0 to float
 void DequantizeQ8_0(const void* src, float* dst, std::size_t k);
+
+// Dequantize row of Q5_0 to float
+void DequantizeQ5_0(const void* src, float* dst, std::size_t k);
 
 // Dequantize row of IQ4_NL to float
 void DequantizeIQ4_NL(const void* src, float* dst, std::size_t k);

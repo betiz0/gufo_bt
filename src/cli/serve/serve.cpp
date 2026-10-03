@@ -26,6 +26,7 @@
 #include <vector>
 
 #include "src/cli/arg_parser.hpp"
+#include "src/cli/kv_cache_options.hpp"
 #include "src/cli/sampling_options.hpp"
 #include "src/cli/serve/asr_service.hpp"
 #include "src/cli/serve/http_server.hpp"
@@ -531,6 +532,8 @@ void PrintServeHelp(std::string_view program_name,
     std::string dspark_model_path;
     std::string mtp_model_path;
     std::string vision_model_path;
+    std::string kv_cache;
+    std::string kv_cache_tail;
     std::size_t draft_tokens = 7;
     std::size_t min_draft_tokens = 1;
     std::size_t prefill_chunk_tokens =
@@ -566,6 +569,12 @@ void PrintServeHelp(std::string_view program_name,
         "-c", "--context", "N",
         "Context tokens per session (default: 0 = model native context)",
         "Model", &max_context);
+    parser.AddOption(
+        "", "--kv-cache", "FORMAT",
+        "Attention KV cache format; supported values: " + KvCacheValueList(),
+        "Model", &kv_cache);
+    parser.AddCustomOption("", "--kv-cache-tail", "N", KvCacheTailHelp(),
+                           "Model", KvCacheTailParser(&kv_cache_tail));
 
     // Sampling Defaults
     parser.AddOption(
@@ -1026,6 +1035,8 @@ int RunServe(std::span<const char* const> args) {
     std::string dspark_model_path;
     std::string mtp_model_path;
     std::string vision_model_path;
+    std::string kv_cache;
+    std::string kv_cache_tail;
     std::size_t draft_tokens = 7;
     std::size_t min_draft_tokens = 1;
     std::size_t prefill_chunk_tokens =
@@ -1060,6 +1071,12 @@ int RunServe(std::span<const char* const> args) {
         "-c", "--context", "N",
         "Context tokens per session (default: 0 = model native context)",
         "Model", &max_context);
+    llm_parser.AddOption(
+        "", "--kv-cache", "FORMAT",
+        "Attention KV cache format; supported values: " + KvCacheValueList(),
+        "Model", &kv_cache);
+    llm_parser.AddCustomOption("", "--kv-cache-tail", "N", KvCacheTailHelp(),
+                               "Model", KvCacheTailParser(&kv_cache_tail));
     llm_parser.AddOption(
         "-n", "--max-tokens", "N",
         "Default new-token limit (default: -1 = until EOS or context full)",
@@ -1156,6 +1173,11 @@ int RunServe(std::span<const char* const> args) {
       return 0;
     }
     if (!valid_server_options()) {
+      return 2;
+    }
+    if ((!kv_cache.empty() || !kv_cache_tail.empty()) &&
+        !ValidateKvCacheSelection(kv_cache, kv_cache_tail, &parse_err)) {
+      std::cerr << "Error: " << parse_err << "\n";
       return 2;
     }
     bool sampling_valid = true;
@@ -1267,6 +1289,9 @@ int RunServe(std::span<const char* const> args) {
                            .staging_capacity_bytes = cache_disk_staging_bytes,
                            .model_artifact_fingerprint = {},
                        },
+                       server::TextKvCacheConfig{
+                           .value = kv_cache,
+                           .tail_tokens = KvCacheTailTokens(kv_cache_tail)},
                        vision_model_path)) {
       std::cerr << "Error loading model '" << model << "': " << err << "\n";
       return 1;
@@ -1315,6 +1340,7 @@ int RunServe(std::span<const char* const> args) {
         " sessions=" + std::to_string(session_count) + " context_tokens=" +
         std::to_string(backend->max_context()) + " speculative=" + speculation +
         " draft_limit=" + std::to_string(speculative_config.max_draft_tokens) +
+        " kv_cache=" + backend->kv_cache_format() +
         " disk_cache=" + (cache_disk_directory.empty() ? "off" : "enabled"));
   }
 

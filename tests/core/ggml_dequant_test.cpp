@@ -176,6 +176,81 @@ void TestQ6() {
              expected_dot, "Q6_K dot product");
 }
 
+void TestQ5_0() {
+  constexpr std::size_t kQ5_0Elements = 32;
+  struct Q5_0Block {
+    std::uint16_t d;
+    std::uint8_t qh[4];
+    std::uint8_t qs[16];
+  };
+  static_assert(sizeof(Q5_0Block) == 22);
+
+  Q5_0Block block{};
+  block.d = 0x3800;  // fp16 0.5
+  for (std::size_t j = 0; j < 16; ++j) {
+    block.qs[j] =
+        static_cast<std::uint8_t>((j & 0x0FU) | (((15U - j) & 0x0FU) << 4U));
+  }
+  // Bit 3 of the high-bit word sets element 3's fifth bit, bit 21 element 21's.
+  block.qh[0] = 0x08;
+  block.qh[2] = 0x20;
+
+  std::array<float, kQ5_0Elements> actual{};
+  gufo::quant::DequantizeQ5_0(&block, actual.data(), actual.size());
+
+  // Hand-checked corner values of the same block.
+  const std::array<std::pair<std::size_t, float>, 6> samples{{{0, -8.0F},
+                                                              {3, 1.5F},
+                                                              {15, -0.5F},
+                                                              {16, -0.5F},
+                                                              {21, 5.0F},
+                                                              {31, -8.0F}}};
+  for (const auto& [index, value] : samples) {
+    ExpectNear(actual[index], value, "Q5_0 hand-checked value");
+  }
+
+  // Every element against the GGML byte layout: element j of the first half
+  // takes qs[j]'s low nibble and bit j of the high-bit word, element j + 16
+  // the high nibble and bit j + 16; the value is d * (quant - 16).
+  const std::uint32_t high = static_cast<std::uint32_t>(block.qh[0]) |
+                             (static_cast<std::uint32_t>(block.qh[1]) << 8U) |
+                             (static_cast<std::uint32_t>(block.qh[2]) << 16U) |
+                             (static_cast<std::uint32_t>(block.qh[3]) << 24U);
+  const float d = gufo::quant::Fp16ToFloat(block.d);
+  for (std::size_t j = 0; j < 16; ++j) {
+    const int lo = static_cast<int>(block.qs[j] & 0x0FU) |
+                   static_cast<int>(((high >> j) & 1U) << 4U);
+    const int hi = static_cast<int>(block.qs[j] >> 4U) |
+                   static_cast<int>(((high >> (j + 16)) & 1U) << 4U);
+    ExpectNear(actual[j], d * static_cast<float>(lo - 16),
+               "Q5_0 low-nibble value");
+    ExpectNear(actual[16 + j], d * static_cast<float>(hi - 16),
+               "Q5_0 high-nibble value");
+  }
+
+  // Whole row: two blocks, the second with a different scale, mirrored
+  // nibbles and every high bit set.
+  std::array<Q5_0Block, 2> row{};
+  row[0] = block;
+  row[1].d = 0x3000;  // fp16 0.125
+  for (std::size_t j = 0; j < 16; ++j) {
+    row[1].qs[j] =
+        static_cast<std::uint8_t>(((15U - j) & 0x0FU) | ((j & 0x0FU) << 4U));
+  }
+  std::fill(std::begin(row[1].qh), std::end(row[1].qh),
+            static_cast<std::uint8_t>(0xFF));
+  std::array<float, 2 * kQ5_0Elements> row_actual{};
+  gufo::quant::DequantizeQ5_0(row.data(), row_actual.data(), row_actual.size());
+  for (std::size_t index = 0; index < kQ5_0Elements; ++index) {
+    ExpectNear(row_actual[index], actual[index],
+               "Q5_0 row block 0 repeats the single-block case");
+  }
+  ExpectNear(row_actual[32], 1.875F, "Q5_0 row block 1 first value");
+  ExpectNear(row_actual[32 + 16], 0.0F,
+             "Q5_0 row block 1 high-nibble first value");
+  ExpectNear(row_actual[63], 1.875F, "Q5_0 row block 1 last value");
+}
+
 void TestQ3() {
   const std::array<std::int8_t, 16> scales{-32, -27, -18, -9, -1, 0,  1,  7,
                                            12,  18,  23,  27, 29, 30, 31, -16};
@@ -455,6 +530,7 @@ int main() {
   TestQ3();
   TestQ8();
   TestQ8_0();
+  TestQ5_0();
   TestQ5_K();
   if (const char* model = std::getenv("GUFO_MTP_MODEL");
       model != nullptr && std::string_view(model).size() > 0) {

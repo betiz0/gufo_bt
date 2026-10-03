@@ -9,6 +9,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -26,9 +27,12 @@
 
 #include "src/core/hip/detail/hip_graph_decode_executor.hpp"
 #include "src/models/qwen/hip/execution_policy.hpp"
+#include "src/models/qwen/hip/kvarn.hpp"
+#include "src/models/qwen/hip/ops/attention.hpp"
 #include "src/models/qwen/hip/ops/gemm.hpp"
 #include "src/models/qwen/hip/ops/ssm.hpp"
 #include "src/models/qwen/hip/ops/token.hpp"
+#include "src/models/qwen/kvarn_reference.hpp"
 #include "src/models/qwen/vision/device_input.hpp"
 
 namespace gufo::hip {
@@ -157,6 +161,26 @@ private:
   void* d_kv_f16_{nullptr};
   void* d_ssm_conv_{nullptr};
   void* d_ssm_deltanet_{nullptr};
+  /// KVarN storage (design D1/D9): a KVarN snapshot carries the sink, the
+  /// sealed-tile body and the tail ring, plus the per-(layer, KV head) sealed
+  /// tile counters, instead of a canonical FP16/FP32 plane.
+  bool kvarn_{false};
+  std::uint8_t kvarn_k_bits_{0};
+  std::uint8_t kvarn_v_bits_{0};
+  /// Raw `--kv-cache-tail` value: 0 means unset (L = W), which is distinct from
+  /// an explicit value and is part of the snapshot identity.
+  std::uint32_t kvarn_tail_length_{0};
+  std::uint32_t kvarn_ring_rows_{0};
+  std::uint32_t kvarn_tile_count_{0};
+  std::uint8_t kvarn_scale_{0};
+  std::size_t kvarn_sink_bytes_{0};
+  std::size_t kvarn_body_bytes_{0};
+  std::size_t kvarn_tail_bytes_{0};
+  std::size_t kvarn_seal_elements_{0};
+  void* d_kvarn_sink_{nullptr};
+  void* d_kvarn_body_{nullptr};
+  void* d_kvarn_tail_{nullptr};
+  std::uint32_t* d_kvarn_sealed_{nullptr};
   std::size_t kv_elements_per_plane_{0};
   std::size_t conv_elements_{0};
   std::size_t deltanet_elements_{0};
@@ -296,6 +320,64 @@ public:
   float* d_logits{nullptr};
   void* d_attention_kv_f16{nullptr};
   float* d_kv_cache{nullptr};
+  /// KVarN regions (design.md D1), allocated only when the policy selects a
+  /// preset: the F16 sink, the sealed tiles, the F16 tail ring, and the
+  /// bounded per-chunk F16 workspace of design D4/4.1.
+  void* d_kvarn_sink{nullptr};
+  std::uint8_t* d_kvarn_body{nullptr};
+  void* d_kvarn_tail{nullptr};
+  void* d_kvarn_chunk{nullptr};
+  [[nodiscard]] const models::qwen::KvarnRegions& GetKvarnRegions()
+      const noexcept {
+    return kvarn_regions_;
+  }
+  /// Elements of one K or V plane of the per-chunk workspace: a whole prefill
+  /// chunk of `max_batch_` rows.
+  [[nodiscard]] std::uint64_t KvarnChunkPlaneElements() const noexcept {
+    return static_cast<std::uint64_t>(max_batch_) *
+           config_.num_key_value_heads * config_.head_dim;
+  }
+  /// KVarN write destination for the fused KV write, or a disabled value for
+  /// the FP16/FP32 policies (design D1/D7).
+  [[nodiscard]] KvarnWriteParams GetKvarnWriteParams() const noexcept {
+    if (!policy_.UsesKvarn()) {
+      return {};
+    }
+    return KvarnWriteParams{
+        static_cast<__half*>(d_kvarn_sink), static_cast<__half*>(d_kvarn_tail),
+        kvarn_regions_.sink_elements, kvarn_regions_.tail_elements,
+        static_cast<std::uint32_t>(kvarn_regions_.tail_rows),
+        static_cast<__half*>(d_kvarn_chunk), KvarnChunkPlaneElements()};
+  }
+  /// KVarN read source for the decode attention, or a disabled value for the
+  /// FP16/FP32 policies (design D1/D2/D7).
+  [[nodiscard]] KvarnReadParams GetKvarnReadParams() const noexcept {
+    if (!policy_.UsesKvarn()) {
+      return {};
+    }
+    KvarnReadParams params{
+        static_cast<const __half*>(d_kvarn_sink),
+        static_cast<const __half*>(d_kvarn_tail),
+        d_kvarn_body,
+        kvarn_regions_.sink_elements,
+        kvarn_regions_.tail_elements,
+        static_cast<std::uint32_t>(kvarn_regions_.tail_rows),
+        static_cast<std::uint32_t>(kvarn_regions_.tile_count),
+        static_cast<std::uint32_t>(
+            models::qwen::KvarnTilePayloadBytes(policy_.kvarn.k_bits)),
+        static_cast<std::uint32_t>(
+            models::qwen::KvarnTilePayloadBytes(policy_.kvarn.v_bits)),
+        config_.num_key_value_heads,
+        QwenKvarnTailRows(policy_.kvarn),
+        policy_.kvarn.k_bits,
+        policy_.kvarn.v_bits,
+        static_cast<const __half*>(d_kvarn_chunk),
+        KvarnChunkPlaneElements()};
+    return params;
+  }
+  [[nodiscard]] KvarnSealState* GetKvarnSealState() const noexcept {
+    return kvarn_seal_.get();
+  }
   float* d_ssm_conv_state{nullptr};
   void* d_ssm_deltanet_state{nullptr};
   std::uint32_t* d_prompt_tokens{nullptr};
@@ -350,11 +432,16 @@ private:
   void FreeAll() noexcept;
   void AllocateRecurrentSnapshot();
   [[nodiscard]] bool AllocateSsmReplayLog();
+  /// Allocates the KVarN sink, body and tail regions of `policy_.kvarn`.
+  void AllocateKvarnRegions();
 
   core::ModelConfig config_;
   std::uint32_t max_context_;
   std::uint32_t max_batch_;
   QwenExecutionPolicy policy_;
+  models::qwen::KvarnRegions kvarn_regions_;
+  /// Seal state, non-null only when the policy selects KVarN.
+  std::unique_ptr<KvarnSealState> kvarn_seal_;
   std::vector<std::uint32_t> target_layer_ids_;
   float* d_saved_ssm_conv_state_{nullptr};
   void* d_saved_ssm_deltanet_state_{nullptr};
@@ -426,6 +513,13 @@ public:
 
   [[nodiscard]] const QwenExecutionPolicy& GetExecutionPolicy() const noexcept {
     return policy_;
+  }
+
+  /// Per-session KVarN seal state, or null for the FP16/FP32 policies
+  /// (design D15). The executor checks its device error flag at the logits
+  /// synchronization point and poisons the session on a non-finite tile.
+  [[nodiscard]] KvarnSealState* GetKvarnSealState() noexcept {
+    return arena_.GetKvarnSealState();
   }
 
   /// Runs one single token forward step on GPU, returning next token ID.
@@ -553,6 +647,12 @@ private:
   void CheckReset() const {
     if (reset_failure_)
       std::rethrow_exception(reset_failure_);
+    // A KVarN seal non-finite error discards the session: it may not be
+    // reused, snapshotted or continue (design D15).
+    if (kvarn_poisoned_)
+      throw std::runtime_error(
+          "Qwen KVarN seal detected a non-finite KV value; the session is "
+          "discarded and must not be reused or snapshotted");
   }
   std::exception_ptr reset_failure_;
   void ReplaySsmState(std::uint32_t position, std::uint32_t count = 1);
@@ -590,6 +690,9 @@ private:
   std::optional<tokenization::TokenId> next_token_;
   bool capture_prompt_hidden_{false};
   bool replaying_ssm_state_{false};
+  /// Set when a KVarN seal reports a non-finite KV tile (design D15). All
+  /// subsequent fallible operations fail and snapshots are refused.
+  bool kvarn_poisoned_{false};
 };
 
 }  // namespace gufo::hip

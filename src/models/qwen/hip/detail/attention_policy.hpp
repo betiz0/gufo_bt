@@ -26,6 +26,10 @@ struct AttentionSupportParams {
   std::uint32_t head_dim{0};
   bool has_k_cache_f16{false};
   bool has_v_cache_f16{false};
+  // KVarN selection replaces the canonical FP16 planes with the sink, the
+  // sealed-tile body and the F16 tail ring (design D1/D7). The tile and WMMA
+  // kernels must then read those regions instead of `*_cache_f16`.
+  bool has_kvarn{false};
 };
 
 [[nodiscard]] constexpr bool ShouldAttemptOptimizedAttention(
@@ -81,7 +85,8 @@ struct AttentionSupportParams {
          params.head_dim == kTiledAttentionHeadDim &&
          static_cast<std::size_t>(params.start_pos) + params.batch_size <=
              params.max_context &&
-         params.has_k_cache_f16 && params.has_v_cache_f16;
+         (params.has_kvarn ||
+          (params.has_k_cache_f16 && params.has_v_cache_f16));
 }
 
 /// The row-split recurrence needs two scratch planes and a 128 x 128 state
