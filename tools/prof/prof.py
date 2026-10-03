@@ -209,6 +209,14 @@ STAGE_MAPS: dict[str, list[tuple[str, str]]] = {
         ("SSMConv", "ssm: conv1d"),
         ("SSMPostNormGate", "ssm: post-norm gate"),
         ("SSM", "ssm: other"),
+        // KVarN (openspec add-kvarn-kv-cache-quantization): seal and read
+        // stages must be matched before the generic `Attention` needle.
+        ("KvarnSeal", "kvarn: seal"),
+        ("KvarnChunkFlush", "kvarn: chunk flush"),
+        ("KvarnSplitK", "kvarn: split-k read"),
+        ("KvarnCausal", "kvarn: verification read"),
+        ("KvarnReduce", "kvarn: read reduce"),
+        ("Kvarn", "kvarn: read"),
         ("Attention", "attention"),
         ("QKNormRoPE", "attention: qk-norm+rope+kv"),
         ("RoPE", "attention: rope"),
