@@ -48,6 +48,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--artifacts", default="artifacts")
     parser.add_argument("--json", default=None)
+    parser.add_argument("--series-prefix", default="g1d19-r",
+                        help="directory prefix of the measurement series")
     args = parser.parse_args()
     root = Path(args.artifacts)
     out = Path(args.json) if args.json else root / "g1d19-summary.json"
@@ -57,14 +59,14 @@ def main() -> int:
     for depth in DEPTHS:
         fp16[depth] = {
             metric: median(
-                [read(root / f"g1d19-r{r}" / f"fp16_d{depth}.log", depth, metric)
+                [read(root / f"{args.series_prefix}{r}" / f"fp16_d{depth}.log", depth, metric)
                  for r in SERIES])
             for metric in ("pp2048", "tg128")
         }
         for tag in KVARN:
             kvarn[(tag, depth)] = {
                 metric: median(
-                    [read(root / f"g1d19-r{r}" / f"{tag}_d{depth}.log", depth,
+                    [read(root / f"{args.series_prefix}{r}" / f"{tag}_d{depth}.log", depth,
                           metric) for r in SERIES])
                 for metric in ("pp2048", "tg128")
             }
@@ -72,7 +74,7 @@ def main() -> int:
     summary: dict = {"model_sha256": None, "fp16": {}, "presets": {},
                      "gate": {}, "reference": {}}
     for r in SERIES:
-        identity = root / f"g1d19-r{r}" / "model.json"
+        identity = root / f"{args.series_prefix}{r}" / "model.json"
         if identity.exists():
             summary["model_sha256"] = json.loads(identity.read_text()).get("sha256")
             break

@@ -51,6 +51,9 @@ RUN_LOG = "run.log"
 RUN_MARKER_SUFFIX = ".done"
 
 DEPTHS = (0, 4096, 32768, 131072)
+# Pass-through bench arguments set by `run --extra-args` (e.g. the DFlash2
+# speculation flags used by the G2 judgment).
+EXTRA_ARGS: list[str] = []
 PROMPT_TOKENS = 2048
 GEN_TOKENS = 128
 DEFAULT_RUN_TIMEOUT = 3600
@@ -220,7 +223,7 @@ def bench_command(binary: Path, model: Path, depth: int, kv_cache: str,
                "--n-depth", str(depth), "--kv-cache", kv_cache]
     if tail:
         command += ["--kv-cache-tail", str(tail)]
-    return command
+    return command + EXTRA_ARGS
 
 
 def read_metric(out: Path, tag: str, depth: int, metric: str) -> float | None:
@@ -305,6 +308,8 @@ def run_one(out: Path, log_path: Path, binary: Path, model: Path, tag: str,
 
 
 def cmd_run(args) -> int:
+    global EXTRA_ARGS
+    EXTRA_ARGS = shlex.split(getattr(args, "extra_args", "") or "")
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     binary = Path(args.binary)
@@ -326,6 +331,8 @@ def cmd_run(args) -> int:
                    "--foreground", "--binary", str(binary), "--model", str(model),
                    "--out", str(out), "--depths",
                    ",".join(str(d) for d in depths), "--timeout", str(args.timeout)]
+        if getattr(args, "extra_args", ""):
+            command += ["--extra-args", args.extra_args]
         # The child appends its own progress to run.log, so its stdout goes to a
         # separate driver log (tracebacks included) to avoid duplicating lines.
         script = (f"{shlex.join(command)} >> {shlex.quote(str(driver_path))} 2>&1; "
@@ -567,6 +574,10 @@ def main() -> int:
                      help="per-invocation timeout in seconds")
     run.add_argument("--foreground", action="store_true",
                      help="run in this process instead of detaching")
+    run.add_argument("--extra-args", default="",
+                     help="extra arguments appended to every gufo bench call "
+                          "(for example \"--speculative dflash2 "
+                          "--dflash-model /path\")")
     run.set_defaults(func=cmd_run)
 
     status = sub.add_parser("status")
