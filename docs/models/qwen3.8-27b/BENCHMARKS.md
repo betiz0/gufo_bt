@@ -169,18 +169,25 @@ from the same measurement series (design D18).
 <!-- bench:kvarn-ar -->
 | Qwen27B Q8 AR tg128 (tok/s) | d0 | d4,096 | d32,768 | d131,072 |
 | --- | ---: | ---: | ---: | ---: |
-| fp16 (reference) | 7.69 | 7.63 | 7.19 | 6.03 |
-| kvarn-k4v4, tail unset | 7.64 | 7.50 | 6.73 | 4.90 |
-| kvarn-k4v4, tail 2048 | 7.64 | 7.49 | 6.70 | 4.88 |
-| kvarn-k5v4, tail unset | 7.64 | 7.47 | 6.54 | 4.51 |
-| kvarn-k5v4, tail 2048 | 7.64 | 7.48 | 6.49 | 4.48 |
-| kvarn-k6v5, tail unset | 7.64 | 7.42 | 6.20 | 3.88 |
-| kvarn-k6v5, tail 2048 | 7.64 | 7.45 | 6.15 | 3.86 |
+| fp16 (reference) | 7.69 | 7.62 | 7.19 | 6.04 |
+| kvarn-k4v4, tail unset | 7.66 | 7.50 | 6.65 | 4.75 |
+| kvarn-k4v4, tail 2048 | 7.66 | 7.52 | 6.60 | 4.71 |
+| kvarn-k5v4, tail unset | 7.66 | 7.47 | 6.45 | 4.34 |
+| kvarn-k5v4, tail 2048 | 7.66 | 7.49 | 6.38 | 4.32 |
+| kvarn-k6v5, tail unset | 7.66 | 7.42 | 6.07 | 3.66 |
+| kvarn-k6v5, tail 2048 | 7.66 | 7.44 | 6.03 | 3.65 |
 
-Ratios to the FP16 reference: 0.99 at d0, 0.97–0.98 at d4K, 0.86–0.94 at
-d32K, and 0.64–0.81 at d128K. Only the d0 and d4K floors (≥ 0.95) are met; the
-d32K and d128K floors (≥ 1.00, and R ≥ 1 + 0.5·G* for `kvarn-k4v4` at d128K,
-design D18) are not (G1 fails).
+Ratios to the FP16 reference: 0.996 at d0, 0.974–0.987 at d4K, 0.839–0.926 at
+d32K, and 0.605–0.787 at d128K. Only the d0 and d4K floors (≥ 0.95) are met; the
+d32K and d128K floors (≥ 1.00, and R ≥ 1 + 0.5·G* = 1.092/1.090 for
+`kvarn-k4v4` at d128K, design D18) are not, so G1 fails and the performance
+work stops for a user decision (D18).
+
+Measured 2026-10-03 with the host toolchain (ROCm 7.14, host glibc 2.43; Q8_0,
+`artifacts/g1sys`): the `nix develop` build links ROCm's raw `hipClang` without
+the nixpkgs compiler wrapper and mixes host glibc 2.43 with the store's glibc
+2.42, so that binary cannot start here. `python3 tools/qwen27b/g1.py evaluate
+--artifacts artifacts/g1sys` reproduces the table.
 <!-- /bench -->
 
 Measured scope: one `gufo bench --n-prompt 2048 --n-gen 128` run per point, so
