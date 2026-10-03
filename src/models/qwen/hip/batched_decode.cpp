@@ -704,10 +704,9 @@ QwenGpuExecutor::ForwardVerificationBatch(
           {
             const auto& regions = state_arena.GetKvarnRegions();
             LaunchKvarnSeal(
-                *state_arena.GetKvarnSealState(),
-                item.executor->policy_.kvarn, state_arena.d_kvarn_sink,
-                state_arena.d_kvarn_tail, regions.sink_elements,
-                regions.tail_elements,
+                *state_arena.GetKvarnSealState(), item.executor->policy_.kvarn,
+                state_arena.d_kvarn_sink, state_arena.d_kvarn_tail,
+                regions.sink_elements, regions.tail_elements,
                 static_cast<std::uint32_t>(regions.tail_rows),
                 state_arena.d_kvarn_body,
                 static_cast<std::uint32_t>(regions.tile_count), attention_layer,
