@@ -158,6 +158,44 @@ Reproduce (design D16):
 python3 tools/qwen27b/kvarn_quality.py report --label g0-tail --gate
 ```
 
+**Pre-fix and invalid (2026-10-04):** the acceptance numbers in this paragraph
+were measured before the speculative-verification store fix (see
+[experiments](EXPERIMENTS.md), "DFlash2 検証分岐の修正"); with the fix the same
+corpus reports 0/11 AR/DFlash2 mismatches at depth 0 and ~3.9K and the depth-0
+acceptance returns to the FP16 value 0.844. Re-measure before using them.
+
+DFlash2 and long-context cost (design D20, tasks 4.8). KVarN KV changes where
+the target's greedy decisions land: at depth 0 the FP16 and `kvarn-k5v4`
+tail-2048 DFlash2 runs emit the same first two tokens (identical sha256,
+acceptance and decode steps) and separate at the third, so the divergence is
+the target's rotated-space rounding, not the draft wiring. Over the 11-case
+corpus at 32 generated tokens the acceptance difference is not significant
+(depth 0: 0.876 against 0.814, paired bootstrap 95% CI [-0.198, +0.056]; depth
+4096: 0.765 against 0.695, [-0.169, +0.009]). At depth 128K the `kvarn: seal`
+cost is the depth preparation (35 prefill chunks × 16 layers = 560 seals, 33.63 s
+at n=1 and 33.65 s at n=128), not the generation cycles; the generation-side
+KVarN cost is the AR split-K read (11.65 s per 128 tokens) and the DFlash2
+verification read (30.98 s), which makes AR the better KVarN choice in very long
+contexts. **Promise (design D20/D22):** the DFlash2 depth-0 tg floor (0.95× FP16) is
+decided by the user after this cause check; the recorded G2 DFlash2 numbers are
+pre-fix and invalid, so the decision now waits for the re-measured numbers while
+the D19 reference values stay unchanged. Reproduce:
+
+```sh
+# (1) short-length agreement, depth 0
+GUFO_DISPATCH_TELEMETRY=1 build/release/gufo bench -m MODEL -p 2048 -n 3 -d 0 \
+  --kv-cache kvarn-k5v4 --kv-cache-tail 2048 \
+  --speculative dflash2 --dflash-model DFLASH --verbose
+# (2) corpus acceptance; KVarN needs a --binary wrapper that inserts the flags
+python3 tools/bench/speculative-corpus.py --binary build/release/gufo \
+  --model MODEL --draft-model DFLASH --backend dflash2 --json OUT.json
+# (3) 128K seal split
+python3 tools/prof/prof.py run --stages qwen --tag tg -o OUT -- \
+  build/release/gufo bench -m MODEL -p 2048 -n 128 -d 131072 \
+  --kv-cache kvarn-k5v4 --kv-cache-tail 2048 \
+  --speculative dflash2 --dflash-model DFLASH
+```
+
 ## Images
 
 Use the matching `mmproj-BF16.gguf` beside the target or pass `--mmproj PATH`.

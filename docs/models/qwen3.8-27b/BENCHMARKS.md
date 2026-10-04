@@ -219,6 +219,19 @@ depth-0 DFlash2 floor (0.95) is not met, so the performance work stops for a
 user decision (D18/D19). The pp re-check passes: every G2 pp ratio is 1.00–1.01×
 of the G1 value at the same point, i.e. ≥ 0.97× of the recorded reference.
 
+**Invalid — re-measure (2026-10-04, tasks 4.8 follow-up, design D18).** Every
+DFlash2 number above was measured while the speculative-verification and 2–8
+session batched-decode KVarN stores wrote their rows into the per-chunk prefill
+workspace instead of the sink/tail ring, so the verification read stale or zero
+rows for the rows it had just written and the emitted token differed from the
+scalar AR continuation in 5 of 11 corpus cases at depth 0 and 7 of 11 at ~3.9K.
+With the store fixed (`RequireKvarnDirectWrite`, sink/ring only) the same runs
+report 0/11 mismatches and the acceptance returns to the FP16 value
+(0.844 at depth 0). Treat the DFlash2 tg ratios, cycle counts and acceptances in
+this section as pre-fix and invalid. The AR tg and pp numbers are unaffected
+(they use the single-row decode store). The depth-0 DFlash2 floor decision
+stays with the user, now on re-measured numbers.
+
 Measured scope: the difference to the FP16 point of the same depth is the KVarN
 read-path cost (the model's projections, the recurrent layers and the KV writes
 are otherwise identical). With the retained per-key read (`kKeyBlock = 1`), that
