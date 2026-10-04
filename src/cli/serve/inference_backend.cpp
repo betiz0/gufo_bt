@@ -293,8 +293,13 @@ std::string QwenStateAbiName(bool speculative,
     return std::string(QwenStateAbi(speculative, policy.UsesFp16AttentionKv(),
                                     policy.UsesBf16RecurrentState()));
   }
+  // One generation ahead of the canonical strings: v6/v5 reject every cache
+  // written before the batched decode and verification stores were fixed to
+  // write the sink and tail ring directly (2026-10-04), whose ring rows and
+  // sealed tiles could hold stale or zero F16 rows. FP16/FP32 keep their
+  // spellings above, so their caches are unaffected.
   std::string abi =
-      speculative ? "qwen-gfx1151-dflash-state-v5-" : "qwen-gfx1151-state-v4-";
+      speculative ? "qwen-gfx1151-dflash-state-v6-" : "qwen-gfx1151-state-v5-";
   abi += QwenKvStorageIdentity(policy);
   if (policy.UsesBf16RecurrentState()) {
     abi += "-bf16-recurrent";
