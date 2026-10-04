@@ -25,6 +25,7 @@
 #include "src/models/qwen/chat_template.hpp"
 #include "src/models/qwen/dflash_weights.hpp"
 #include "src/models/qwen/hip/executor.hpp"
+#include "tests/models/qwen27b/multi_session.hpp"
 
 namespace {
 
@@ -800,6 +801,134 @@ void CheckKvarnDflashMatchesAutoregressive(
   }
 }
 
+// Tasks 7.5 (user decision 2026-10-04): one session through the production
+// executor must leave byte-identical KVarN storage (sink, sealed tiles, tail
+// ring and seal counters) after a DFlash2 run and after the scalar AR run over
+// the same committed prefix. Covers every speculative-corpus case and a
+// natural-language prompt whose generated continuation crosses the first tile
+// seal boundary. Single session only (design D21).
+void CheckKvarnDflashStateMatchesDecode(
+    const std::shared_ptr<const gufo::hip::QwenGpuModel>& target_model,
+    const std::shared_ptr<const gufo::hip::QwenDFlashGpuModel>& draft_model) {
+  using QwenGpuExecutor = gufo::hip::QwenGpuExecutor;
+  using Token = gufo::tokenization::TokenId;
+  struct Case {
+    std::string name;
+    std::string text;
+    const char* preset;
+    std::uint32_t tail;
+    std::size_t tokens;
+  };
+  std::vector<Case> cases;
+  {
+    std::ifstream corpus(GUFO_QWEN27B_CORPUS_PATH);
+    Expect(corpus.good(), "speculative corpus must open");
+    auto document = gufo::json::parse(
+        std::string(std::istreambuf_iterator<char>(corpus), {}));
+    for (const auto& item : document["prompts"].items()) {
+      cases.push_back({item.member_str("id", "?"), item.member_str("text", ""),
+                       "kvarn-k5v4", 2048U, 32U});
+    }
+  }
+  Expect(cases.size() == 11, "the corpus must keep its eleven cases");
+  const std::string sentence =
+      "The attention cache of a long conversation grows with every turn, so a "
+      "server that keeps full precision keys and values for every session "
+      "quickly runs out of memory. Quantizing the cached keys and values "
+      "reduces that pressure, but the decode path must still read the same "
+      "history that the writer stored, or the generated text drifts away from "
+      "the autoregressive reference. ";
+  std::string boundary_text;
+  for (int repeat = 0; repeat < 6; ++repeat)
+    boundary_text += sentence;
+  cases.push_back(
+      {"seal-boundary-natural", boundary_text, "kvarn-k4v4", 0U, 96U});
+
+  for (const auto& item : cases) {
+    gufo::hip::QwenExecutionPolicy policy =
+        gufo::hip::QwenExecutionPolicy::Production();
+    gufo::hip::QwenKvarnPreset preset;
+    Expect(gufo::hip::ParseQwenKvarnPreset(item.preset, &preset),
+           "production KVarN preset must parse");
+    preset.tail_length = item.tail;
+    policy.kvarn = preset;
+    policy.kv_cache_storage = gufo::hip::QwenKvCacheStorage::kKvarn;
+    std::string error;
+    std::vector<gufo::tokenization::ChatMessage> messages{
+        {gufo::tokenization::ChatRole::kUser, item.text, "", ""}};
+    const auto rendered = gufo::tokenization::QwenChatTemplate::Render(
+        messages, gufo::tokenization::ResolveQwenChatOptions({}));
+    Expect(rendered.has_value(), "chat template render");
+    const auto prompt = target_model->GetTokenizer().Encode(*rendered);
+    Expect(!prompt.empty(), "case must tokenize");
+
+    auto ar = QwenGpuExecutor::Create(target_model, &error, 8192, policy);
+    Expect(ar != nullptr, error);
+    std::vector<Token> tokens;
+    Token token = ar->ForwardPromptBatch(prompt, 0, true);
+    tokens.push_back(token);
+    while (tokens.size() < item.tokens) {
+      token = ar->ForwardToken(
+          token, static_cast<std::uint32_t>(prompt.size() + tokens.size() - 1),
+          true);
+      tokens.push_back(token);
+    }
+    const auto ar_snapshot = ar->SaveSnapshot(
+        static_cast<std::uint32_t>(prompt.size() + tokens.size()));
+
+    auto spec = QwenGpuExecutor::Create(target_model, &error, 8192, policy);
+    Expect(spec != nullptr, error);
+    auto backend = gufo::hip::QwenDFlashGpuDraftBackend::Create(
+        draft_model, {.max_context = 8192, .max_draft_tokens = 7}, &error);
+    Expect(backend != nullptr, error);
+    gufo::speculative::SpeculativeVerifier verifier(
+        *spec, std::move(backend),
+        {.max_draft_tokens = 7,
+         .min_draft_tokens = 1,
+         .initial_draft_tokens = 7,
+         .enable_adaptive_draft_length = true,
+         .use_batched_verification = true});
+    const auto eos = target_model->GetTokenizer().GetEosTokenId();
+    Token current = verifier.Prime(prompt);
+    std::vector<Token> sequence = prompt;
+    sequence.push_back(current);
+    std::vector<Token> drafted{current};
+    while (drafted.size() < item.tokens) {
+      const auto budget =
+          static_cast<std::uint32_t>(item.tokens - drafted.size());
+      const auto step = verifier.VerifyStep(
+          sequence, static_cast<std::uint32_t>(sequence.size() - 1), current,
+          eos, budget);
+      for (const auto emitted : step.emitted_tokens) {
+        drafted.push_back(emitted);
+        sequence.push_back(emitted);
+      }
+      if (step.hit_eos) {
+        break;
+      }
+      current = step.next_token;
+    }
+    Expect(drafted == tokens,
+           "DFlash2 continuation must match the AR continuation");
+    const auto df_snapshot = spec->SaveSnapshot(
+        static_cast<std::uint32_t>(prompt.size() + drafted.size()));
+    Expect(ar_snapshot->CompactPayloadBytes() ==
+               df_snapshot->CompactPayloadBytes(),
+           "KVarN compact payload size must match");
+    std::vector<std::uint8_t> left(ar_snapshot->CompactPayloadBytes());
+    std::vector<std::uint8_t> right(left.size());
+    Expect(ar_snapshot->SerializeCompact(left) == left.size(),
+           "AR compact serialize");
+    Expect(df_snapshot->SerializeCompact(right) == right.size(),
+           "DFlash2 compact serialize");
+    Expect(left == right,
+           "KVarN sink/tiles/ring bytes must match between AR and DFlash2");
+    std::cout << "KVarN state exact: " << item.name << " preset=" << item.preset
+              << " tail=" << item.tail << " tokens=" << tokens.size()
+              << " bytes=" << left.size() << "\n";
+  }
+}
+
 }  // namespace
 
 int main(int argc, const char* const* argv) {
@@ -842,10 +971,15 @@ int main(int argc, const char* const* argv) {
       CaptureAcceptanceTrace(target_model, dflash_model, argv[4], argv[5]);
       return 0;
     }
-    TestConcurrentBlocks(target_model, dflash_model);
+    if (gufo::tests::MultiSessionEnabled()) {
+      TestConcurrentBlocks(target_model, dflash_model);
+    } else {
+      gufo::tests::ReportMultiSessionSkipped("concurrent DFlash2 blocks");
+    }
     if (argc == 4 && std::string_view(argv[3]) == "--concurrency-only")
       return 0;
     CheckKvarnDflashMatchesAutoregressive(target_model, dflash_model);
+    CheckKvarnDflashStateMatchesDecode(target_model, dflash_model);
     if (argc == 4 && std::string_view(argv[3]) == "--kvarn-only")
       return 0;
 
@@ -1006,6 +1140,12 @@ int main(int argc, const char* const* argv) {
     Expect(persistent_bytes_for(*restored) == persistent_bytes_for(*cold),
            "new cached requests retain the same future policy and model state");
 
+    if (!gufo::tests::MultiSessionEnabled()) {
+      gufo::tests::ReportMultiSessionSkipped(
+          "batched draft contexts and ring-crossing requests");
+      std::cout << "qwen_dflash_gpu_test: ALL TESTS PASSED\n";
+      return 0;
+    }
     // A large logical context must not reserve or serialize expired history.
     // Restore at the window boundary, overwrite wrapped slots, and replay.
     const auto window = dflash_model->GetDFlashConfig().sliding_window;

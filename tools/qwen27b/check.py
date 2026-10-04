@@ -27,6 +27,22 @@ SUITES = {
                 "speculative_verification_test"],
     "serving": ["inference_backend_gpu_test"],
     "model": ["qwen27b_target_test", "qwen_mtp_gpu_test", "qwen_dflash_gpu_test"],
+    # Design D21: only this suite batches or interleaves several sessions; the
+    # entries are ctest names whose binaries the build list names separately.
+    "multi-session": ["qwen27b_target_test",
+                      "qwen_dflash_gpu_test",
+                      "inference_backend_gpu_test"],
+}
+
+# ctest names that are not build targets.
+EXTRA_TESTS = {
+    "model": ["qwen27b.cli", "qwen27b.dflash-kvarn"],
+    "fast": ["qwen27b.tools", "qwen27b.cli-options"],
+    "all": ["qwen27b.tools", "qwen27b.cli-options", "qwen27b.cli",
+            "qwen27b.dflash-kvarn"],
+    "multi-session": ["qwen27b_multisession_target_test",
+                      "qwen_dflash_multisession_gpu_test",
+                      "inference_backend_multisession_gpu_test"],
 }
 
 
@@ -46,7 +62,8 @@ def main() -> None:
     environment = os.environ.copy()
     required = ["model"] if args.suite == "reference" else (
         ["model", "mtp_model", "dflash_model"] if args.suite in ("model", "all") else
-        ["model", "dflash_model"] if args.suite == "serving" else [])
+        ["model", "dflash_model"]
+        if args.suite in ("serving", "multi-session") else [])
     for name in required:
         variable = "GUFO_QWEN27B_" + name.upper()
         value = getattr(args, name) or environment.get(variable)
@@ -60,7 +77,8 @@ def main() -> None:
     commands = [
         ["cmake", "--preset", "gpu-test"],
         ["cmake", "--build", "--preset", "gpu-test", "--target", *targets,
-         *(["gufo"] if args.suite in ("fast", "model", "all") else [])],
+         *(["gufo"] if args.suite in ("fast", "model", "all")
+           else [])],
     ]
     if args.suite == "reference":
         commands.append([
@@ -68,11 +86,7 @@ def main() -> None:
             environment["GUFO_QWEN27B_MODEL"], str(args.reference_model.resolve()),
         ])
     else:
-        names = targets + (["qwen27b.tools"] if args.suite in ("fast", "all") else [])
-        if args.suite in ("fast", "all"):
-            names.append("qwen27b.cli-options")
-        if args.suite in ("model", "all"):
-            names.append("qwen27b.cli")
+        names = targets + EXTRA_TESTS.get(args.suite, [])
         commands.append(["ctest", "--test-dir", "build/gpu-test", "-R",
                          "^(" + "|".join(names) + ")$",
                          "--output-on-failure", "--stop-on-failure", "--no-tests=error"])

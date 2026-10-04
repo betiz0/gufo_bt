@@ -19,6 +19,7 @@
 #include "src/models/qwen/hip/execution_policy.hpp"
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/testing/compare/logit_comparator.hpp"
+#include "tests/models/qwen27b/multi_session.hpp"
 
 namespace {
 using Token = gufo::tokenization::TokenId;
@@ -555,6 +556,77 @@ gufo::hip::QwenExecutionPolicy KvarnPolicy(const char* name,
   return policy;
 }
 
+// Design D21 / tasks 7.3: the 2-session batched AR decode must reach the same
+// greedy continuation as the 1-session scalar decode past the first tile seal
+// boundary, so a store that bypasses the sink/ring cannot pass unnoticed.
+// Only the multi-session suite runs this check.
+void CheckKvarnBatchDecodeSingleVsTwo(
+    const std::shared_ptr<const gufo::hip::QwenGpuModel>& model) {
+  constexpr std::size_t kSessions = 2;
+  constexpr std::size_t kContinuation = 64;
+  constexpr std::uint32_t kMaxContext = 8192;
+  for (const char* name : {"kvarn-k4v4", "kvarn-k5v4"}) {
+    for (const std::uint32_t tail : {0U, 2048U}) {
+      const auto policy = KvarnPolicy(name, tail);
+      const std::uint32_t boundary =
+          256U + gufo::hip::QwenKvarnTailRows(policy.kvarn);
+      // Cross the boundary during the continuation, not only during prefill.
+      const std::uint32_t prompt_size = boundary - 8U;
+      Expect(prompt_size + kContinuation < kMaxContext,
+             "KVarN batch regression context must fit");
+      std::array<std::unique_ptr<Executor>, kSessions> sessions;
+      std::array<std::vector<Token>, kSessions> tokens;
+      std::array<std::vector<Token>, kSessions> expected;
+      for (std::size_t row = 0; row < kSessions; ++row) {
+        sessions[row] = std::make_unique<Executor>(model, kMaxContext, policy);
+        const auto text = sessions[row]->GetTokenizer().Encode(
+            std::string(kTexts[row % kTexts.size()]) + "\n" +
+            kTexts[(row + 1) % kTexts.size()]);
+        Expect(!text.empty(), "KVarN batch regression fixture must tokenize");
+        tokens[row].resize(prompt_size + kContinuation);
+        for (std::size_t i = 0; i < tokens[row].size(); ++i)
+          tokens[row][i] = text[i % text.size()];
+        sessions[row]->Reset();
+        (void)sessions[row]->ForwardPromptBatch(
+            std::span(tokens[row]).first(prompt_size));
+        // Scalar C1 reference over the continuation that crosses the boundary.
+        for (std::size_t step = 0; step < kContinuation; ++step) {
+          const auto position = prompt_size + step;
+          expected[row].push_back(
+              sessions[row]->ForwardToken(tokens[row][position], position));
+        }
+      }
+      std::array<std::unique_ptr<gufo::hip::QwenGpuSnapshot>, kSessions>
+          snapshots;
+      for (std::size_t row = 0; row < kSessions; ++row) {
+        sessions[row]->Reset();
+        (void)sessions[row]->ForwardPromptBatch(
+            std::span(tokens[row]).first(prompt_size));
+        snapshots[row] = sessions[row]->SaveSnapshot(prompt_size);
+      }
+      for (std::size_t row = 0; row < kSessions; ++row)
+        sessions[row]->RestoreSnapshot(*snapshots[row]);
+      std::array<gufo::hip::QwenGpuBatchItem, kSessions> items;
+      for (std::size_t step = 0; step < kContinuation; ++step) {
+        for (std::size_t row = 0; row < kSessions; ++row)
+          items[row] = {sessions[row].get(), tokens[row][prompt_size + step],
+                        static_cast<std::uint32_t>(prompt_size + step)};
+        const auto predictions =
+            Executor::ForwardTokenBatch(std::span(items).first(kSessions));
+        Expect(predictions.size() == kSessions,
+               "KVarN 2-session batch returned the wrong number of rows");
+        for (std::size_t row = 0; row < kSessions; ++row)
+          Expect(predictions[row] == expected[row][step],
+                 "KVarN 2-session batch decode changed the greedy prediction "
+                 "past the seal boundary");
+      }
+      std::cout << "KVarN 2-session batch decode preset=" << name
+                << " tail=" << tail << " boundary=" << boundary
+                << " steps=" << kContinuation << " matches C1\n";
+    }
+  }
+}
+
 // Device read of the per-session sealed-tile counter for layer 0 / KV head 0.
 // Snapshot restore copies asynchronously on the session's non-blocking stream,
 // so synchronize before reading the counter.
@@ -920,12 +992,20 @@ std::vector<Case> Capture(const char* path, bool check_replay,
     cases.push_back(std::move(row));
   }
   if (check_replay) {
-    CheckMixedContextBatch(*executor, false);
-    CheckMixedContextBatch(*executor, true);
-    CheckConcurrencyWidths(*executor);
-    CheckKvarnBatchDecode(executor->GetSharedModel());
+    // Design D21: only the dedicated multi-session suite batches or interleaves
+    // several sessions.
+    if (gufo::tests::MultiSessionEnabled()) {
+      CheckMixedContextBatch(*executor, false);
+      CheckMixedContextBatch(*executor, true);
+      CheckConcurrencyWidths(*executor);
+      CheckKvarnBatchDecode(executor->GetSharedModel());
+      CheckKvarnBatchDecodeSingleVsTwo(executor->GetSharedModel());
+      CheckKvarnForkIndependence(executor->GetSharedModel());
+    } else {
+      gufo::tests::ReportMultiSessionSkipped(
+          "mixed-context batch, C2/C8 widths, KVarN batch decode and forks");
+    }
     CheckKvarnRollbackCancel(executor->GetSharedModel());
-    CheckKvarnForkIndependence(executor->GetSharedModel());
     CheckKvarnSeededReplay(executor->GetSharedModel());
     CheckWideCache(*executor);
     CheckPrefillReplay(executor->GetSharedModel());

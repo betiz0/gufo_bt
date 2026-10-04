@@ -21,6 +21,7 @@
 #include "src/models/qwen/chat_template.hpp"
 #include "src/models/qwen/generator.hpp"
 #include "src/models/qwen/hip/executor.hpp"
+#include "tests/models/qwen27b/multi_session.hpp"
 #include "tests/models/qwen27b/sampling_cases.hpp"
 
 namespace {
@@ -123,6 +124,10 @@ void CheckSamplingStrategies(
   // Reuse the isolated oracles above. The final C8 group wraps around so all
   // 23 strategies participate, including greedy penalties and combined floors.
   std::size_t offset = 0;
+  if (!gufo::tests::MultiSessionEnabled()) {
+    gufo::tests::ReportMultiSessionSkipped("concurrent sampling widths");
+    return;
+  }
   bool shared_ar = false;
   bool shared_speculative = false;
   for (const std::size_t width : {2U, 4U, 6U, 8U, 8U}) {
@@ -1081,66 +1086,99 @@ int main(int argc, const char* const* argv) {
     // Small chunks also cover bounded prefill before the concurrent decode.
     Expect(backend.load(model, &error, context, 2, {.decode_active_tokens = 8}),
            error);
-    gufo::server::ChatRequest concurrent_a({
-        {gufo::tokenization::ChatRole::kUser,
-         "The quick brown fox jumps over the lazy dog. Explain why this "
-         "sentence is commonly used.",
-         "", ""},
-    });
-    concurrent_a.client_id = "batch-a";
-    gufo::server::ChatRequest concurrent_b({
-        {gufo::tokenization::ChatRole::kUser,
-         "Write a concise C++20 implementation of a fixed-capacity ring buffer "
-         "with push, pop, front, and size. Explain the invariants.",
-         "", ""},
-    });
-    concurrent_b.client_id = "batch-b";
-    const auto rendered_a =
-        gufo::tokenization::QwenChatTemplate::Render(concurrent_a.messages);
-    const auto rendered_b =
-        gufo::tokenization::QwenChatTemplate::Render(concurrent_b.messages);
-    Expect(rendered_a.has_value() && rendered_b.has_value(),
-           "concurrent chat prompt rendering");
-    const auto direct_a =
-        GenerateDirect(*direct, model->GetTokenizer().Encode(*rendered_a), 8);
-    const auto direct_b =
-        GenerateDirect(*direct, model->GetTokenizer().Encode(*rendered_b), 8);
-    Expect(direct_a.size() == 8 && direct_b.size() == 8,
-           "concurrency fixtures must retain eight generated tokens");
+    if (!gufo::tests::MultiSessionEnabled()) {
+      gufo::tests::ReportMultiSessionSkipped(
+          "concurrent Qwen requests and W=2 plans");
+    } else {
+      gufo::server::ChatRequest concurrent_a({
+          {gufo::tokenization::ChatRole::kUser,
+           "The quick brown fox jumps over the lazy dog. Explain why this "
+           "sentence is commonly used.",
+           "", ""},
+      });
+      concurrent_a.client_id = "batch-a";
+      gufo::server::ChatRequest concurrent_b({
+          {gufo::tokenization::ChatRole::kUser,
+           "Write a concise C++20 implementation of a fixed-capacity ring "
+           "buffer "
+           "with push, pop, front, and size. Explain the invariants.",
+           "", ""},
+      });
+      concurrent_b.client_id = "batch-b";
+      const auto rendered_a =
+          gufo::tokenization::QwenChatTemplate::Render(concurrent_a.messages);
+      const auto rendered_b =
+          gufo::tokenization::QwenChatTemplate::Render(concurrent_b.messages);
+      Expect(rendered_a.has_value() && rendered_b.has_value(),
+             "concurrent chat prompt rendering");
+      const auto direct_a =
+          GenerateDirect(*direct, model->GetTokenizer().Encode(*rendered_a), 8);
+      const auto direct_b =
+          GenerateDirect(*direct, model->GetTokenizer().Encode(*rendered_b), 8);
+      Expect(direct_a.size() == 8 && direct_b.size() == 8,
+             "concurrency fixtures must retain eight generated tokens");
 
-    auto pending_a = backend.start_chat(concurrent_a, 8, 0.0F);
-    auto pending_b = backend.start_chat(concurrent_b, 8, 0.0F);
-    const auto concurrent_result_a = pending_a->Wait();
-    const auto concurrent_result_b = pending_b->Wait();
-    Expect(concurrent_result_a.tokens == direct_a,
-           "concurrent Qwen request A differs from isolated execution");
-    Expect(concurrent_result_b.tokens == direct_b,
-           "concurrent Qwen request B differs from isolated execution");
-    // The first cold prefill uses its optimal geometry. Work overlapping a
-    // decoder or its pending snapshot yields; it can grow after that peer ends.
-    const auto snapshot_bounded = [](const auto& result) {
-      return result.prefill_chunks > 1 && result.max_prefill_chunk_tokens <= 8;
-    };
-    Expect(concurrent_result_a.active_decode_prefill_chunks +
-                       concurrent_result_b.active_decode_prefill_chunks >
-                   0 ||
-               snapshot_bounded(concurrent_result_a) ||
-               snapshot_bounded(concurrent_result_b),
-           "concurrent Qwen prefill must yield to decode or snapshot work");
-    std::cout << "concurrency tokens=" << concurrent_result_a.tokens.size()
-              << ',' << concurrent_result_b.tokens.size()
-              << " widths=" << concurrent_result_a.physical_execution_width
-              << ',' << concurrent_result_b.physical_execution_width
-              << " plans=" << concurrent_result_a.execution_plan << ','
-              << concurrent_result_b.execution_plan
-              << " queue_ms=" << concurrent_result_a.queue_ms << ','
-              << concurrent_result_b.queue_ms << '\n';
-    Expect(concurrent_result_a.physical_execution_width == 2 &&
-               concurrent_result_b.physical_execution_width == 2,
-           "concurrent Qwen requests did not execute through W=2");
-    Expect(concurrent_result_a.execution_plan == "batched-w2" &&
-               concurrent_result_b.execution_plan == "batched-w2",
-           "concurrent Qwen requests did not report the W=2 plan");
+      auto pending_a = backend.start_chat(concurrent_a, 8, 0.0F);
+      auto pending_b = backend.start_chat(concurrent_b, 8, 0.0F);
+      const auto concurrent_result_a = pending_a->Wait();
+      const auto concurrent_result_b = pending_b->Wait();
+      Expect(concurrent_result_a.tokens == direct_a,
+             "concurrent Qwen request A differs from isolated execution");
+      Expect(concurrent_result_b.tokens == direct_b,
+             "concurrent Qwen request B differs from isolated execution");
+      // The first cold prefill uses its optimal geometry. Work overlapping a
+      // decoder or its pending snapshot yields; it can grow after that peer
+      // ends.
+      const auto snapshot_bounded = [](const auto& result) {
+        return result.prefill_chunks > 1 &&
+               result.max_prefill_chunk_tokens <= 8;
+      };
+      Expect(concurrent_result_a.active_decode_prefill_chunks +
+                         concurrent_result_b.active_decode_prefill_chunks >
+                     0 ||
+                 snapshot_bounded(concurrent_result_a) ||
+                 snapshot_bounded(concurrent_result_b),
+             "concurrent Qwen prefill must yield to decode or snapshot work");
+      std::cout << "concurrency tokens=" << concurrent_result_a.tokens.size()
+                << ',' << concurrent_result_b.tokens.size()
+                << " widths=" << concurrent_result_a.physical_execution_width
+                << ',' << concurrent_result_b.physical_execution_width
+                << " plans=" << concurrent_result_a.execution_plan << ','
+                << concurrent_result_b.execution_plan
+                << " queue_ms=" << concurrent_result_a.queue_ms << ','
+                << concurrent_result_b.queue_ms << '\n';
+      Expect(concurrent_result_a.physical_execution_width == 2 &&
+                 concurrent_result_b.physical_execution_width == 2,
+             "concurrent Qwen requests did not execute through W=2");
+      Expect(concurrent_result_a.execution_plan == "batched-w2" &&
+                 concurrent_result_b.execution_plan == "batched-w2",
+             "concurrent Qwen requests did not report the W=2 plan");
+    }
+
+    // Design D21: the stability window below must not absorb the first-use
+    // allocations of the cancellation and error paths, which the skipped
+    // multi-session block used to trigger earlier. Warm them with single
+    // session requests before taking the baseline.
+    {
+      std::size_t warm_checks = 0;
+      (void)backend.complete(raw_prompt, 4, 0.0F, [&warm_checks] {
+        ++warm_checks;
+        return warm_checks > 2;
+      });
+      try {
+        std::size_t warm_errors = 0;
+        (void)backend.complete(raw_prompt, 4, 0.0F, [&warm_errors] {
+          ++warm_errors;
+          if (warm_errors > 2) {
+            throw std::runtime_error("warm-up request failure");
+          }
+          return false;
+        });
+      } catch (const std::runtime_error&) {
+      }
+      (void)backend.complete(raw_prompt, 2, 0.0F);
+      HIP_CHECK(hipDeviceSynchronize());
+    }
 
     std::size_t free_before = 0;
     std::size_t total_memory = 0;

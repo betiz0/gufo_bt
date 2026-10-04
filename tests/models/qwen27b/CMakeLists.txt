@@ -34,6 +34,8 @@ if (ENGINE_ENABLE_HIP)
   add_qwen27b_test(qwen_mtp_gpu_test mtp_test.cpp "gpu;hip;mtp;external-model")
   add_qwen27b_test(qwen_dflash_gpu_test dflash_test.cpp
     "gpu;hip;dflash;dflash2;external-model")
+  target_compile_definitions(qwen_dflash_gpu_test PRIVATE
+    GUFO_QWEN27B_CORPUS_PATH="${PROJECT_SOURCE_DIR}/docs/models/qwen3.8-27b/artifacts/speculative-corpus.json")
   add_qwen27b_test(qwen_dflash_noncausal_attention_ops_test attention_test.cpp
     "gpu;hip;dflash;dflash2;kernels")
   target_link_libraries(qwen_dflash_noncausal_attention_ops_test PRIVATE hip::host)
@@ -57,5 +59,29 @@ if (ENGINE_ENABLE_HIP)
   set_tests_properties(inference_backend_gpu_test PROPERTIES
     LABELS "qwen27b;hip;gpu;server;correctness;external-model"
     SKIP_RETURN_CODE 77)
+
+  # Design D21 / tasks 7.2: the production entry must keep one session's
+  # DFlash2 continuation equal to AR over the corpus and across a seal boundary.
+  add_test(NAME qwen27b.dflash-kvarn COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/dflash_single_session_test.py $<TARGET_FILE:gufo>)
+  set_tests_properties(qwen27b.dflash-kvarn PROPERTIES
+    LABELS "qwen27b;gpu;hip;dflash;kvarn;external-model;slow"
+    SKIP_RETURN_CODE 77)
+
+  # Design D21 / tasks 7.3: multi-session checks live in their own suite and run
+  # only when GUFO_MULTI_SESSION_TESTS is set (the `multi-session` label).
+  add_test(NAME qwen27b_multisession_target_test COMMAND qwen27b_target_test)
+  set_tests_properties(qwen27b_multisession_target_test PROPERTIES
+    LABELS "qwen27b;gpu;hip;target;multi-session;external-model"
+    ENVIRONMENT "GUFO_MULTI_SESSION_TESTS=1" SKIP_RETURN_CODE 77)
+  add_test(NAME qwen_dflash_multisession_gpu_test COMMAND qwen_dflash_gpu_test)
+  set_tests_properties(qwen_dflash_multisession_gpu_test PROPERTIES
+    LABELS "qwen27b;gpu;hip;dflash;dflash2;multi-session;external-model"
+    ENVIRONMENT "GUFO_MULTI_SESSION_TESTS=1" SKIP_RETURN_CODE 77)
+  add_test(NAME inference_backend_multisession_gpu_test
+    COMMAND inference_backend_gpu_test)
+  set_tests_properties(inference_backend_multisession_gpu_test PROPERTIES
+    LABELS "qwen27b;hip;gpu;server;multi-session;external-model"
+    ENVIRONMENT "GUFO_MULTI_SESSION_TESTS=1" SKIP_RETURN_CODE 77)
 
 endif()

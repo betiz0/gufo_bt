@@ -120,6 +120,11 @@
       "configurePreset": "gpu-test",
       "output": {
         "outputOnFailure": true
+      },
+      "filter": {
+        "exclude": {
+          "label": "multi-session"
+        }
       }
     },
     {
@@ -131,7 +136,7 @@
       },
       "filter": {
         "exclude": {
-          "label": "slow|external-model"
+          "label": "slow|external-model|multi-session"
         }
       }
     },
@@ -158,6 +163,19 @@
       "filter": {
         "include": {
           "label": "qwen-kernel-oracle"
+        }
+      }
+    },
+    {
+      "name": "gpu-multisession",
+      "displayName": "Multi-Session gfx1151 GPU Tests (design D21)",
+      "configurePreset": "gpu-test",
+      "output": {
+        "outputOnFailure": true
+      },
+      "filter": {
+        "include": {
+          "label": "multi-session"
         }
       }
     }
