@@ -310,7 +310,6 @@ __global__ __launch_bounds__(kThreads) void KvarnSealKernel(
     for (int plane = 0; plane < 2; ++plane) {
       const bool is_value = plane != 0;
       const std::uint8_t bits = is_value ? v_bits : k_bits;
-      const std::uint32_t tile_bytes = is_value ? v_tile_bytes : k_tile_bytes;
       if (tid == 0) {
         s_bad = 0;
       }
