@@ -124,7 +124,9 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
             attn_layer_idx, d_in_pos, arena.GetMaxContext(),
             config.num_attention_heads, config.num_key_value_heads,
             config.head_dim, config.rotary_dim, config.rope_theta, 1e-6F,
-            arena.stream, rope, arena.GetKvarnWriteParams());
+            arena.stream, rope,
+            RequireKvarnDirectWrite(arena.GetKvarnDirectWriteParams(),
+                                    "Qwen decode"));
       } else {
         if (!layer.attn_q_norm.empty()) {
           LaunchPerHeadRMSNorm(
@@ -149,7 +151,7 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
       }
 
       // Softmax Attention + Gating
-      const auto kvarn_read = arena.GetKvarnReadParams();
+      const auto kvarn_read = arena.GetKvarnDirectReadParams();
       if (kvarn_read.enabled()) {
         // Seal the tiles the view rule selects, then read the sink, sealed
         // tiles and tail ring through one online softmax (design D4/D7).

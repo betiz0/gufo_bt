@@ -352,6 +352,35 @@ public:
         static_cast<__half*>(d_kvarn_chunk),
         KvarnChunkPlaneElements()};
   }
+  /// KVarN store destination for the decode, batched decode and verification
+  /// paths: the F16 sink and the tail ring only (design D1/D4). The per-chunk
+  /// prefill workspace is deliberately absent, because only the prefill path
+  /// flushes it.
+  [[nodiscard]] KvarnWriteParams GetKvarnDirectWriteParams() const noexcept {
+    if (!policy_.UsesKvarn()) {
+      return {};
+    }
+    return KvarnWriteParams{
+        static_cast<__half*>(d_kvarn_sink),
+        static_cast<__half*>(d_kvarn_tail),
+        kvarn_regions_.sink_elements,
+        kvarn_regions_.tail_elements,
+        static_cast<std::uint32_t>(kvarn_regions_.tail_rows),
+        nullptr,
+        0};
+  }
+  /// KVarN read source for the decode and verification attention: the sink,
+  /// the sealed tiles and the tail ring (design D2). Nothing outside a prefill
+  /// chunk may read the workspace.
+  [[nodiscard]] KvarnReadParams GetKvarnDirectReadParams() const noexcept {
+    if (!policy_.UsesKvarn()) {
+      return {};
+    }
+    KvarnReadParams params = GetKvarnReadParams();
+    params.chunk = nullptr;
+    params.chunk_plane_elements = 0;
+    return params;
+  }
   /// KVarN read source for the decode attention, or a disabled value for the
   /// FP16/FP32 policies (design D1/D2/D7).
   [[nodiscard]] KvarnReadParams GetKvarnReadParams() const noexcept {

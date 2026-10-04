@@ -318,7 +318,8 @@ std::vector<tokenization::TokenId> QwenGpuExecutor::ForwardTokenBatch(
               config.num_attention_heads, config.num_key_value_heads,
               config.head_dim, config.rotary_dim, config.rope_theta, 1e-6F,
               arena.stream, items[row].executor->vision_input_.rope(),
-              state_arena.GetKvarnWriteParams());
+              RequireKvarnDirectWrite(state_arena.GetKvarnDirectWriteParams(),
+                                      "Qwen GPU batched decode"));
           const auto& regions = state_arena.GetKvarnRegions();
           LaunchKvarnSeal(*state_arena.GetKvarnSealState(),
                           items[row].executor->policy_.kvarn,
@@ -332,7 +333,7 @@ std::vector<tokenization::TokenId> QwenGpuExecutor::ForwardTokenBatch(
           LaunchKvarnDecodeAttention(
               query, gate, context, attention_layer, position, nullptr, 1,
               config.num_attention_heads, config.num_key_value_heads,
-              state_arena.GetKvarnReadParams(), arena.d_split_k_attention,
+              state_arena.GetKvarnDirectReadParams(), arena.d_split_k_attention,
               arena.stream);
           continue;
         }
@@ -686,7 +687,8 @@ QwenGpuExecutor::ForwardVerificationBatch(
               config.num_key_value_heads, config.head_dim, config.rotary_dim,
               config.rope_theta, 1e-6F, arena_.stream,
               item.executor->vision_input_.rope(),
-              state_arena.GetKvarnWriteParams());
+              RequireKvarnDirectWrite(state_arena.GetKvarnDirectWriteParams(),
+                                      "Qwen verification"));
           // Exact verification projections do not use weight dequantization
           // scratch. Reuse it for independent split-K rows without allocating
           // another buffer or changing the scalar decode workspace.
@@ -726,7 +728,7 @@ QwenGpuExecutor::ForwardVerificationBatch(
               attention_layer, start_pos, sequence_size,
               state_arena.GetMaxContext(), config.num_attention_heads,
               config.num_key_value_heads, config.head_dim, arena_.stream,
-              attention_scratch, state_arena.GetKvarnReadParams());
+              attention_scratch, state_arena.GetKvarnDirectReadParams());
         } else {
           for (std::size_t row = 0; row < sequence_size; ++row) {
             float* const query =

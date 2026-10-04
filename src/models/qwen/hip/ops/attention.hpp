@@ -85,6 +85,21 @@ inline void RequireAttentionKvSource(const void* k_cache, const void* v_cache,
   }
 }
 
+/// Validates a KVarN store destination (design D1/D4): the decode, batched
+/// decode and speculative-verification paths store into the F16 sink and tail
+/// ring directly and never flush a per-chunk prefill workspace, so a write
+/// parameter set that carries the workspace would silently lose every row.
+[[nodiscard]] inline KvarnWriteParams RequireKvarnDirectWrite(
+    KvarnWriteParams kvarn, const char* path) {
+  if (kvarn.chunk != nullptr) {
+    throw std::runtime_error(
+        std::string(path) +
+        " must store KVarN rows in the sink/tail ring, not in the per-chunk "
+        "prefill workspace");
+  }
+  return kvarn;
+}
+
 /// Computes Fused QKV Projections for Full Attention layers in a single kernel
 void LaunchFusedQKVProjections(const void* q_w, core::GgmlType q_type,
                                const void* k_w, core::GgmlType k_type,
