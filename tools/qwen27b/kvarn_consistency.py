@@ -305,8 +305,8 @@ def server_command(args: argparse.Namespace, config: dict,
                    speculative: bool) -> list[str]:
     command = [
         str(args.binary), "serve", "--host", args.host, "--port", "0",
-        "--served-model-name", args.served_model_name,
-        "llm", "--model", str(args.model),
+        "llm", "--served-model-name", args.served_model_name,
+        "--model", str(args.model),
         "--context", str(args.context), "--sessions", str(args.sessions),
     ]
     if config["kv_cache"]:
