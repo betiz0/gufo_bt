@@ -86,11 +86,11 @@ acceptance, full-vocabulary residual correction, nonfinite inputs and replay.
 replay requires the same configuration. GPU/CPU distributions have numerical
 tolerances, not bit-identical upstream sampler parity.
 
-**Pre-fix and invalid (2026-10-04):** the acceptance numbers below were taken
-before the speculative-verification store fix (see
-[experiments](EXPERIMENTS.md)); after the fix the same corpus reports no
-AR/DFlash2 mismatch at depth 0 or ~3.9K, so re-measure before judging
-acceptance.
+**Re-measured (2026-10-05, tasks 7.8):** with the verification-store
+fix the same corpus reports no AR/DFlash2 mismatch at depth 0 or
+~3.9K and the depth-0 acceptance returns to parity (FP16 0.844
+against KVarN 0.844); the pre-fix numbers below stay recorded as
+invalid.
 
 KVarN KV changes where the target's greedy decisions land, so a KVarN DFlash2
 run need not match an FP16-KV DFlash2 run. The cause was checked without code
@@ -98,13 +98,17 @@ changes (design D20, tasks 4.8). At depth 0 the two runs emit the same first two
 tokens **exactly** — identical sha256, acceptance 0.000 and the same decode
 step counts — and separate at the third token, which points to the
 rotated-space rounding of the target rather than to the draft wiring. Across the
-11-case corpus (32 generated tokens, `speculative-corpus.py`) the DFlash2
-acceptance difference is not significant: depth 0 is FP16 0.876 against KVarN
-0.814 (paired bootstrap 95% CI of the mean difference [-0.198, +0.056]) and
-depth 4096 is 0.765 against 0.695 ([-0.169, +0.009]), so no systematic
-acceptance loss was found. The DFlash2 depth-0 tg floor (0.95× FP16) is decided
-by the user after this cause check (design D20/D22); the recorded G2 result and
-the D19 reference values are unchanged. Measurements and reproduce commands are
+11-case corpus (32 generated tokens, `speculative-corpus.py`) the
+pre-fix DFlash2 acceptance difference was not significant: depth 0 was
+FP16 0.876 against KVarN 0.814 (paired bootstrap 95% CI of the mean
+difference [-0.198, +0.056]) and depth 4096 was 0.765 against 0.695
+([-0.169, +0.009]); with the store fixed the depth-0 acceptance is at
+parity (0.844 against 0.844), so no systematic acceptance loss was
+found. **Outcome (2026-10-05, G2 re-measured):** the DFlash2 depth-0
+tg floor (0.95× FP16) is met — 0.994–0.995× for all six presets and
+tails — so G2 passes under D19; the depth 4K and 32K+ ratios are the
+recorded reference values and the D19 AR reference values are
+unchanged. Measurements and reproduce commands are
 in [experiments](EXPERIMENTS.md).
 
 ## Vision

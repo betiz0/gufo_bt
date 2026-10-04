@@ -211,26 +211,41 @@ artifacts` (logs under `artifacts/g1d19-r{1,2,3}`, summary
 `artifacts/g1d19-summary.json`).
 <!-- /bench -->
 
-DFlash2 (speculative decoding), same series, `gufo bench --speculative dflash2`:
-FP16 tg 23.47 / 17.99 / 38.45 / 7.47 t/s at d0 / 4K / 32K / 128K; the KVarN
-DFlash2 tg FP16 ratios are d0 0.587–0.588, 4K 0.728–0.866, 32K 0.574–0.627,
-128K 0.367–0.439 (the depth 32K+ values are recorded reference values). The D19
-depth-0 DFlash2 floor (0.95) is not met, so the performance work stops for a
-user decision (D18/D19). The pp re-check passes: every G2 pp ratio is 1.00–1.01×
-of the G1 value at the same point, i.e. ≥ 0.97× of the recorded reference.
+DFlash2 (speculative decoding), re-measured 2026-10-05 after the
+verification-store fix (tasks 7.8, designs D18/D21), same series method,
+`gufo bench --speculative dflash2 --dflash-model <DFlash2-Q8_0>`: FP16 tg
+23.48 / 17.97 / 38.36 / 7.56 t/s at d0 / 4K / 32K / 128K; the KVarN
+DFlash2 tg FP16 ratios are d0 0.994–0.995, 4K 0.769–0.971, 32K
+0.579–0.628, 128K 0.347–0.807. The D19 depth-0 DFlash2 floor (0.95) is
+met for every preset and tail, so **G2 passes under D19**. The pp re-check
+passes: every G2 pp ratio is ≥ 0.998× of the G1 recorded reference (floor
+0.97×). Depth 4K and 32K+ tg are the reference values G2 records; later
+judgments (G4/T-09) must keep the same point at ≥ 0.97× of them.
 
-**Invalid — re-measure (2026-10-04, tasks 4.8 follow-up, design D18).** Every
-DFlash2 number above was measured while the speculative-verification and 2–8
-session batched-decode KVarN stores wrote their rows into the per-chunk prefill
-workspace instead of the sink/tail ring, so the verification read stale or zero
-rows for the rows it had just written and the emitted token differed from the
-scalar AR continuation in 5 of 11 corpus cases at depth 0 and 7 of 11 at ~3.9K.
-With the store fixed (`RequireKvarnDirectWrite`, sink/ring only) the same runs
-report 0/11 mismatches and the acceptance returns to the FP16 value
-(0.844 at depth 0). Treat the DFlash2 tg ratios, cycle counts and acceptances in
-this section as pre-fix and invalid. The AR tg and pp numbers are unaffected
-(they use the single-row decode store). The depth-0 DFlash2 floor decision
-stays with the user, now on re-measured numbers.
+Effect of the store fix against the pre-fix (invalid) runs: depth-0 tg
+0.587–0.588 → 0.994–0.995 (the defect collapsed the depth-0 acceptance to
+0.277 against FP16's 0.460, D20, while the per-cycle time was already
+equivalent at 158.3 against 155.6 ms, so the gap was the acceptance rate),
+4K 0.728–0.866 → 0.769–0.971 (5 of 6 improved; `kvarn-k4v4` tail 2048
+0.800 → 0.769), 32K unchanged (0.574–0.627 → 0.579–0.628), 128K
+0.367–0.439 → 0.667–0.807 for 5 of 6 (`kvarn-k6v5` tail unset
+0.383 → 0.347; at that point the now-real ring rows are written and
+sealed every cycle, which the pre-fix runs never did). The pre-fix values,
+cycle counts and acceptances stay recorded as invalid in
+[experiments](EXPERIMENTS.md). The AR tg and pp numbers are unaffected
+(they use the single-row decode store). Reproduce:
+
+```sh
+for r in 1 2 3; do
+  python3 tools/qwen27b/g1.py run --binary build/release/gufo \
+    --out artifacts/g2fix-r$r \
+    --extra-args "--speculative dflash2 --dflash-model <DFlash2-Q8_0>"
+  python3 tools/qwen27b/g1.py wait --out artifacts/g2fix-r$r
+done && python3 tools/qwen27b/g1_d19.py --artifacts artifacts \
+  --series-prefix g2fix-r --json artifacts/g2fix-summary.json
+```
+(logs under `artifacts/g2fix-r{1,2,3}`, summary
+`artifacts/g2fix-summary.json`).
 
 Measured scope: the difference to the FP16 point of the same depth is the KVarN
 read-path cost (the model's projections, the recurrent layers and the KV writes

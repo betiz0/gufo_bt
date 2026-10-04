@@ -158,28 +158,33 @@ Reproduce (design D16):
 python3 tools/qwen27b/kvarn_quality.py report --label g0-tail --gate
 ```
 
-**Pre-fix and invalid (2026-10-04):** the acceptance numbers in this paragraph
-were measured before the speculative-verification store fix (see
-[experiments](EXPERIMENTS.md), "DFlash2 検証分岐の修正"); with the fix the same
-corpus reports 0/11 AR/DFlash2 mismatches at depth 0 and ~3.9K and the depth-0
-acceptance returns to the FP16 value 0.844. Re-measure before using them.
+**Re-measured (2026-10-05, tasks 7.8):** with the verification-store fix
+the same corpus reports 0/11 AR/DFlash2 mismatches at depth 0 and ~3.9K,
+the depth-0 acceptance returns to the FP16 value 0.844, and the re-measured
+G2 DFlash2 tg ratios meet the D19 depth-0 floor (0.95× FP16) for every
+preset and tail (0.994–0.995×); see [benchmarks](BENCHMARKS.md),
+"KVarN KV read path".
 
 DFlash2 and long-context cost (design D20, tasks 4.8). KVarN KV changes where
 the target's greedy decisions land: at depth 0 the FP16 and `kvarn-k5v4`
 tail-2048 DFlash2 runs emit the same first two tokens (identical sha256,
 acceptance and decode steps) and separate at the third, so the divergence is
 the target's rotated-space rounding, not the draft wiring. Over the 11-case
-corpus at 32 generated tokens the acceptance difference is not significant
-(depth 0: 0.876 against 0.814, paired bootstrap 95% CI [-0.198, +0.056]; depth
-4096: 0.765 against 0.695, [-0.169, +0.009]). At depth 128K the `kvarn: seal`
-cost is the depth preparation (35 prefill chunks × 16 layers = 560 seals, 33.63 s
+corpus at 32 generated tokens the pre-fix acceptance
+difference was not significant (depth 0: 0.876 against 0.814, paired
+bootstrap 95% CI [-0.198, +0.056]; depth 4096: 0.765 against 0.695,
+[-0.169, +0.009]); with the store fixed the depth-0 acceptance returns to
+parity (0.844 against 0.844).
+At depth 128K the `kvarn: seal` cost is the depth preparation (35 prefill chunks × 16 layers = 560 seals, 33.63 s
 at n=1 and 33.65 s at n=128), not the generation cycles; the generation-side
 KVarN cost is the AR split-K read (11.65 s per 128 tokens) and the DFlash2
 verification read (30.98 s), which makes AR the better KVarN choice in very long
-contexts. **Promise (design D20/D22):** the DFlash2 depth-0 tg floor (0.95× FP16) is
-decided by the user after this cause check; the recorded G2 DFlash2 numbers are
-pre-fix and invalid, so the decision now waits for the re-measured numbers while
-the D19 reference values stay unchanged. Reproduce:
+**Outcome (2026-10-05, G2 re-measured):** the DFlash2 depth-0 tg floor
+(0.95× FP16) is met — 0.994–0.995× for all six presets and tails — so G2
+passes under D19 and no user decision is pending; the depth 4K and 32K+
+DFlash2 ratios in [benchmarks](BENCHMARKS.md) are the recorded reference
+values for later judgments (G4/T-09). The D19 reference values for AR stay
+unchanged. Reproduce:
 
 ```sh
 # (1) short-length agreement, depth 0
