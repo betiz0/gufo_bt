@@ -175,15 +175,22 @@ difference was not significant (depth 0: 0.876 against 0.814, paired
 bootstrap 95% CI [-0.198, +0.056]; depth 4096: 0.765 against 0.695,
 [-0.169, +0.009]); with the store fixed the depth-0 acceptance returns to
 parity (0.844 against 0.844).
-At depth 128K the `kvarn: seal` cost is the depth preparation (35 prefill chunks × 16 layers = 560 seals, 33.63 s
-at n=1 and 33.65 s at n=128), not the generation cycles; the generation-side
-KVarN cost is the AR split-K read (11.65 s per 128 tokens) and the DFlash2
-verification read (30.98 s), which makes AR the better KVarN choice in very long
+At depth 128K the `kvarn: seal` cost is the depth preparation (35 prefill
+chunks × 16 layers = 560 seals, 33.63 s at n=1 and 33.65 s at n=128), not
+the generation cycles; the generation-side AR cost is the split-K read
+(11.65 s per 128 tokens). The pre-fix DFlash2 verification read (30.98 s,
+defective store) made AR the better KVarN choice in very long contexts;
+with the store fixed, the re-measured 128K DFlash2 tg is faster than AR
+for every preset and tail except `kvarn-k6v5` tail unset
+(`kvarn-k5v4` tail 2048: 5.57 against 4.54 t/s; `kvarn-k6v5` tail
+unset: AR 3.82 against DFlash2 2.62 t/s), so DFlash2 is the better
+KVarN choice at every depth for those configurations.
 **Outcome (2026-10-05, G2 re-measured):** the DFlash2 depth-0 tg floor
 (0.95× FP16) is met — 0.994–0.995× for all six presets and tails — so G2
-passes under D19 and no user decision is pending; the depth 4K and 32K+
-DFlash2 ratios in [benchmarks](BENCHMARKS.md) are the recorded reference
-values for later judgments (G4/T-09). The D19 reference values for AR stay
+passes under D19 and no user decision is pending; the depth 4K DFlash2
+ratio in [benchmarks](BENCHMARKS.md) is record-only (D24) and the depth
+32K+ ratios are the recorded reference values for later judgments
+(G4/T-09). The D19 reference values for AR stay
 unchanged. Reproduce:
 
 ```sh

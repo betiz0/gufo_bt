@@ -167,9 +167,11 @@ FP16 KV is measured inside every series (designs D16/D19).
 
 Contract (D19): the floors are AR tg ≥ 0.95× FP16 at depth 0–4K, DFlash2 tg
 ≥ 0.95× at depth 0, C8 aggregate throughput ≥ 0.95×, startup time worsening
-≤ 5%, and generation token-to-token p99/p50 ≤ 1.05× FP16's. Depth 32K and above
-AR tg and all-depth pp have no floor: the FP16 ratios below are the recorded
-**reference values**, and later judgments (G2, G4/T-09) must keep the same point
+≤ 5%, and generation token-to-token p99/p50 ≤ 1.05× FP16's. Depth-4K
+DFlash2 tg is record-only (user decision D24): no floor, no baseline.
+Depth 32K and above AR tg and all-depth pp have no floor: the FP16
+ratios below are the recorded **reference values**, and later judgments
+(G2, G4/T-09) must keep the same point
 at ≥ 0.97× of them. KVarN is a KV-memory feature and is expected to be slower
 than FP16 KV for long-context single-session generation.
 
@@ -219,8 +221,9 @@ DFlash2 tg FP16 ratios are d0 0.994–0.995, 4K 0.769–0.971, 32K
 0.579–0.628, 128K 0.347–0.807. The D19 depth-0 DFlash2 floor (0.95) is
 met for every preset and tail, so **G2 passes under D19**. The pp re-check
 passes: every G2 pp ratio is ≥ 0.998× of the G1 recorded reference (floor
-0.97×). Depth 4K and 32K+ tg are the reference values G2 records; later
-judgments (G4/T-09) must keep the same point at ≥ 0.97× of them.
+0.97×). Depth 4K DFlash2 tg is record-only (user decision D24); depth
+32K+ tg is the reference value G2 records, and later judgments (G4/T-09)
+must keep the same 32K+ point at ≥ 0.97× of it.
 
 Effect of the store fix against the pre-fix (invalid) runs: depth-0 tg
 0.587–0.588 → 0.994–0.995 (the defect collapsed the depth-0 acceptance to
