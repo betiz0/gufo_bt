@@ -873,6 +873,17 @@ def build_parser() -> argparse.ArgumentParser:
     status = sub.add_parser("status")
     common(status)
     status.set_defaults(func=cmd_status)
+    suite = sub.add_parser(
+        "suite", help="build a request suite from corpus document slices")
+    suite.add_argument("--corpus", type=Path, required=True,
+                       help="directory holding corpus-*.txt files")
+    suite.add_argument("--include", type=Path,
+                       help="curated suite JSON whose cases come first")
+    suite.add_argument("--count", type=int, default=160)
+    suite.add_argument("--slice-chars", type=int, default=1200)
+    suite.add_argument("--out", type=Path, required=True,
+                       help="suite JSON to write")
+    suite.set_defaults(func=cmd_suite)
     wait = sub.add_parser("wait")
     common(wait)
     wait.add_argument("--timeout", type=int, default=DEFAULT_WAIT_SECONDS)
@@ -884,6 +895,55 @@ def build_parser() -> argparse.ArgumentParser:
                              "seal-boundary unit")
     report.set_defaults(func=cmd_report)
     return parser
+
+
+def cmd_suite(args) -> None:
+    """Build a consistency suite from corpus document slices.
+
+    The curated `--include` cases come first; the remainder are document heads
+    sliced in corpus file and document order, so the suite is reproducible from
+    the corpus files alone. Categories follow the document's source path."""
+    cases: list[dict] = []
+    if args.include:
+        included = json.loads(args.include.read_text(encoding="utf-8"))
+        cases = [{key: case[key] for key in ("id", "category", "text")}
+                 for case in included.get("prompts", []) if case.get("text")]
+        cases = cases[: args.count]
+    corpora = sorted(args.corpus.glob("corpus-*.txt"))
+    if not corpora:
+        raise SystemExit(f"no corpus-*.txt under {args.corpus}")
+    for path in corpora:
+        if len(cases) >= args.count:
+            break
+        blocks = path.read_text(encoding="utf-8").split("\n\n# ")
+        for index, block in enumerate(blocks):
+            if len(cases) >= args.count:
+                break
+            block = block.strip()
+            if len(block) < 400:
+                continue
+            name = block.split("\n", 1)[0].strip()
+            if name.endswith((".cpp", ".hpp", ".hip", ".py")):
+                category = "code"
+            elif name.endswith(".json") or "venv/" in name:
+                category = "other"
+            else:
+                category = "prose"
+            cases.append({"id": f"{path.stem}-d{index:04d}",
+                          "category": category,
+                          "text": block[: args.slice_chars].strip()})
+    if len(cases) < args.count:
+        raise SystemExit(f"only {len(cases)} cases sliced (< {args.count})")
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    args.out.write_text(json.dumps({
+        "schema": "gufo.consistency-suite.v1",
+        "generator": {"corpus_dir": str(args.corpus),
+                      "include": str(args.include or ""),
+                      "count": args.count,
+                      "slice_chars": args.slice_chars},
+        "prompts": cases}, ensure_ascii=False, indent=1) + "\n",
+        encoding="utf-8")
+    print(f"wrote {args.out}: {len(cases)} cases")
 
 
 def main() -> None:

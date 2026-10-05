@@ -129,13 +129,16 @@ def cmd_corpus(args):
     for name, texts in sources.items():
         print(f"{name}: {len(texts)} files, "
               f"{sum(len(t) for _, t in texts)} chars")
-    # Three corpora with different document orders, so a window at a fixed
-    # depth lands in different content between them.
-    for index, seed in enumerate((1, 2, 3)):
+    # Corpora with different document orders, so a window at a fixed depth
+    # lands in different content between them. The seeds are recorded so a
+    # later judgment can build corpora earlier ones never used (design D17).
+    seeds = [int(s) for s in args.seeds.split(",") if s.strip()]
+    for index, seed in enumerate(seeds):
         text, estimate = build_corpus(sources, seed)
         path = out / f"corpus-{index}.txt"
         path.write_text(text, encoding="utf-8")
-        print(f"wrote {path} ({len(text)} chars, ~{estimate:.0f} tokens)")
+        print(f"wrote {path} (seed {seed}, {len(text)} chars, "
+              f"~{estimate:.0f} tokens)")
 
 
 def label_dir(args):
@@ -406,6 +409,102 @@ def canonical_candidate(name):
     return name[len(prefix):] if name.startswith(prefix) else name
 
 
+BOOTSTRAP_RESAMPLES = 2000
+BOOTSTRAP_SEED = 20261005
+
+
+def window_cells(results, max_teacher_nll):
+    """Per (kv_cache, tail, depth, corpus) aggregates for the judged metrics;
+    D14-excluded windows are dropped exactly as `summarize` drops them."""
+    cells = {}
+    for r in results:
+        if statistics.fmean(r["nll_teacher"]) > max_teacher_nll:
+            continue
+        cell = cells.setdefault(
+            (r["kv_cache"], r["tail"], r["depth"], r["corpus"]),
+            {"kl": [], "top1": 0, "large_dev": 0, "n": 0})
+        cell["kl"] += [x if x is not None else float("inf") for x in r["kl"]]
+        cell["top1"] += round(r["top1_agreement"] * r["positions"])
+        cell["large_dev"] += sum(1 for x in r["kl"]
+                                 if x is not None and x > LARGE_DEVIATION_NAT)
+        cell["n"] += r["positions"]
+    return cells
+
+
+def merged_cells(parts):
+    total = {"kl": [], "top1": 0, "large_dev": 0, "n": 0}
+    for part in parts:
+        total["kl"] += part["kl"]
+        total["top1"] += part["top1"]
+        total["large_dev"] += part["large_dev"]
+        total["n"] += part["n"]
+    return total
+
+
+def judged_metrics(cell):
+    return {
+        "kl_mean": statistics.fmean(cell["kl"]),
+        "kl_median": statistics.median(cell["kl"]),
+        "large_dev_rate": cell["large_dev"] / cell["n"],
+        "top1_disagree": 1.0 - cell["top1"] / cell["n"],
+    }
+
+
+def bootstrap_positions(results, max_teacher_nll, resamples, seed):
+    """The q8->q4 position p of every judged metric at every depth with a
+    window-wise bootstrap 95% interval (design D17 position). The resampling
+    unit is the evaluation window (one surviving (corpus, depth) unit),
+    resampled paired across the candidate and both baselines."""
+    cells = window_cells(results, max_teacher_nll)
+    rng = random.Random(seed)
+    rows = []
+    anchors = (("baseline-q8", None), ("baseline-q4", None))
+    configs = sorted({(name, tail) for name, tail, _, _ in cells
+                      if canonical_candidate(name).startswith("kvarn-")},
+                     key=lambda config: (config[0], tail_key(config[1])))
+    for name, tail in configs:
+        for depth in sorted({d for _, _, d, _ in cells}):
+            corpora = [c for c in sorted({w for _, _, d, w in cells
+                                          if d == depth})
+                       if all((n, t, depth, c) in cells
+                              for n, t in ((name, tail),) + anchors)]
+            if not corpora:
+                continue
+
+            def pooled(n, t, picks):
+                return merged_cells([cells[(n, t, depth, corpora[p])]
+                                     for p in picks])
+
+            point = {}
+            draws = {label: [] for label, _ in GATE_METRICS}
+            for draw in range(resamples + 1):
+                picks = (list(range(len(corpora))) if draw == 0 else
+                         [rng.randrange(len(corpora)) for _ in corpora])
+                candidate = judged_metrics(pooled(name, tail, picks))
+                eq8 = judged_metrics(pooled(*anchors[0], picks))
+                eq4 = judged_metrics(pooled(*anchors[1], picks))
+                for label, key in GATE_METRICS:
+                    denominator = eq4[key] - eq8[key]
+                    if denominator <= 0:
+                        continue
+                    position = (candidate[key] - eq8[key]) / denominator
+                    if draw == 0:
+                        point[label] = position
+                    else:
+                        draws[label].append(position)
+            for label, _ in GATE_METRICS:
+                values = draws[label]
+                rows.append({
+                    "kv_cache": canonical_candidate(name), "tail": tail,
+                    "depth": depth, "metric": label,
+                    "p": point.get(label),
+                    "lo": pct(values, 0.025) if values else None,
+                    "hi": pct(values, 0.975) if values else None,
+                    "windows": len(corpora), "defined": len(values),
+                    "resamples": resamples})
+    return rows
+
+
 def cmd_report(args):
     manifest, results = load_label(args)
     cfg = manifest["config"]
@@ -435,6 +534,21 @@ def cmd_report(args):
               f"{m['non_finite']:6d} {mem.get('total_bpv', float('nan')):7.3f} "
               f"{mem.get('session_kv_gib', float('nan')):6.2f}")
     failures, fitting, positions = gate(table, depths)
+    intervals = bootstrap_positions(results, args.max_teacher_nll,
+                                    args.bootstrap, args.bootstrap_seed)
+    print(f"\np (q8->q4 position) with window bootstrap 95% CI "
+          f"({args.bootstrap} resamples, seed {args.bootstrap_seed}; the gate "
+          f"budgets judge the pooled p)")
+    print(f"{'kv-cache':20s} {'tail':>5s} {'depth':>7s} {'metric':22s} "
+          f"{'p':>8s} {'95% CI':>18s} {'win':>4s}")
+    for row in intervals:
+        interval = (f"[{row['lo']:.3f}, {row['hi']:.3f}]"
+                    if row["lo"] is not None else "undefined")
+        point = f"{row['p']:.3f}" if row["p"] is not None else "n/a"
+        tail = "none" if row["tail"] is None else str(row["tail"])
+        print(f"{row['kv_cache']:20s} {tail:>5s} {row['depth']:7d} "
+              f"{row['metric']:22s} {point:>8s} {interval:>18s} "
+              f"{row['windows']:4d}")
     quality_first = sorted({name for (name, kind), tail in fitting.items()
                             if kind == "quality" and tail != NO_FIT})
     summary = {
@@ -450,6 +564,7 @@ def cmd_report(args):
         "quality_first_preset": quality_first[-1] if quality_first else NO_FIT,
         "g0_failures": failures,
         "gate": positions,
+        "p_intervals": intervals,
         "cells": [{"kv_cache": name, "tail": tail, "depth": depth, **m}
                   for (name, tail, depth), m in sorted(
                       table.items(),
@@ -468,6 +583,9 @@ def main():
     sub = parser.add_subparsers(dest="command", required=True)
     corpus = sub.add_parser("corpus")
     corpus.add_argument("--out", default=str(DEFAULT_DIR))
+    corpus.add_argument("--seeds", default="1,2,3",
+                        help="comma-separated document-order seeds; one "
+                             "corpus file per seed (default: 1,2,3)")
     corpus.set_defaults(func=cmd_corpus)
 
     def common(p):
@@ -499,6 +617,10 @@ def main():
     report.add_argument("--gate", action="store_true")
     report.add_argument("--max-teacher-nll", type=float,
                         default=MAX_TEACHER_NLL)
+    report.add_argument("--bootstrap", type=int,
+                        default=BOOTSTRAP_RESAMPLES,
+                        help="window bootstrap resamples for the p intervals")
+    report.add_argument("--bootstrap-seed", type=int, default=BOOTSTRAP_SEED)
     common(report)
     report.set_defaults(func=cmd_report)
     args = parser.parse_args()
