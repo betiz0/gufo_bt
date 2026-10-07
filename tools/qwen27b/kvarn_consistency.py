@@ -65,6 +65,10 @@ KVARN_W = 9
 KVARN_TAIL_MIN = 256
 KVARN_TAIL_MAX = 2048
 SCHEMA_VERSION = 1
+# 2: the compared text is `reasoning_content` + `content` on the chat endpoint
+# (1 compared `content` alone, which is empty when a short generation stays
+# inside the reasoning channel and made those units vacuously equal).
+RESPONSE_TEXT_VERSION = 2
 WAIT_POLL_SECONDS = 30
 DEFAULT_WAIT_SECONDS = 7200
 EXIT_STILL_RUNNING = 3
@@ -200,7 +204,14 @@ def run_request(args: argparse.Namespace, base_url: str,
     try:
         choice = response["choices"][0]
         if args.endpoint == "chat":
-            completion = choice["message"].get("content") or ""
+            # The model separates its reasoning from the answer, and a short
+            # generation can live entirely in `reasoning_content`. Comparing
+            # the answer alone made such units vacuously equal (observed on
+            # 2026-10-06: 32 generated tokens, content empty); compare the
+            # whole generation in order.
+            message = choice["message"]
+            completion = ((message.get("reasoning_content") or "")
+                          + (message.get("content") or ""))
         else:
             completion = choice.get("text") or ""
         usage = response["usage"]
@@ -208,6 +219,10 @@ def run_request(args: argparse.Namespace, base_url: str,
         completion_tokens = int(usage["completion_tokens"])
     except (KeyError, IndexError, TypeError, ValueError) as error:
         raise RuntimeError(f"unexpected response shape: {response}") from error
+    if completion_tokens > 0 and not completion:
+        raise RuntimeError(
+            f"response reported {completion_tokens} tokens but no text: "
+            f"{json.dumps(response)[:400]}")
     return {
         "completion": completion,
         "completion_sha256": sha256_text(completion),
@@ -510,6 +525,7 @@ def ar_identity(args: argparse.Namespace, config: dict, case: dict,
         "endpoint": args.endpoint, "served_model_name": args.served_model_name,
         "case": case["id"], "text_sha256": sha256_text(case["text"]),
         "depth": depth, "chars": chars, "max_tokens": args.max_tokens,
+        "response_text": RESPONSE_TEXT_VERSION,
     }
 
 
