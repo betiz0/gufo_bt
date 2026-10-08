@@ -263,6 +263,61 @@ key-block variants (2/4/8 keys) all measured slower than per-key. See
 [experiments](EXPERIMENTS.md) for the sweep, the compute-only measurement, and
 the memory-side motivation (`proposal.md`).
 
+### T-09 reduced re-measurement (2026-10-08, tasks 6.3, design D23)
+
+Release build (host ROCm 7.14), Q8_0 weights, one series with the FP16
+brackets measured in the same series (pp2048 median of three, tg128 once
+per point). Reused from the earlier judgments: `artifacts/g1d19-r{1,2,3}`
+(G1: AR tg and pp for every preset, tail and depth 0–128K) and
+`artifacts/g2fix-r{1,2,3}` (G2: DFlash2 tg). The main configuration's AR
+tg and pp were re-measured here because the verification-store fix
+(tasks 7.1) came after G1; the reference column is the G1 ratio for the
+same point (design D19: keep the point at ≥ 0.97× of it).
+
+| Point | t/s | FP16 t/s | ratio | floor / reference | verdict |
+| --- | ---: | ---: | ---: | --- | --- |
+| `kvarn-k5v4` tail 2048, AR tg128 d0 | 7.66 | 7.69 | 0.996 | ≥ 0.95 (floor) | pass |
+| `kvarn-k5v4` tail 2048, pp2048 d0 | 323.72 | 328.13 | 0.987 | ≥ 0.97 × 0.985 (G1) | pass |
+| `kvarn-k5v4` tail 2048, AR tg128 d4096 | 7.51 | 7.63 | 0.984 | ≥ 0.95 (floor) | pass |
+| `kvarn-k5v4` tail 2048, pp2048 d4096 | 295.24 | 319.53 | 0.924 | ≥ 0.97 × 0.921 (G1) | pass |
+| `kvarn-k5v4` tail 2048, AR tg128 d32768 | 6.54 | 7.20 | 0.908 | ≥ 0.97 × 0.910 (G1) | pass |
+| `kvarn-k5v4` tail 2048, pp2048 d32768 | 252.83 | 284.38 | 0.889 | ≥ 0.97 × 0.894 (G1) | pass |
+
+Startup to the first successful `/ready` (spawn → ready, warm page cache,
+3 runs each): `kvarn-k5v4` tail 2048 1.25–1.26 s, FP16 1.25–1.26 s → worsening 0% (criterion ≤ 5%).
+
+Token-to-token latency during a 128-token generation after a 2,564-token
+prompt (which crosses the first seal at tail 2048), 3 repetitions each;
+the server reports the per-request mean ITL, so the percentiles are across
+requests. Criterion: KVarN's p99/p50 ≤ 1.05× FP16's (design D19).
+
+| Config | ITL p50 ms | ITL p99 ms | p99/p50 | peak GiB |
+| --- | ---: | ---: | ---: | ---: |
+| `kvarn-k5v4` tail 2048 | 133.30 | 133.50 | 1.0015 | 22.01 |
+| `kvarn-k6v5` tail 2048 | 133.83 | 133.88 | 1.0004 | 22.08 |
+| FP16 | 131.30 | 131.79 | 1.0037 | 22.10 |
+
+HIP peak allocation at the full 262,144-token KV capacity (device-global
+`hipMemGetInfo` peak, the counter the memory table above uses; the KV
+reservation dominates the difference): `kvarn-k5v4` tail 2048 25.75 GiB, `kvarn-k6v5` tail 2048 26.43 GiB, FP16 36.49 GiB. At the 4,096-token context used for the latency runs all three peak at
+~22.0 GiB, which is the device-global baseline rather than the session
+footprint.
+
+C8 aggregate AR throughput (context 4096 per user, eight concurrent ~3.4K
+prompts, 3 repetitions; criterion ≥ 0.95× FP16):
+
+| Config | aggregate output t/s | per-request whole t/s | peak GiB |
+| --- | ---: | ---: | ---: |
+| `kvarn-k5v4` tail 2048 | 8.678 | 31.14 | 48.12 |
+| FP16 | 9.269 | 33.10 | 47.99 |
+
+The C8 criterion is **missed**: the aggregate output ratio is 0.936 against the 0.95 floor. Per-request medians: decode 5.553 vs 6.078 t/s (ratio 0.914), whole request 31.14 vs 33.10 t/s; both runs queued ~11 s per request with physical execution width 8. At concurrency 1 the same configuration's decode ratio is 0.985 (T6.3D4), so the deficit appears when eight sessions share the GPU. The user decision on 2026-10-08 accepts this as-is: the task is completed with the miss recorded (no criterion change, no further optimization, no pull request).
+
+(a) `CheckKvarnBatchDecodeSingleVsTwo` (dedicated multi-session suite,
+design D21, `artifacts/test-ledger.jsonl` run `T6.3A`): the 2-session batch
+decode matches the C1 reference for `kvarn-k4v4` and `kvarn-k5v4` at tails
+unset and 2048 (64 continuation steps, boundaries 265 and 2304).
+
 ## Memory occupation
 
 C1, context capacity 262144, AR. Peak memory reported by HIP.

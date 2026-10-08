@@ -104,6 +104,9 @@ The supported modalities are LLM, image, video, and audio (TTS, ASR).
   and `.kvc` disk caches are unchanged. The startup log and `gufo bench` report
   the selected format, the tail length (or none), the effective bpv (body and
   total) and the per-session KV capacity.
+- KVarN with image tokens and M-RoPE positions is unverified (the vision check
+  needs the `mmproj-BF16.gguf` sidecar, design D20 / task 5.4), so image
+  requests should keep the default `fp16` KV.
 
 KVarN is a KV-memory feature and is slower than FP16 KV for long-context
 generation: it passes the shallow floors (AR tg ≥ 0.95× FP16 at depth 0–4K,
@@ -118,7 +121,9 @@ same point at ≥ 0.97× of them):
 | `kvarn-k4v4` | none | 0.996 / 0.925 | 0.986 / 0.922 | 0.949 / 0.890 | 0.843 / 0.826 |
 | `kvarn-k4v4` | 2048 | 0.996 / 0.985 | 0.987 / 0.922 | 0.943 / 0.894 | 0.838 / 0.840 |
 | `kvarn-k5v4` | none | 0.996 / 0.924 | 0.982 / 0.921 | 0.914 / 0.889 | 0.753 / 0.822 |
-| `kvarn-k5v4` | 2048 | 0.996 / 0.985 | 0.984 / 0.921 | 0.910 / 0.894 | 0.752 / 0.835 |
+| `kvarn-k5v4` | 2048 | 0.996 / 0.987\* | 0.984 / 0.924\* | 0.908 / 0.889\* | 0.752 / 0.835 |
+
+\* Main configuration re-measured in the same series on 2026-10-08 (task 6.3, design D23): AR tg / pp2048 ratios against FP16 at d0 0.996/0.987, d4K 0.984/0.924, d32K 0.908/0.889; depth 128K keeps the G1 value. The floors and the reference checks (≥ 0.95 at d0–4K, ≥ 0.97× the G1 point at 32K) pass.
 | `kvarn-k6v5` | none | 0.996 / 0.924 | 0.974 / 0.921 | 0.860 / 0.887 | 0.632 / 0.816 |
 | `kvarn-k6v5` | 2048 | 0.996 / 0.985 | 0.979 / 0.920 | 0.854 / 0.891 | 0.631 / 0.830 |
 

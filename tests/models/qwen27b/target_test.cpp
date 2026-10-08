@@ -852,7 +852,7 @@ void CheckWideCache(Executor& reference) {
       << "context=262144: prefill, scalar and verification logits exact\n";
 }
 
-enum class CheckMode { kAll, kPrefill, kConcurrency, kKvarn };
+enum class CheckMode { kAll, kPrefill, kConcurrency, kKvarn, kKvarnBatch };
 
 std::vector<Case> Capture(const char* path, bool check_replay,
                           CheckMode mode = CheckMode::kAll) {
@@ -872,6 +872,15 @@ std::vector<Case> Capture(const char* path, bool check_replay,
   }
   if (mode == CheckMode::kConcurrency) {
     CheckConcurrencyWidths(*executor);
+    return {};
+  }
+  if (mode == CheckMode::kKvarnBatch) {
+    // Task 6.3(a): the 2-session batch regression alone. The dedicated
+    // multi-session suite (design D21) gates every batching check behind
+    // GUFO_MULTI_SESSION_TESTS, so this mode requires it as well.
+    Expect(gufo::tests::MultiSessionEnabled(),
+           "GUFO_MULTI_SESSION_TESTS must be set for the KVarN batch check");
+    CheckKvarnBatchDecodeSingleVsTwo(executor->GetSharedModel());
     return {};
   }
   if (mode == CheckMode::kKvarn) {
@@ -1081,6 +1090,10 @@ int main(int argc, const char* const* argv) {
     }
     if (argc == 3 && std::string_view(argv[2]) == "--kvarn-only") {
       (void)Capture(model, true, CheckMode::kKvarn);
+      return 0;
+    }
+    if (argc == 3 && std::string_view(argv[2]) == "--kvarn-batch-only") {
+      (void)Capture(model, true, CheckMode::kKvarnBatch);
       return 0;
     }
     // Reference mode measures quantization on fixed histories. Replay,

@@ -42,9 +42,20 @@ The KVarN KV-cache quantization change
 quality gate (G0, design D17). Presets are selected with `--kv-cache` and the
 full-precision tail behind each KVarN query with `--kv-cache-tail`. The fitting
 tails are `kvarn-k4v4` 256 (memory-first) and `kvarn-k6v5` 2048 (quality-first);
-`kvarn-k5v4` fits the memory-first budget with no tail. Sizes are design D5's
-formula at the 262,144-token capacity (16 attention layers, 4 KV heads), where
-the session KV capacity in GiB equals the total bpv. FP16 KV is 16.00 GiB.
+`kvarn-k5v4` fits the memory-first budget with no tail. Depth 128K is **not
+re-judged** in this change: the production-path re-judgment (fresh
+`t08-reduced` windows, design D23) covers depths 4K and 32K, so the 128K
+figures here remain G0 and are provisional, and statistical task evaluation is
+deferred to a follow-up change. The 32K re-judgment rests on the four windows
+that survive the pre-registered teacher-NLL rule (the rule drops four of the
+eight; the spec's six-window target is a documented deviation in
+[quality](QUALITY.md)). KVarN with image tokens
+and M-RoPE positions is **unverified**: the vision check needs the
+`mmproj-BF16.gguf` sidecar, which the measurement host does not have yet
+(design D20, task 5.4), so image requests should keep the default `fp16` KV.
+Sizes are design D5's formula at the 262,144-token capacity (16 attention
+layers, 4 KV heads), where the session KV capacity in GiB equals the total bpv.
+FP16 KV is 16.00 GiB.
 "none" means no tail tokens were added (L = W).
 
 | Preset | Tail | Body bpv | Total bpv | KV/session (GiB) |
@@ -78,7 +89,9 @@ values**: later judgments must keep the same point at ≥ 0.97× of them.
 | `kvarn-k4v4` | none | 0.996 / 0.925 | 0.986 / 0.922 | 0.949 / 0.890 | 0.843 / 0.826 |
 | `kvarn-k4v4` | 2048 | 0.996 / 0.985 | 0.987 / 0.922 | 0.943 / 0.894 | 0.838 / 0.840 |
 | `kvarn-k5v4` | none | 0.996 / 0.924 | 0.982 / 0.921 | 0.914 / 0.889 | 0.753 / 0.822 |
-| `kvarn-k5v4` | 2048 | 0.996 / 0.985 | 0.984 / 0.921 | 0.910 / 0.894 | 0.752 / 0.835 |
+| `kvarn-k5v4` | 2048 | 0.996 / 0.987\* | 0.984 / 0.924\* | 0.908 / 0.889\* | 0.752 / 0.835 |
+
+\* Main configuration re-measured in the same series on 2026-10-08 (task 6.3, design D23): AR tg / pp2048 ratios against FP16 at d0 0.996/0.987, d4K 0.984/0.924, d32K 0.908/0.889; depth 128K keeps the G1 value. The floors and the reference checks (≥ 0.95 at d0–4K, ≥ 0.97× the G1 point at 32K) pass.
 | `kvarn-k6v5` | none | 0.996 / 0.924 | 0.974 / 0.921 | 0.860 / 0.887 | 0.632 / 0.816 |
 | `kvarn-k6v5` | 2048 | 0.996 / 0.985 | 0.979 / 0.920 | 0.854 / 0.891 | 0.631 / 0.830 |
 
@@ -99,8 +112,8 @@ implements the production read path.
 | `kvarn-k4v4` | none | 4K | 0.24927 | 0.000261 | 15.475 | 0.9479 | +0.01343 |
 | `kvarn-k4v4` | none | 32K | 0.35534 | 0.000842 | 19.428 | 0.9277 | +0.09796 |
 | `kvarn-k4v4` | none | 128K | 0.44308 | 0.000368 | 21.991 | 0.9154 | +0.08163 |
-| `kvarn-k4v4` | 256 | 4K | 0.17350 | 0.000148 | 13.607 | 0.9583 | -0.03365 |
-| `kvarn-k4v4` | 256 | 32K | 0.22953 | 0.000456 | 17.052 | 0.9336 | -0.00896 |
+| `kvarn-k4v4` | 256 | 4K\* | 0.02181 | 0.000171 | 1.614 | 0.9834 | -0.00286 |
+| `kvarn-k4v4` | 256 | 32K\* | 0.14711 | 0.000278 | 13.003 | 0.9658 | -0.08478 |
 | `kvarn-k4v4` | 256 | 128K | 0.29218 | 0.000185 | 17.803 | 0.9375 | +0.04018 |
 | `kvarn-k4v4` | 1024 | 4K | 0.09675 | 0.000060 | 10.346 | 0.9727 | -0.00972 |
 | `kvarn-k4v4` | 1024 | 32K | 0.21262 | 0.000211 | 17.179 | 0.9473 | -0.06917 |
@@ -117,8 +130,8 @@ implements the production read path.
 | `kvarn-k5v4` | 1024 | 4K | 0.06006 | 0.000048 | 8.950 | 0.9714 | +0.01540 |
 | `kvarn-k5v4` | 1024 | 32K | 0.14627 | 0.000179 | 15.231 | 0.9512 | +0.02877 |
 | `kvarn-k5v4` | 1024 | 128K | 0.13445 | 0.000068 | 16.345 | 0.9596 | +0.05124 |
-| `kvarn-k5v4` | 2048 | 4K | 0.01522 | 0.000031 | 1.884 | 0.9805 | +0.01889 |
-| `kvarn-k5v4` | 2048 | 32K | 0.19446 | 0.000316 | 17.768 | 0.9453 | -0.05213 |
+| `kvarn-k5v4` | 2048 | 4K\* | 0.00799 | 0.000048 | 2.898 | 0.9907 | +0.00631 |
+| `kvarn-k5v4` | 2048 | 32K\* | 0.06486 | 0.000068 | 12.713 | 0.9746 | +0.03960 |
 | `kvarn-k5v4` | 2048 | 128K | 0.09981 | 0.000049 | 14.053 | 0.9661 | -0.02620 |
 | `kvarn-k5v5` | none | 4K | 0.13607 | 0.000078 | 13.494 | 0.9674 | -0.00943 |
 | `kvarn-k5v5` | none | 32K | 0.26603 | 0.000223 | 22.323 | 0.9512 | +0.06888 |
@@ -141,9 +154,19 @@ implements the production read path.
 | `kvarn-k6v5` | 1024 | 4K | 0.02867 | 0.000025 | 2.966 | 0.9714 | +0.00301 |
 | `kvarn-k6v5` | 1024 | 32K | 0.15900 | 0.000101 | 20.632 | 0.9648 | +0.03745 |
 | `kvarn-k6v5` | 1024 | 128K | 0.09695 | 0.000028 | 14.456 | 0.9661 | +0.03620 |
-| `kvarn-k6v5` | 2048 | 4K | 0.01502 | 0.000023 | 1.645 | 0.9779 | -0.00611 |
-| `kvarn-k6v5` | 2048 | 32K | 0.07043 | 0.000076 | 11.131 | 0.9727 | +0.01227 |
+| `kvarn-k6v5` | 2048 | 4K\* | 0.00389 | 0.000034 | 0.413 | 0.9897 | +0.00618 |
+| `kvarn-k6v5` | 2048 | 32K\* | 0.06358 | 0.000037 | 10.909 | 0.9834 | -0.02267 |
 | `kvarn-k6v5` | 2048 | 128K | 0.10306 | 0.000023 | 14.848 | 0.9661 | +0.06929 |
+
+\* Production read path on the fresh `t08-reduced` windows (eight
+corpora, seeds 11–18; the same 256 positions after each 4K/32K prefix; task 6.1
+under design D23), scored with the q8→q4 positions of design D17 as amended on
+2026-10-08 (D-27): the E_q8/E_q4 ruler comes from the G0 windows above, because
+the baseline implementation was removed with task 3.10. Windows excluded by the
+pre-registered teacher-mean-NLL rule (design D14): corpora 2, 3, 4 and 7 at 32K.
+Rows without the marker, and depth 128K for every preset, are the G0 phase-0
+probe values and have not been re-judged.
+
 
 Gate (design D17): each judged metric (mean KL, median KL, large-deviation rate,
 top-1 disagreement rate) is mapped to its q8→q4 interpolated position p per

@@ -95,35 +95,35 @@ struct KvarnFixture {
     v_tile_bytes = TilePayloadBytes(v_bits);
     sink_plane = static_cast<std::size_t>(kLayers) * kKvHeads *
                  ref::kKvarnSinkRows * kHeadDim;
-    tail_plane = static_cast<std::size_t>(kLayers) * kKvHeads * ring_rows *
-                 kHeadDim;
+    tail_plane =
+        static_cast<std::size_t>(kLayers) * kKvHeads * ring_rows * kHeadDim;
     HIP_CHECK(hipMalloc(&sink, 2 * sink_plane * sizeof(std::uint16_t)));
     HIP_CHECK(hipMalloc(&tail, 2 * tail_plane * sizeof(std::uint16_t)));
     void* body_raw = nullptr;
-    HIP_CHECK(hipMalloc(&body_raw,
-                        static_cast<std::size_t>(kLayers) * kKvHeads *
-                            tile_count * (k_tile_bytes + v_tile_bytes)));
+    HIP_CHECK(hipMalloc(&body_raw, static_cast<std::size_t>(kLayers) *
+                                       kKvHeads * tile_count *
+                                       (k_tile_bytes + v_tile_bytes)));
     body = static_cast<std::uint8_t*>(body_raw);
 
     // Tiles the view rule reads quantized for the query at `context - 1`.
     const std::uint32_t query = context - 1;
     const std::uint32_t quantized_tiles =
         query >= ref::kKvarnSinkRows + tail_rows + 1
-            ? (query - ref::kKvarnSinkRows - tail_rows) /
-                  ref::kKvarnTileTokens
+            ? (query - ref::kKvarnSinkRows - tail_rows) / ref::kKvarnTileTokens
             : 0;
-    const std::uint32_t first_f16 = ref::kKvarnSinkRows +
-                                    ref::kKvarnTileTokens * quantized_tiles;
+    const std::uint32_t first_f16 =
+        ref::kKvarnSinkRows + ref::kKvarnTileTokens * quantized_tiles;
 
-    // F16 sink and the unquantized tail rows; everything the query reads as F16.
+    // F16 sink and the unquantized tail rows; everything the query reads as
+    // F16.
     std::vector<std::uint16_t> sink_host(2 * sink_plane, 0);
     std::vector<std::uint16_t> tail_host(2 * tail_plane, 0);
     const auto write_f16 = [&](std::uint32_t position) {
       for (std::uint32_t head = 0; head < kKvHeads; ++head) {
         for (const bool is_value : {false, true}) {
           for (std::uint32_t c = 0; c < kHeadDim; ++c) {
-            const std::uint16_t encoded =
-                __half_as_ushort(__float2half_rn(KeyValue(position, c, is_value)));
+            const std::uint16_t encoded = __half_as_ushort(
+                __float2half_rn(KeyValue(position, c, is_value)));
             std::size_t offset = 0;
             std::size_t plane = 0;
             if (position < ref::kKvarnSinkRows) {
@@ -147,9 +147,11 @@ struct KvarnFixture {
     for (std::uint32_t position = first_f16; position < context; ++position) {
       write_f16(position);
     }
-    HIP_CHECK(hipMemcpy(sink, sink_host.data(), 2 * sink_plane * sizeof(std::uint16_t),
+    HIP_CHECK(hipMemcpy(sink, sink_host.data(),
+                        2 * sink_plane * sizeof(std::uint16_t),
                         hipMemcpyHostToDevice));
-    HIP_CHECK(hipMemcpy(tail, tail_host.data(), 2 * tail_plane * sizeof(std::uint16_t),
+    HIP_CHECK(hipMemcpy(tail, tail_host.data(),
+                        2 * tail_plane * sizeof(std::uint16_t),
                         hipMemcpyHostToDevice));
 
     // Seal the quantized tiles with the CPU reference encoder.
@@ -158,7 +160,8 @@ struct KvarnFixture {
     for (std::uint32_t head = 0; head < kKvHeads; ++head) {
       for (const bool is_value : {false, true}) {
         for (std::uint32_t t = 0; t < quantized_tiles; ++t) {
-          for (std::uint32_t token = 0; token < ref::kKvarnTileTokens; ++token) {
+          for (std::uint32_t token = 0; token < ref::kKvarnTileTokens;
+               ++token) {
             const std::uint32_t position =
                 ref::kKvarnSinkRows + ref::kKvarnTileTokens * t + token;
             float* row = tile.data() + token * ref::kKvarnTileChannels;
@@ -170,8 +173,8 @@ struct KvarnFixture {
           }
           ref::KvarnTileQuantResult result{};
           ref::KvarnQuantDiagnostics diag{};
-          const auto status = ref::KvarnNormalizeTile(
-              tile, normalized, &result, &diag);
+          const auto status =
+              ref::KvarnNormalizeTile(tile, normalized, &result, &diag);
           if (status != ref::KvarnQuantStatus::kOk) {
             throw std::runtime_error("reference tile normalization failed");
           }
@@ -240,11 +243,11 @@ double KvarnBytes(std::uint8_t k_bits, std::uint8_t v_bits,
                   std::uint32_t tail_tokens, std::uint32_t capacity) {
   const std::uint32_t tail_rows =
       tail_tokens == 0 ? gufo::hip::kQwenKvarnW : tail_tokens;
-  const std::uint32_t ring_rows = tail_rows + ref::kKvarnSinkRows +
-                                  gufo::hip::kQwenKvarnW;
-  const std::size_t tiles = (capacity - ref::kKvarnSinkRows +
-                             ref::kKvarnTileTokens - 1) /
-                            ref::kKvarnTileTokens;
+  const std::uint32_t ring_rows =
+      tail_rows + ref::kKvarnSinkRows + gufo::hip::kQwenKvarnW;
+  const std::size_t tiles =
+      (capacity - ref::kKvarnSinkRows + ref::kKvarnTileTokens - 1) /
+      ref::kKvarnTileTokens;
   const std::size_t heads = static_cast<std::size_t>(kLayers128K) * kKvHeads;
   const std::size_t sink = heads * ref::kKvarnSinkRows * kHeadDim * 2 * 2;
   const std::size_t tail = heads * ring_rows * kHeadDim * 2 * 2;
@@ -341,10 +344,9 @@ int Run() {
       fp16_ms.push_back(time_fp16(context));
       KvarnFixture fixture(context, k_bits, v_bits, tail_tokens);
       kvarn_ms.push_back(TimeMs([&] {
-        gufo::hip::LaunchKvarnDecodeAttention(d_q, d_gate, d_out, 0,
-                                              context - 1, nullptr, 1, kHeads,
-                                              kKvHeads, fixture.read, d_split,
-                                              nullptr);
+        gufo::hip::LaunchKvarnDecodeAttention(
+            d_q, d_gate, d_out, 0, context - 1, nullptr, 1, kHeads, kKvHeads,
+            fixture.read, d_split, nullptr);
       }));
       units.push_back(work);
     }
@@ -363,8 +365,8 @@ int Run() {
         "fp16=%.4f ns/unit (b=%.1f us)\n"
         "  compute_128k_ms=%.2f  fp16_compute_128k_ms=%.2f  "
         "bw_floor_ms=%.2f\n",
-        label, base_context, base_context * 4, kvarn_ns, kvarn_b * 1e3,
-        fp16_ns, fp16_b * 1e3, compute_128k, fp16_compute_128k,
+        label, base_context, base_context * 4, kvarn_ns, kvarn_b * 1e3, fp16_ns,
+        fp16_b * 1e3, compute_128k, fp16_compute_128k,
         kvarn_bytes / kBandwidthGBs / 1e6);
     for (std::size_t i = 0; i < units.size(); ++i) {
       printf("    context=%u kvarn_ms=%.6f fp16_ms=%.6f\n",
@@ -376,8 +378,8 @@ int Run() {
   // Base contexts: 128 sink + 128 token + 2048 fixed rows, scaled by the
   // sweep, so both presets span the same (4x) context range while the KVarN
   // body stays cache-resident.
-  report("kvarn-k4v4-none",
-         ref::kKvarnSinkRows + ref::kKvarnTileTokens + 2048, 4, 4, 0);
+  report("kvarn-k4v4-none", ref::kKvarnSinkRows + ref::kKvarnTileTokens + 2048,
+         4, 4, 0);
   report("kvarn-k6v5-tail2048",
          ref::kKvarnSinkRows + ref::kKvarnTileTokens + 2048, 6, 5, 2048);
 
@@ -390,4 +392,6 @@ int Run() {
 
 }  // namespace
 
-int main() { return Run(); }
+int main() {
+  return Run();
+}

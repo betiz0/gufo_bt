@@ -385,20 +385,23 @@ def gate(table, depths):
     return failures, fitting, records
 
 
-def load_label(args):
-    root = label_dir(args)
+def load_label_at(root: Path):
     manifest = json.loads((root / "manifest.json").read_text())
     if manifest["schema_version"] != SCHEMA_VERSION:
         raise SystemExit(f"{root} has schema {manifest['schema_version']}, "
                          f"expected {SCHEMA_VERSION}")
     results = []
-    for path in unit_files(args):
+    for path in sorted((root / "units").glob("*.json")):
         unit = json.loads(path.read_text())
         assert unit["schema_version"] == SCHEMA_VERSION, path
         results.append(unit)
     if not results:
         raise SystemExit(f"no units under {root / 'units'}")
     return manifest, results
+
+
+def load_label(args):
+    return load_label_at(label_dir(args))
 
 
 def canonical_candidate(name):
@@ -450,12 +453,21 @@ def judged_metrics(cell):
     }
 
 
-def bootstrap_positions(results, max_teacher_nll, resamples, seed):
+def bootstrap_positions(results, max_teacher_nll, resamples, seed,
+                        anchor_results=None):
     """The q8->q4 position p of every judged metric at every depth with a
     window-wise bootstrap 95% interval (design D17 position). The resampling
     unit is the evaluation window (one surviving (corpus, depth) unit),
-    resampled paired across the candidate and both baselines."""
+    resampled paired across the candidate and both baselines.
+
+    `anchor_results` supplies the E_q8/E_q4 windows from another label (design
+    D17 as amended on 2026-10-08: the baselines cannot be measured any more
+    because their implementation was removed, so G0's windows are the fixed
+    ruler). Without it the baselines must be present in `results`, as before.
+    """
     cells = window_cells(results, max_teacher_nll)
+    anchor_cells = (window_cells(anchor_results, max_teacher_nll)
+                    if anchor_results is not None else None)
     rng = random.Random(seed)
     rows = []
     anchors = (("baseline-q8", None), ("baseline-q4", None))
@@ -464,10 +476,16 @@ def bootstrap_positions(results, max_teacher_nll, resamples, seed):
                      key=lambda config: (config[0], tail_key(config[1])))
     for name, tail in configs:
         for depth in sorted({d for _, _, d, _ in cells}):
-            corpora = [c for c in sorted({w for _, _, d, w in cells
-                                          if d == depth})
-                       if all((n, t, depth, c) in cells
-                              for n, t in ((name, tail),) + anchors)]
+            pairs = (name, tail), *anchors
+            if anchor_cells is None:
+                corpora = [c for c in sorted({w for _, _, d, w in cells
+                                              if d == depth})
+                           if all((n, t, depth, c) in cells
+                                  for n, t in pairs)]
+            else:
+                corpora = [c for c in sorted({w for _, _, d, w in cells
+                                              if d == depth})
+                           if (name, tail, depth, c) in cells]
             if not corpora:
                 continue
 
@@ -475,14 +493,41 @@ def bootstrap_positions(results, max_teacher_nll, resamples, seed):
                 return merged_cells([cells[(n, t, depth, corpora[p])]
                                      for p in picks])
 
+            def anchor_metrics(draw):
+                """E_q8 and E_q4 on the ruler's windows, resampled
+                independently so the interval carries the ruler's own window
+                noise too."""
+                windows = sorted({w for _, _, d, w in anchor_cells
+                                  if d == depth})
+                if not windows:
+                    return None
+                chosen = (windows if draw == 0 else
+                          [windows[rng.randrange(len(windows))]
+                           for _ in windows])
+                out = []
+                for n, t in anchors:
+                    parts = [anchor_cells[(n, t, depth, w)]
+                             for w in chosen
+                             if (n, t, depth, w) in anchor_cells]
+                    if not parts:
+                        return None
+                    out.append(judged_metrics(merged_cells(parts)))
+                return out
+
             point = {}
             draws = {label: [] for label, _ in GATE_METRICS}
             for draw in range(resamples + 1):
                 picks = (list(range(len(corpora))) if draw == 0 else
                          [rng.randrange(len(corpora)) for _ in corpora])
                 candidate = judged_metrics(pooled(name, tail, picks))
-                eq8 = judged_metrics(pooled(*anchors[0], picks))
-                eq4 = judged_metrics(pooled(*anchors[1], picks))
+                if anchor_cells is None:
+                    eq8 = judged_metrics(pooled(*anchors[0], picks))
+                    eq4 = judged_metrics(pooled(*anchors[1], picks))
+                else:
+                    ruler = anchor_metrics(draw)
+                    if ruler is None:
+                        continue
+                    eq8, eq4 = ruler
                 for label, key in GATE_METRICS:
                     denominator = eq4[key] - eq8[key]
                     if denominator <= 0:
@@ -514,12 +559,33 @@ def cmd_report(args):
     table, excluded = summarize(results, args.max_teacher_nll)
     table = {(canonical_candidate(name), tail, depth): m
              for (name, tail, depth), m in table.items()}
+    # Judge only the depths this label measured: the anchor label may carry
+    # extra depths whose candidate cells are absent here.
+    depths = sorted({depth for _, _, depth in table})
+    anchor_results = None
+    if args.anchors_label:
+        anchor_out = Path(args.anchors_out or args.out)
+        anchor_root = anchor_out / args.anchors_label
+        if anchor_root.resolve() != label_dir(args).resolve():
+            _, anchor_results = load_label_at(anchor_root)
+        if anchor_results is not None:
+            anchor_table, _ = summarize(anchor_results, args.max_teacher_nll)
+            injected = 0
+            for (name, tail, depth), cell in anchor_table.items():
+                if canonical_candidate(name) not in ("baseline-q8",
+                                                     "baseline-q4"):
+                    continue
+                if (name, tail, depth) not in table:
+                    table[(name, tail, depth)] = cell
+                    injected += 1
+            print(f"ruler: {len(anchor_results)} baseline units from "
+                  f"{anchor_root} (design D17 as amended 2026-10-08; "
+                  f"{injected} anchor cells injected)")
     for w in excluded:
         print(f"excluded corpus {w['corpus']} depth {w['depth']}: teacher mean "
               f"NLL {w['teacher_mean_nll']:.1f} > {args.max_teacher_nll}")
     memory = {(canonical_candidate(f["kv_cache"]), f["tail"]): f
               for f in manifest["memory"]["formats"]}
-    depths = sorted({d for _, _, d in table})
     print(f"{'kv-cache':20s} {'tail':>5s} {'depth':>7s} {'meanKL':>9s} "
           f"{'medKL':>9s} {'p99.9KL':>9s} {'top1':>7s} {'ldr':>7s} {'dNLL':>8s} "
           f"{'nonfin':>6s} {'totbpv':>7s} {'GiB':>6s}")
@@ -535,7 +601,8 @@ def cmd_report(args):
               f"{mem.get('session_kv_gib', float('nan')):6.2f}")
     failures, fitting, positions = gate(table, depths)
     intervals = bootstrap_positions(results, args.max_teacher_nll,
-                                    args.bootstrap, args.bootstrap_seed)
+                                    args.bootstrap, args.bootstrap_seed,
+                                    anchor_results=anchor_results)
     print(f"\np (q8->q4 position) with window bootstrap 95% CI "
           f"({args.bootstrap} resamples, seed {args.bootstrap_seed}; the gate "
           f"budgets judge the pooled p)")
@@ -565,6 +632,13 @@ def cmd_report(args):
         "g0_failures": failures,
         "gate": positions,
         "p_intervals": intervals,
+        "ruler": ({"label": args.anchors_label,
+                   "out": str(Path(args.anchors_out or args.out)),
+                   "units": len(anchor_results),
+                   "note": "E_q8/E_q4 windows from another label (design D17 "
+                           "as amended 2026-10-08: the baseline "
+                           "implementation was removed with task 3.10)"}
+                  if anchor_results is not None else None),
         "cells": [{"kv_cache": name, "tail": tail, "depth": depth, **m}
                   for (name, tail, depth), m in sorted(
                       table.items(),
@@ -621,6 +695,12 @@ def main():
                         default=BOOTSTRAP_RESAMPLES,
                         help="window bootstrap resamples for the p intervals")
     report.add_argument("--bootstrap-seed", type=int, default=BOOTSTRAP_SEED)
+    report.add_argument("--anchors-label", default="",
+                        help="label whose baseline-q8/baseline-q4 units are the "
+                             "fixed p ruler when this label has none (design "
+                             "D17 as amended 2026-10-08)")
+    report.add_argument("--anchors-out", default=None,
+                        help="directory of --anchors-label (default: --out)")
     common(report)
     report.set_defaults(func=cmd_report)
     args = parser.parse_args()

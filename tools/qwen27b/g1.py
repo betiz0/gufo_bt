@@ -319,6 +319,14 @@ def cmd_run(args) -> int:
     if not model.is_file():
         raise SystemExit(f"missing model: {model}")
     depths = parse_depths(args.depths)
+    configs = KVarN_CONFIGS
+    if getattr(args, "configs", ""):
+        wanted = [tag.strip() for tag in args.configs.split(",") if tag.strip()]
+        unknown = [tag for tag in wanted if tag not in CANDIDATES]
+        if unknown:
+            raise SystemExit(f"unknown --configs tag(s): {', '.join(unknown)} "
+                             f"(known: {', '.join(CANDIDATES)})")
+        configs = tuple(c for c in KVarN_CONFIGS if c[0] in wanted)
 
     if not args.foreground:
         # D16: start detached with a completion marker; the same command
@@ -333,6 +341,8 @@ def cmd_run(args) -> int:
                    ",".join(str(d) for d in depths), "--timeout", str(args.timeout)]
         if getattr(args, "extra_args", ""):
             command += ["--extra-args", args.extra_args]
+        if getattr(args, "configs", ""):
+            command += ["--configs", args.configs]
         # The child appends its own progress to run.log, so its stdout goes to a
         # separate driver log (tracebacks included) to avoid duplicating lines.
         script = (f"{shlex.join(command)} >> {shlex.quote(str(driver_path))} 2>&1; "
@@ -352,7 +362,7 @@ def cmd_run(args) -> int:
                                       encoding="utf-8")
         log_line(log_path, f"g1 sweep: model={model} sha256={identity['sha256']} "
                            f"binary={binary}")
-    jobs = (len(FP16_TAGS) + len(KVarN_CONFIGS)) * len(depths)
+    jobs = (len(FP16_TAGS) + len(configs)) * len(depths)
     log_line(log_path, f"jobs={jobs} depths={' '.join(str(d) for d in depths)} "
                        f"start={time.strftime('%Y-%m-%dT%H:%M:%S%z')}")
     # FP16 brackets each depth's candidates so the denominator comes from the
@@ -360,7 +370,7 @@ def cmd_run(args) -> int:
     for depth in depths:
         run_one(out, log_path, binary, model, "fp16", "fp16", None, depth,
                 args.timeout)
-        for tag, kv_cache, tail in KVarN_CONFIGS:
+        for tag, kv_cache, tail in configs:
             run_one(out, log_path, binary, model, tag, kv_cache, tail, depth,
                     args.timeout)
         run_one(out, log_path, binary, model, "fp16b", "fp16", None, depth,
@@ -578,6 +588,10 @@ def main() -> int:
                      help="extra arguments appended to every gufo bench call "
                           "(for example \"--speculative dflash2 "
                           "--dflash-model /path\")")
+    run.add_argument("--configs", default="",
+                     help="comma-separated KVarN sweep tags to measure "
+                          "(default: all of " + ", ".join(CANDIDATES) + "); "
+                          "the FP16 brackets are always measured")
     run.set_defaults(func=cmd_run)
 
     status = sub.add_parser("status")

@@ -61,6 +61,8 @@ constexpr double kSecondsPerHour = 3600.0;
 /// jobs complete.
 constexpr double kAssumedSecondsPerWindowPosition = 0.125;
 constexpr double kAssumedSecondsPerPrefixToken = 0.00385;
+/// Decode progress line interval of the D23 progress lines.
+constexpr std::uint32_t kDecodeProgressPositions = 32;
 
 struct Options {
   std::string model;
@@ -234,15 +236,51 @@ struct Window {
   }
 };
 
+/// Sum of the per-(layer, KV head) sealed-tile counters, 0 for FP16/FP32.
+/// Synchronizes the device first (also for FP16/FP32): the line reports work
+/// that has completed, and the executor's non-blocking stream would otherwise
+/// let a chunk's kernels still be pending. Used only for the D23 progress
+/// lines.
+std::uint64_t SealedTileCount(QwenGpuExecutor& executor) {
+  const gufo::hip::KvarnSealState* const state = executor.GetKvarnSealState();
+  (void)hipDeviceSynchronize();
+  if (state == nullptr)
+    return 0;
+  const auto& config = executor.GetConfig();
+  const std::size_t counters =
+      config.FullAttentionLayerCount() * config.num_key_value_heads;
+  std::vector<std::uint32_t> host(counters, 0);
+  if (hipMemcpy(host.data(), state->sealed(), counters * sizeof(std::uint32_t),
+                hipMemcpyDeviceToHost) != hipSuccess) {
+    return 0;
+  }
+  std::uint64_t total = 0;
+  for (const std::uint32_t value : host)
+    total += value;
+  return total;
+}
+
 Window RunWindow(QwenGpuExecutor& executor, std::span<const Token> tokens,
-                 std::uint32_t depth, std::uint32_t window,
-                 std::uint32_t chunk) {
+                 std::uint32_t depth, std::uint32_t window, std::uint32_t chunk,
+                 const std::string& what) {
+  const auto started = Clock::now();
+  const auto elapsed = [&started]() {
+    return std::chrono::duration<double>(Clock::now() - started).count();
+  };
   executor.Reset();
   for (std::uint32_t offset = 0; offset < depth; offset += chunk) {
     const std::uint32_t count = std::min(chunk, depth - offset);
     (void)executor.ForwardPromptBatch(tokens.subspan(offset, count), offset,
                                       false);
+    std::cerr << "prefill " << what << " chunk at " << offset << " (" << count
+              << " tokens) t=" << elapsed()
+              << " s sealed_tiles=" << SealedTileCount(executor) << "\n"
+              << std::flush;
   }
+  std::cerr << "prefill " << what << " done at " << depth
+            << " tokens t=" << elapsed()
+            << " s sealed_tiles=" << SealedTileCount(executor) << "\n"
+            << std::flush;
   Window out;
   out.vocab = executor.GetConfig().vocab_size;
   out.logits.reserve(static_cast<std::size_t>(window) * out.vocab);
@@ -251,7 +289,15 @@ Window RunWindow(QwenGpuExecutor& executor, std::span<const Token> tokens,
     (void)executor.ForwardToken(tokens[position], position, true);
     const auto view = executor.CopyLastLogits();
     out.logits.insert(out.logits.end(), view.begin(), view.end());
+    if ((i + 1) % kDecodeProgressPositions == 0) {
+      std::cerr << "decode " << what << " position " << position << " ("
+                << (i + 1) << "/" << window << ") t=" << elapsed() << " s\n"
+                << std::flush;
+    }
   }
+  std::cerr << "window " << what << " done " << window
+            << " positions t=" << elapsed() << " s\n"
+            << std::flush;
   return out;
 }
 
@@ -560,8 +606,8 @@ int main(int argc, char** argv) {
                                  std::to_string(job->depth);
         const auto& tokens = corpora.tokens[job->corpus];
         const auto started = Clock::now();
-        const Window window =
-            RunWindow(*executor, tokens, job->depth, opt.window, opt.chunk);
+        const Window window = RunWindow(*executor, tokens, job->depth,
+                                        opt.window, opt.chunk, what);
         const double seconds =
             std::chrono::duration<double>(Clock::now() - started).count();
 
@@ -674,7 +720,7 @@ int main(int argc, char** argv) {
              << ",\"nll_diff_mean\":" << nll_diff
              << ",\"non_finite_positions\":" << non_finite
              << ",\"seconds\":" << seconds << ",\"teacher_logits_sha256\":\""
-             << teacher_sha << ",\"kl\":";
+             << teacher_sha << "\",\"kl\":";
         Json(unit, kl);
         unit << ",\"nll_teacher\":";
         Json(unit, nll_teacher);

@@ -65,6 +65,119 @@ FP16: the probe saw no FP16 overflow, and the 167–215 subnormal scales per
 configuration are the ε floor (1e-5 is below FP16's 6.1e-5 normal minimum) and
 zero points, not a dynamic-range shortfall of real data.
 
+**Re-judgment scope (design D23).** The production read path is re-judged on
+fresh windows (`t08-reduced`: eight corpora, seeds 11–18, the same 256
+positions after each 4K/32K prefix) at depths 4K and 32K only. Depth 128K keeps
+the G0 measurement above, which is therefore **provisional**: the quality-first
+preset's limiting metric (the 128K large-deviation rate at p = 0.143) is not
+re-measured here. The q8→q4 positions of the re-judgment use G0's E_q8/E_q4
+windows as a fixed ruler (design D17 as amended on 2026-10-08, D-27), because
+the baseline implementation was removed with task 3.10 and is not restored;
+the window dependence of the baseline statistics therefore remains in those
+positions. Statistical task evaluation (decoding tasks and the long-distance
+reference non-inferiority test with δ/δ_ret/N/N_ret) is deferred to a follow-up
+change; this change records a short 32K long-distance reference check. KVarN
+with image tokens and M-RoPE positions is unverified (task 5.4: the vision
+sidecar is not available on the measurement host), so image requests keep the
+default `fp16` KV.
+The 32K depth has **four surviving windows** (4K has eight): the spec's
+re-judgment scenario asks for six or more per depth, and the difference is
+recorded here as a documented deviation — the pre-registered teacher-mean-NLL
+exclusion (design D14) drops corpora 2, 3, 4 and 7 at 32K, and the judgment
+therefore rests on the 4-window point estimate with its interval beside it.
+
+
+
+### Long-distance reference check (32K, task 6.2)
+
+One 32K context per configuration: 64 invented facts sit after the sink
+(first 128 tokens) and 28,551 tokens before the questions, so the answer
+has to come from sealed tiles. All 64 questions are asked in one request,
+so each configuration prefills the 32K context exactly once (design D23;
+per-question requests re-prefilled it, because the continuation cache only
+reuses stored checkpoints whose prompt matches exactly). Requests use
+`reasoning_effort: low` and the answers are graded by exact match of the
+4-digit code from the numbered answer lines; there is no pass criterion.
+Problem set: `docs/models/qwen3.8-27b/artifacts/longref-32k.json`
+(SHA-256 `2c2dfca1eee530fd…`).
+
+| Configuration | Correct | Empty answers | Questions | Seconds |
+| --- | ---: | ---: | ---: | ---: |
+| `fp16` | 64/64 | 0 | 64 | 492 |
+| `kvarn-k5v4` (tail 2048) | 64/64 | 0 | 64 | 604 |
+| `kvarn-k6v5` (tail 2048) | 64/64 | 0 | 64 | 323 |
+
+Settings: `reasoning_effort: low`, `max_tokens: 160`, temperature 0,
+`cache_prompt: true`, one `serve llm` per configuration on the release
+build (Q8_0, `--sessions 1`, `--context 40960`, continuation cache).
+Calibration: prefix 32081 tokens, facts at
+tokens 2058..3530, distance to the question
+28551 tokens.
+Reproduce:
+
+```sh
+python3 tools/qwen27b/longref_check.py --config kvarn-k5v4 --tail 2048 \
+  --label t62-k5v4-2048 --max-tokens 160 --binary build/release/gufo \
+  --model /home/betiz/models/Qwen3.8-27B-Q8_0.gguf \
+  --output ~/.cache/gufo/longref
+```
+
+### Production-path re-judgment (T-08 reduced, 2026-10-08)
+
+Fresh windows (`t08-reduced`: eight corpora, seeds 11–18) at depths 4K and
+32K, measured through the production read path (`qwen_kvarn_quality_eval`
+with `--kv-cache` / `--kv-cache-tail`). The q8→q4 positions use G0's
+E_q8/E_q4 windows as the fixed ruler (design D17 as amended 2026-10-08,
+D-27). Windows excluded by the pre-registered teacher-mean-NLL rule:
+corpora 2, 3, 4 and 7 at 32K (4K keeps all eight). No non-finite logits.
+
+| Preset | Tail | Depth | Windows | Mean KL | Median KL | P99.9 KL | Top-1 | ΔNLL |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `kvarn-k4v4` | 256 | 4K | 8 | 0.02181 | 0.000171 | 1.614 | 0.9834 | -0.00286 |
+| `kvarn-k4v4` | 256 | 32K | 4 | 0.14711 | 0.000278 | 13.003 | 0.9658 | -0.08478 |
+| `kvarn-k5v4` | 2048 | 4K | 8 | 0.00799 | 0.000048 | 2.898 | 0.9907 | +0.00631 |
+| `kvarn-k5v4` | 2048 | 32K | 4 | 0.06486 | 0.000068 | 12.713 | 0.9746 | +0.03960 |
+| `kvarn-k6v5` | 2048 | 4K | 8 | 0.00389 | 0.000034 | 0.413 | 0.9897 | +0.00618 |
+| `kvarn-k6v5` | 2048 | 32K | 4 | 0.06358 | 0.000037 | 10.909 | 0.9834 | -0.02267 |
+
+| Preset | Tail | Depth | Metric | p | 95% CI |
+| --- | ---: | ---: | --- | ---: | ---: |
+| `kvarn-k4v4` | 256 | 4K | mean KL | +0.004 | [-0.085, 1.351] |
+| `kvarn-k4v4` | 256 | 4K | median KL | +0.255 | [-0.001, 2.298] |
+| `kvarn-k4v4` | 256 | 4K | large-deviation rate | -0.070 | [-0.174, 1.127] |
+| `kvarn-k4v4` | 256 | 4K | top-1 disagreement rate | -0.008 | [-0.301, 1.557] |
+| `kvarn-k4v4` | 256 | 32K | mean KL | +0.246 | [-0.221, 1.504] |
+| `kvarn-k4v4` | 256 | 32K | median KL | +0.107 | [-0.021, 0.514] |
+| `kvarn-k4v4` | 256 | 32K | large-deviation rate | +0.478 | [-0.130, 2.125] |
+| `kvarn-k4v4` | 256 | 32K | top-1 disagreement rate | +0.183 | [-0.306, 0.983] |
+| `kvarn-k5v4` | 2048 | 4K | mean KL | -0.052 | [-0.087, 0.378] |
+| `kvarn-k5v4` | 2048 | 4K | median KL | +0.041 | [-0.032, 0.646] |
+| `kvarn-k5v4` | 2048 | 4K | large-deviation rate | -0.115 | [-0.174, 0.525] |
+| `kvarn-k5v4` | 2048 | 4K | top-1 disagreement rate | -0.184 | [-0.354, 0.725] |
+| `kvarn-k5v4` | 2048 | 32K | mean KL | -0.000 | [-0.243, 0.653] |
+| `kvarn-k5v4` | 2048 | 32K | median KL | -0.003 | [-0.032, 0.051] |
+| `kvarn-k5v4` | 2048 | 32K | large-deviation rate | +0.109 | [-0.167, 0.750] |
+| `kvarn-k5v4` | 2048 | 32K | top-1 disagreement rate | +0.033 | [-0.361, 0.604] |
+| `kvarn-k6v5` | 2048 | 4K | mean KL | -0.068 | [-0.088, 0.145] |
+| `kvarn-k6v5` | 2048 | 4K | median KL | +0.017 | [-0.036, 0.437] |
+| `kvarn-k6v5` | 2048 | 4K | large-deviation rate | -0.145 | [-0.178, 0.225] |
+| `kvarn-k6v5` | 2048 | 4K | top-1 disagreement rate | -0.160 | [-0.350, 0.875] |
+| `kvarn-k6v5` | 2048 | 32K | mean KL | -0.004 | [-0.244, 0.641] |
+| `kvarn-k6v5` | 2048 | 32K | median KL | -0.019 | [-0.036, 0.018] |
+| `kvarn-k6v5` | 2048 | 32K | large-deviation rate | +0.087 | [-0.167, 0.667] |
+| `kvarn-k6v5` | 2048 | 32K | top-1 disagreement rate | -0.117 | [-0.431, 0.400] |
+
+Worst position per preset: `kvarn-k4v4` tail 256 p = +0.478 (32K large-deviation rate; budget ≤ 1, memory-first), `kvarn-k5v4` tail 2048 p = +0.109 (32K large-deviation rate; recorded, no budget), `kvarn-k6v5` tail 2048 p = +0.087 (32K large-deviation rate; budget ≤ 0.15, quality-first). Depth 128K keeps the G0 measurement above (not re-judged).
+
+Artifacts: `~/.cache/gufo/kvarn-quality/t08/t08-reduced/{units,summary.json}`
+(the `ruler` field records the anchor label). Reproduce:
+
+```sh
+python3 tools/qwen27b/kvarn_quality.py report \
+  --out ~/.cache/gufo/kvarn-quality/t08 --label t08-reduced \
+  --anchors-out ~/.cache/gufo/kvarn-quality --anchors-label g0-tail --gate
+```
+
 Reproduce (design D16):
 
 ```sh
