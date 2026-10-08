@@ -107,6 +107,7 @@ G0（`kvarn-k5v4`）各テール長の最悪 p（律速 = 指標・深度）:
 
 - **T3 は停止した**（利用者の判断、2026-10-08「T3停止後待機」）。SIGTERM 後 **11:29:23 に `GPU reset(30) succeeded!`**（4 回目、`device wedged, but recovered through reset`）で復帰し、`rocm-smi --showpids` は **No KFD PIDs**、`gpu_busy_percent=0` を確認。以後は待機（追加テストは行わない）。
 - **注記（記録の欠落）**: T2b と T3 の **OUT レコードは残っていません**。停止に使った `pkill -f "qwen_kvarn_quality_eval.*--label t2|t3"` が、ハーネス（子）だけでなく **ledger の監視プロセスも巻き込んで停止**したためです（IN・PROGRESS・JUDGE は記録済み。T2b は `State: R`・約 2 コア・`gpu_busy_percent=100`、T3 は教師 47.15 s 成功後に候補が未完了）。次回以降は監視プロセスを巻き込まない停止方法（ハーネスの pid を直接指定するなど）が必要です。
+- **udev 監視は機能しています**（手順 2 の要件）: T3 の停止・リセット時に `<run_dir>/udev.log` が DRM カーネルイベントを捕捉しました（`DEVNAME=/dev/dri/card0`, `DEVTYPE=drm_minor`, `SEQNUM=7485`, `MAJOR=226`, `MINOR=0`）。journalctl の抜粋（`GPU reset(30) succeeded!` / `device wedged, but recovered through reset`、11:29:23）と合わせて、次回以降のカーネル観測手段として使えます。
 - 利用者の分岐「T2 と T3 の両方が止まった」に該当 → デバイスのリセット／再起動の要否を報告する段階。
 - **再起動は不要と見る**根拠:
   1. 3 回のウェッジはいずれも amdgpu の自動リセットで復帰している。
