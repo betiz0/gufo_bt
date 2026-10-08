@@ -99,18 +99,45 @@ def git_facts() -> dict:
             "dirty": bool(run("status", "--porcelain"))}
 
 
-def dmesg_amdgpu(lines: int = 40) -> list[str]:
-    """Best-effort kernel log excerpt mentioning amdgpu, newest last."""
-    for command in (["dmesg"], ["journalctl", "-k", "--no-pager"]):
-        try:
-            out = subprocess.run(command, capture_output=True, text=True,
-                                 timeout=60)
-        except Exception:
-            continue
-        if out.returncode == 0 and out.stdout:
-            hits = [l for l in out.stdout.splitlines() if "amdgpu" in l.lower()]
-            return hits[-lines:]
-    return []
+def journalctl_amdgpu(since: str, lines: int = 40) -> list[str]:
+    """amdgpu/drm lines from the kernel log since `since`.
+
+    `dmesg` needs root here (Operation not permitted), so the kernel-log
+    excerpt in the ledger uses journalctl plus the udev monitor output
+    (user decision 2026-10-08, step 2).
+    """
+    try:
+        out = subprocess.run(["journalctl", "-k", "--no-pager", "--since",
+                              since], capture_output=True, text=True,
+                             timeout=90)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if out.returncode != 0:
+        return []
+    hits = [line for line in out.stdout.splitlines()
+            if "amdgpu" in line.lower() or "drm" in line.lower()]
+    return hits[-lines:]
+
+
+def start_udev_monitor(run_dir: Path):
+    """Background `udevadm monitor` for DRM kernel events."""
+    path = run_dir / "udev.log"
+    try:
+        handle = path.open("wb")
+        proc = subprocess.Popen(
+            ["udevadm", "monitor", "--kernel", "--property",
+             "--subsystem-match=drm"], stdout=handle,
+            stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
+    except OSError:
+        return None, None
+    return proc, path
+
+
+def tail_text(path, lines: int = 40) -> str:
+    if not path or not Path(path).is_file():
+        return ""
+    with Path(path).open("r", encoding="utf-8", errors="replace") as handle:
+        return "".join(handle.readlines()[-lines:])
 
 
 def settings_from_pairs(pairs: list[str]) -> dict:
@@ -144,6 +171,8 @@ def monitor(args, run_dir: Path, log_path: Path) -> None:
     os.setsid()
     environment = os.environ.copy()
     started = time.time()
+    start_stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    udev_proc, udev_path = start_udev_monitor(run_dir)
     with log_path.open("wb") as log:
         child = subprocess.Popen(args.command, cwd=str(ROOT), stdout=log,
                                  stderr=subprocess.STDOUT,
@@ -205,8 +234,18 @@ def monitor(args, run_dir: Path, log_path: Path) -> None:
         "log_path": str(log_path), "log_tail": tail,
         "artifacts": artifacts,
     }
-    if code != 0:
-        record["dmesg_amdgpu"] = dmesg_amdgpu()
+    if udev_proc is not None:
+        udev_proc.terminate()
+        try:
+            udev_proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            udev_proc.kill()
+    record["kernel_log_excerpt"] = {
+        "udev_drm_tail": tail_text(udev_path, 40),
+        "journalctl_k_amdgpu": journalctl_amdgpu(start_stamp),
+        "note": "dmesg needs root here; replaced by the udev DRM monitor and "
+                "journalctl (user decision 2026-10-08, step 2)",
+    }
     append(record)
     print(f"OUT {args.id} state={state} exit={code} "
           f"elapsed={ended - started:.0f}s", flush=True)
@@ -274,9 +313,14 @@ def cmd_status(args) -> int:
               f"{out_record['exit_code']} elapsed "
               f"{out_record['elapsed_seconds']}s (delta "
               f"{out_record['estimate_delta_seconds']}s)")
-        if out_record.get("dmesg_amdgpu"):
-            print("  dmesg(amdgpu):")
-            for line in out_record["dmesg_amdgpu"][-5:]:
+        excerpt = out_record.get("kernel_log_excerpt") or {}
+        if excerpt.get("udev_drm_tail"):
+            print("  udev DRM events (tail):")
+            for line in excerpt["udev_drm_tail"].splitlines()[-5:]:
+                print("   ", line)
+        if excerpt.get("journalctl_k_amdgpu"):
+            print("  journalctl -k (amdgpu, tail):")
+            for line in excerpt["journalctl_k_amdgpu"][-5:]:
                 print("   ", line)
         for artifact in out_record.get("artifacts", [])[:6]:
             print(f"  artifact {artifact['path']} "
