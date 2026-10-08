@@ -82,6 +82,29 @@ public:
   [[nodiscard]] bool has_mtp() const noexcept { return has_mtp_; }
   const DeviceLayer& mtp() const noexcept { return mtp_; }
   [[nodiscard]] std::size_t resident_bytes() const noexcept { return bytes_; }
+  /// One tensor uploaded in its stored GGUF encoding, with the device bytes it
+  /// occupies (the stored size plus the per-tensor tail margin).
+  struct UploadedTensor {
+    std::string name;
+    std::size_t stored_bytes;
+    std::size_t device_bytes;
+  };
+  /// Every tensor uploaded as stored (aggregated and decoded tensors are
+  /// reported by decoded_tensors()).
+  [[nodiscard]] const std::vector<UploadedTensor>& uploaded_tensors()
+      const noexcept {
+    return uploaded_;
+  }
+  /// Device bytes of the tensors decoded at load (Q6_K/IQ4_NL/F16 stored as
+  /// F16 or F32), and their names, for the load report and the spec's 1 GiB
+  /// bound on decoded weight memory.
+  [[nodiscard]] std::size_t decoded_bytes() const noexcept {
+    return decoded_bytes_;
+  }
+  [[nodiscard]] const std::vector<std::pair<std::string, std::size_t>>&
+  decoded_tensors() const noexcept {
+    return decoded_;
+  }
   /// Widest K among the BF16/F16 matrices (activation staging for hipBLAS).
   [[nodiscard]] std::size_t max_half_cols() const noexcept {
     return max_half_cols_;
@@ -103,6 +126,9 @@ private:
   bool has_mtp_{false};
   std::vector<void*> allocations_;
   std::size_t bytes_{0};
+  std::size_t decoded_bytes_{0};
+  std::vector<std::pair<std::string, std::size_t>> decoded_;
+  std::vector<UploadedTensor> uploaded_;
   std::size_t max_half_cols_{1};
   std::size_t max_q8_cols_{32};
 };

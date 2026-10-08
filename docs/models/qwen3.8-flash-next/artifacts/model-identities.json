@@ -4,11 +4,17 @@
     "Target UD-Q4_K_XL shard 2 of 4": "3f342f1c1580473f1ee94ddd5b28206e8c07a70fa1a366f59d1d6c922919a6c9",
     "Target UD-Q4_K_XL shard 3 of 4": "56758f40269cad5cd9b0d3d6fbae0f40f6d5be6de49e4ab392dbe83157d9cbd3",
     "Target UD-Q4_K_XL shard 4 of 4": "753bda48b98ba4f1636134a90a967de1b2d3908a236c026e464777342e53510a",
-    "MTP shared Q8_0": "5ff54097406a905cf3a724c709124ceb0e3e10235ee862298969e91c96fa96e6"
+    "MTP shared Q8_0": "5ff54097406a905cf3a724c709124ceb0e3e10235ee862298969e91c96fa96e6",
+    "Agention AP-Q4_K_XL trunk (single file)": "427a7a10dd5a98d77c71be62a89d14e7408fc61a84c6efe889393852282cd3c6",
+    "Swift-1.5 Q4_K_M shard 1 of 3": "994d3e3303eba363662dfc513e5fdb0c9802df141b456e4ad0200888a31b3d94",
+    "Swift-1.5 Q4_K_M shard 2 of 3": "2fcea3b32795ea415a2a58fb6d81829de3d4f195d6d14ab1f62a382765140a80",
+    "Swift-1.5 Q4_K_M shard 3 of 3": "479377e61b50d8542627f99219480f37aeeafa7fcb6cf4f530f56642c60feaa1"
   },
   "sources": {
     "target": "unsloth/Qwen3.8-Flash-Next-GGUF, revision 38bb39ee97821de2c9009abb7e93950eec396e66, UD-Q4_K_XL (four shards)",
-    "mtp": "unsloth/Qwen3.8-Flash-Next-GGUF, same revision, mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf"
+    "mtp": "unsloth/Qwen3.8-Flash-Next-GGUF, same revision, mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf",
+    "ap-q4-k-xl": "agentionai/Signal-3.8-Flash-Next-GGUF, revision eba565bea194b899480ebd8a8ab63d537917004b (main when fetched 2026-09-26), AP-Q4_K_XL/Signal-3.8-Flash-Next-AP-Q4_K_XL.gguf (single file, qwen4exp, 94.2 GiB)",
+    "swift-q4-k-m": "ukisai/Swift-1.5-Qwen3.8-Flash-Next-GGUF, revision 0142554c963a8653912c0c8283f05f13f63653f3, Q4_K_M (three shards, 119,599,029,952 bytes; general.name \"Swift 1.5 Flash Miroslav2.0\"; qwen4exp; 1224 tensors)"
   },
   "benchmarks-2026-09-22": {
     "reference": "llama.cpp b11069 from flake.nix (0.4.1-dev build 11069, commit 68d9053a), ROCm gfx1151",
@@ -35,6 +41,223 @@
       "binarySha256": "66a42853bde76ef09e0574298819559003ef7fa5a9aa55bdbe3c0e4c085a484f"
     },
     "measurement": "One measured sample per point. Concurrency uses the same synthetic pp2048 prompt generator as single-user d0. Every session completes prompt preparation before timed tg128; measured requests reuse the full prefix, allowing at most four final prompt tokens to be evaluated again. Rates sum individual server decode rates. Gufo outputs match independent fresh AR controls. Inference and weights are unchanged."
+  },
+  "histograms": {
+    "swift-q4-k-m": {
+      "general.name": "Swift 1.5 Flash Miroslav2.0",
+      "tensor_count": 1224,
+      "source": "tools/gguf_formats.py --json, 2026-09-29",
+      "formats": {
+        "Q6_K": {
+          "tensors": 91,
+          "bytes": 1514956800
+        },
+        "BF16": {
+          "tensors": 122,
+          "bytes": 60293120
+        },
+        "F32": {
+          "tensors": 460,
+          "bytes": 297602560
+        },
+        "Q5_0": {
+          "tensors": 121,
+          "bytes": 49257640960
+        },
+        "Q4_K": {
+          "tensors": 255,
+          "bytes": 46435368960
+        },
+        "Q8_0": {
+          "tensors": 162,
+          "bytes": 21892300800
+        },
+        "F16": {
+          "tensors": 1,
+          "bytes": 81920
+        },
+        "Q5_K": {
+          "tensors": 12,
+          "bytes": 129761280
+        }
+      },
+      "classes": {
+        "dense": {
+          "tensors": 328,
+          "bytes": 3145328640,
+          "formats": {
+            "Q6_K": 91,
+            "Q4_K": 63,
+            "Q8_0": 138,
+            "Q5_K": 12,
+            "BF16": 24
+          }
+        },
+        "mixer_down_up": {
+          "tensors": 194,
+          "bytes": 406323200,
+          "formats": {
+            "BF16": 2,
+            "Q4_K": 96,
+            "Q5_0": 96
+          }
+        },
+        "f32_only": {
+          "tensors": 388,
+          "bytes": 262213120,
+          "formats": {
+            "F32": 388
+          }
+        },
+        "ple_table": {
+          "tensors": 1,
+          "bytes": 35200168960,
+          "formats": {
+            "Q5_0": 1
+          }
+        },
+        "routed_down": {
+          "tensors": 48,
+          "bytes": 35232153600,
+          "formats": {
+            "Q8_0": 24,
+            "Q5_0": 24
+          }
+        },
+        "routed_gate_up": {
+          "tensors": 96,
+          "bytes": 45298483200,
+          "formats": {
+            "Q4_K": 96
+          }
+        },
+        "mixer_inject": {
+          "tensors": 96,
+          "bytes": 7864320,
+          "formats": {
+            "BF16": 96
+          }
+        },
+        "ssm_gate": {
+          "tensors": 72,
+          "bytes": 35389440,
+          "formats": {
+            "F32": 72
+          }
+        },
+        "ple_conv1d": {
+          "tensors": 1,
+          "bytes": 81920,
+          "formats": {
+            "F16": 1
+          }
+        }
+      }
+    },
+    "ap-q4-k-xl": {
+      "general.name": "Signal 3.8 Flash Next",
+      "tensor_count": 1224,
+      "source": "tools/gguf_formats.py --json, 2026-09-29",
+      "formats": {
+        "Q6_K": {
+          "tensors": 520,
+          "bytes": 3660787200
+        },
+        "IQ4_NL": {
+          "tensors": 51,
+          "bytes": 51453066240
+        },
+        "F32": {
+          "tensors": 388,
+          "bytes": 262213120
+        },
+        "Q8_0": {
+          "tensors": 144,
+          "bytes": 417792000
+        },
+        "Q4_K": {
+          "tensors": 96,
+          "bytes": 45298483200
+        },
+        "F16": {
+          "tensors": 1,
+          "bytes": 81920
+        },
+        "BF16": {
+          "tensors": 24,
+          "bytes": 39321600
+        }
+      },
+      "classes": {
+        "dense": {
+          "tensors": 328,
+          "bytes": 3515136000,
+          "formats": {
+            "Q6_K": 256,
+            "Q8_0": 48,
+            "BF16": 24
+          }
+        },
+        "mixer_down_up": {
+          "tensors": 194,
+          "bytes": 595968000,
+          "formats": {
+            "IQ4_NL": 2,
+            "Q6_K": 96,
+            "Q8_0": 96
+          }
+        },
+        "f32_only": {
+          "tensors": 388,
+          "bytes": 262213120,
+          "formats": {
+            "F32": 388
+          }
+        },
+        "ple_table": {
+          "tensors": 1,
+          "bytes": 28800138240,
+          "formats": {
+            "IQ4_NL": 1
+          }
+        },
+        "routed_down": {
+          "tensors": 48,
+          "bytes": 22649241600,
+          "formats": {
+            "IQ4_NL": 48
+          }
+        },
+        "routed_gate_up": {
+          "tensors": 96,
+          "bytes": 45298483200,
+          "formats": {
+            "Q4_K": 96
+          }
+        },
+        "mixer_inject": {
+          "tensors": 96,
+          "bytes": 3225600,
+          "formats": {
+            "Q6_K": 96
+          }
+        },
+        "ssm_gate": {
+          "tensors": 72,
+          "bytes": 7257600,
+          "formats": {
+            "Q6_K": 72
+          }
+        },
+        "ple_conv1d": {
+          "tensors": 1,
+          "bytes": 81920,
+          "formats": {
+            "F16": 1
+          }
+        }
+      }
+    }
   },
   "benchmarks-attention-tiles": {
     "scope": "Gufo single-user TG refresh only; retained PP and other measurements retain their original provenance.",

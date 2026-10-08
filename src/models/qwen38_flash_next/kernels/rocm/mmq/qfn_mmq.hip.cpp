@@ -193,6 +193,233 @@ extern "C" int qfn_mmq_q8_0_dense(
     return qfn_mmq_dense_impl<GGML_TYPE_Q8_0>("qfn_mmq_q8_0_dense", W, X, out, M, N, K, stream);
 }
 
+extern "C" int qfn_mmq_q6_K_dense(
+        const void * W, const float * X, float * out,
+        int M, int N, int K, hipStream_t stream) {
+    return qfn_mmq_dense_impl<GGML_TYPE_Q6_K>("qfn_mmq_q6_K_dense", W, X, out, M, N, K, stream);
+}
+
+extern "C" int qfn_mmq_iq4_nl_dense(
+        const void * W, const float * X, float * out,
+        int M, int N, int K, hipStream_t stream) {
+    return qfn_mmq_dense_impl<GGML_TYPE_IQ4_NL>("qfn_mmq_iq4_nl_dense", W, X, out, M, N, K, stream);
+}
+
+// The Swift-1.5 Q4_K_M dense formats: Q4_K and Q5_K projections and the
+// Q5_0 up projection of the hyper-connection Mixer.
+extern "C" int qfn_mmq_q4_K_dense(
+        const void * W, const float * X, float * out,
+        int M, int N, int K, hipStream_t stream) {
+    return qfn_mmq_dense_impl<GGML_TYPE_Q4_K>("qfn_mmq_q4_K_dense", W, X, out, M, N, K, stream);
+}
+
+extern "C" int qfn_mmq_q5_K_dense(
+        const void * W, const float * X, float * out,
+        int M, int N, int K, hipStream_t stream) {
+    return qfn_mmq_dense_impl<GGML_TYPE_Q5_K>("qfn_mmq_q5_K_dense", W, X, out, M, N, K, stream);
+}
+
+extern "C" int qfn_mmq_q5_0_dense(
+        const void * W, const float * X, float * out,
+        int M, int N, int K, hipStream_t stream) {
+    return qfn_mmq_dense_impl<GGML_TYPE_Q5_0>("qfn_mmq_q5_0_dense", W, X, out, M, N, K, stream);
+}
+
+// Decode GEMV for the dense Q6_K / IQ4_NL projections: one wave per weight
+// row, the vendored MMVQ dot products over the Q8_1 activation blocks. The
+// tiled MMQ entry above only wins once several tokens share each weight
+// decode; this is the single- and few-token route.
+template<ggml_type type>
+__device__ __forceinline__ float qfn_dense_vec_dot(
+        const void * __restrict__ w, const block_q8_1 * __restrict__ y,
+        int kbx, int iqs) {
+    if constexpr (type == GGML_TYPE_Q6_K) {
+        return vec_dot_q6_K_q8_1(w, y, kbx, iqs);
+    } else if constexpr (type == GGML_TYPE_Q4_K) {
+        return vec_dot_q4_K_q8_1(w, y, kbx, iqs);
+    } else if constexpr (type == GGML_TYPE_Q5_K) {
+        return vec_dot_q5_K_q8_1(w, y, kbx, iqs);
+    } else if constexpr (type == GGML_TYPE_Q5_0) {
+        return vec_dot_q5_0_q8_1(w, y, kbx, iqs);
+    } else {
+        return vec_dot_iq4_nl_q8_1(w, y, kbx, iqs);
+    }
+}
+
+template<ggml_type type>
+static constexpr int qfn_dense_vdr() {
+    if constexpr (type == GGML_TYPE_Q6_K) {
+        return VDR_Q6_K_Q8_1_MMVQ;
+    } else if constexpr (type == GGML_TYPE_Q4_K) {
+        return VDR_Q4_K_Q8_1_MMVQ;
+    } else if constexpr (type == GGML_TYPE_Q5_K) {
+        return VDR_Q5_K_Q8_1_MMVQ;
+    } else if constexpr (type == GGML_TYPE_Q5_0) {
+        return VDR_Q5_0_Q8_1_MMVQ;
+    } else {
+        return VDR_IQ4_NL_Q8_1_MMVQ;
+    }
+}
+
+/// Stored bytes of one weight block. Block sizes are constexpr because
+/// ggml_type_size is host-only.
+template<ggml_type type>
+static constexpr std::size_t qfn_dense_block_bytes() {
+    if constexpr (type == GGML_TYPE_Q6_K) {
+        return sizeof(block_q6_K);
+    } else if constexpr (type == GGML_TYPE_Q4_K) {
+        return sizeof(block_q4_K);
+    } else if constexpr (type == GGML_TYPE_Q5_K) {
+        return sizeof(block_q5_K);
+    } else if constexpr (type == GGML_TYPE_Q5_0) {
+        return sizeof(block_q5_0);
+    } else {
+        return sizeof(block_iq4_nl);
+    }
+}
+
+template<ggml_type type, int tokens>
+__launch_bounds__(32) __global__ static void qfn_dense_mmvq_kernel(
+        const void * __restrict__ weights,
+        const block_q8_1 * __restrict__ input, float * __restrict__ output,
+        int k, int rows, int input_stride) {
+    constexpr int qk = ggml_hip_type_traits<type>::qk;
+    constexpr int qi = ggml_hip_type_traits<type>::qi;
+    constexpr int vdr = qfn_dense_vdr<type>();
+    constexpr int blocks_per_iter = vdr * 32 / qi;
+    // Block sizes are constexpr; ggml_type_size is host-only.
+    constexpr size_t block_bytes = qfn_dense_block_bytes<type>();
+    const int lane = threadIdx.x;
+    const int blocks_per_row = k / qk;
+    const auto * row = static_cast<const char *>(weights) +
+                       (size_t)blockIdx.x * blocks_per_row * block_bytes;
+    float sum[tokens] = {};
+    for (int kbx = lane / (qi / vdr); kbx < blocks_per_row;
+         kbx += blocks_per_iter) {
+        const int kby = kbx * (qk / QK8_1);
+        const int kqs = vdr * (lane % (qi / vdr));
+#pragma unroll
+        for (int t = 0; t < tokens; ++t) {
+            sum[t] += qfn_dense_vec_dot<type>(
+                row, input + t * input_stride + kby, kbx, kqs);
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < tokens; ++t) {
+        sum[t] = warp_reduce_sum<32>(sum[t]);
+        if (lane == 0) {
+            output[t * rows + blockIdx.x] =
+                isfinite(sum[t]) ? sum[t] : 0.0f;
+        }
+    }
+}
+
+template<ggml_type type, int tokens = 1>
+static void launch_dense_mmvq(const void * weights,
+                              const block_q8_1 * input, float * output, int k,
+                              int rows, int n_tokens, int input_stride,
+                              hipStream_t stream) {
+    if (n_tokens == tokens) {
+        qfn_dense_mmvq_kernel<type, tokens><<<rows, 32, 0, stream>>>(
+            weights, input, output, k, rows, input_stride);
+    } else if constexpr (tokens < MMVQ_MAX_BATCH_SIZE) {
+        launch_dense_mmvq<type, tokens + 1>(weights, input, output, k, rows,
+                                            n_tokens, input_stride, stream);
+    }
+}
+
+static int dense_vector_projection(const char * tag, ggml_type type,
+                                   const void * W, const void * X_q8,
+                                   float * out, int M, int N, int K,
+                                   hipStream_t stream) {
+    if (!W || !X_q8 || !out) {
+        fprintf(stderr, "%s: null pointer\n", tag);
+        return -1;
+    }
+    if (M <= 0 || N <= 0 || K <= 0) {
+        fprintf(stderr, "%s: bad shape M=%d N=%d K=%d\n", tag, M, N, K);
+        return -1;
+    }
+    if (K % ggml_blck_size(type) != 0) {
+        fprintf(stderr, "%s: K=%d is not a whole weight block\n", tag, K);
+        return -1;
+    }
+    if (N > MMVQ_MAX_BATCH_SIZE) {
+        fprintf(stderr, "%s: N=%d exceeds the %d-token decode width\n", tag, N,
+                MMVQ_MAX_BATCH_SIZE);
+        return -1;
+    }
+    const int input_stride = GGML_PAD(K, MATRIX_ROW_PADDING) / QK8_1;
+    const auto * input = static_cast<const block_q8_1 *>(X_q8);
+    switch (type) {
+        case GGML_TYPE_Q4_K:
+            launch_dense_mmvq<GGML_TYPE_Q4_K>(W, input, out, K, M, N,
+                                              input_stride, stream);
+            break;
+        case GGML_TYPE_Q5_K:
+            launch_dense_mmvq<GGML_TYPE_Q5_K>(W, input, out, K, M, N,
+                                              input_stride, stream);
+            break;
+        case GGML_TYPE_Q5_0:
+            launch_dense_mmvq<GGML_TYPE_Q5_0>(W, input, out, K, M, N,
+                                              input_stride, stream);
+            break;
+        case GGML_TYPE_Q6_K:
+            launch_dense_mmvq<GGML_TYPE_Q6_K>(W, input, out, K, M, N,
+                                              input_stride, stream);
+            break;
+        case GGML_TYPE_IQ4_NL:
+            launch_dense_mmvq<GGML_TYPE_IQ4_NL>(W, input, out, K, M, N,
+                                                input_stride, stream);
+            break;
+        default:
+            fprintf(stderr, "%s: unsupported weight type %d\n", tag,
+                    static_cast<int>(type));
+            return -1;
+    }
+    return hipGetLastError() == hipSuccess ? 0 : -3;
+}
+
+extern "C" int qfn_mmq_q6_K_dense_vec_preq(
+        const void * W, const void * X_q8, float * out,
+        int M, int N, int K, hipStream_t stream) {
+    return dense_vector_projection("qfn_mmq_q6_K_dense_vec_preq",
+                                   GGML_TYPE_Q6_K, W, X_q8, out, M, N, K,
+                                   stream);
+}
+
+extern "C" int qfn_mmq_iq4_nl_dense_vec_preq(
+        const void * W, const void * X_q8, float * out,
+        int M, int N, int K, hipStream_t stream) {
+    return dense_vector_projection("qfn_mmq_iq4_nl_dense_vec_preq",
+                                   GGML_TYPE_IQ4_NL, W, X_q8, out, M, N, K,
+                                   stream);
+}
+
+extern "C" int qfn_mmq_q4_K_dense_vec_preq(
+        const void * W, const void * X_q8, float * out,
+        int M, int N, int K, hipStream_t stream) {
+    return dense_vector_projection("qfn_mmq_q4_K_dense_vec_preq",
+                                   GGML_TYPE_Q4_K, W, X_q8, out, M, N, K,
+                                   stream);
+}
+
+extern "C" int qfn_mmq_q5_K_dense_vec_preq(
+        const void * W, const void * X_q8, float * out,
+        int M, int N, int K, hipStream_t stream) {
+    return dense_vector_projection("qfn_mmq_q5_K_dense_vec_preq",
+                                   GGML_TYPE_Q5_K, W, X_q8, out, M, N, K,
+                                   stream);
+}
+
+extern "C" int qfn_mmq_q5_0_dense_vec_preq(
+        const void * W, const void * X_q8, float * out,
+        int M, int N, int K, hipStream_t stream) {
+    return dense_vector_projection("qfn_mmq_q5_0_dense_vec_preq",
+                                   GGML_TYPE_Q5_0, W, X_q8, out, M, N, K,
+                                   stream);
+}
+
 template <ggml_type type>
 int qfn_mmq_moe_impl(
         const char    * tag,
@@ -356,8 +583,11 @@ static int moe_vector_projection(int weight_type, const void* W,
                                  float* out_b, bool gated) {
   constexpr const char* tag = "qfn_mmq_moe_vec";
   const auto type = static_cast<ggml_type>(weight_type);
+  // IQ4_NL and Q5_0 are admitted for the routed down projection only, which
+  // is the one ungated projection the AP and Swift tiers store in them.
   if (type != GGML_TYPE_Q4_K && type != GGML_TYPE_Q5_K &&
-      type != GGML_TYPE_Q5_1 && type != GGML_TYPE_Q8_0) {
+      type != GGML_TYPE_Q5_1 && type != GGML_TYPE_Q5_0 &&
+      type != GGML_TYPE_Q8_0 && type != GGML_TYPE_IQ4_NL) {
     fprintf(stderr, "%s: unsupported weight type %d\n", tag, weight_type);
     return -1;
   }
@@ -522,6 +752,24 @@ extern "C" int qfn_mmq_q5_K_moe_raw(
                                             nullptr, nullptr);
 }
 
+extern "C" int qfn_mmq_iq4_nl_moe_raw(
+        const void * W, const float * X, const int32_t * ids, float * out,
+        int M, int K, int n_tokens, int n_experts, int n_expert_used,
+        hipStream_t stream) {
+    return qfn_mmq_moe_impl<GGML_TYPE_IQ4_NL>("qfn_mmq_iq4_nl_moe_raw", W, X, ids, out,
+                                              M, K, n_tokens, n_experts, n_expert_used,
+                                              stream, nullptr, nullptr);
+}
+
+extern "C" int qfn_mmq_q5_0_moe_raw(
+        const void * W, const float * X, const int32_t * ids, float * out,
+        int M, int K, int n_tokens, int n_experts, int n_expert_used,
+        hipStream_t stream) {
+    return qfn_mmq_moe_impl<GGML_TYPE_Q5_0>("qfn_mmq_q5_0_moe_raw", W, X, ids, out,
+                                            M, K, n_tokens, n_experts, n_expert_used,
+                                            stream, nullptr, nullptr);
+}
+
 extern "C" int qfn_mmq_q4_K_moe_pair_unique(
     const void * W_a, const void * W_b, const float * X, const int32_t * ids,
     float * out_a, float * out_b, int M, int K, int n_tokens, int n_experts,
@@ -663,5 +911,11 @@ template void mul_mat_q_case<GGML_TYPE_Q4_K>(
 template void mul_mat_q_case<GGML_TYPE_Q5_1>(
     ggml_backend_hip_context&, const mmq_args&, hipStream_t);
 template void mul_mat_q_case<GGML_TYPE_Q5_K>(
+    ggml_backend_hip_context&, const mmq_args&, hipStream_t);
+template void mul_mat_q_case<GGML_TYPE_Q6_K>(
+    ggml_backend_hip_context&, const mmq_args&, hipStream_t);
+template void mul_mat_q_case<GGML_TYPE_IQ4_NL>(
+    ggml_backend_hip_context&, const mmq_args&, hipStream_t);
+template void mul_mat_q_case<GGML_TYPE_Q5_0>(
     ggml_backend_hip_context&, const mmq_args&, hipStream_t);
 } // namespace qfn_mmq

@@ -1,3 +1,9 @@
+// Dense projection operator checks for Qwen3.8-Flash-Next: the Q8_0 W8A8 and
+// F16 routes against MMQ and an FP64 reference, the mixed-quant decode paths,
+// and the AP trunk's dense formats, Q6_K and the Swift-1.5 Q4_K/Q5_K mix (the
+// MMQ prefill entry and the decode GEMV over pre-quantized activations at
+// their production shapes).
+
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
@@ -14,8 +20,10 @@
 
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/mmq/qfn_mmq.h"
+#include "tests/models/qwen38_flash_next/quant_fixture.hpp"
 
 namespace q = gufo::models::qwen38_flash_next::rocm;
+namespace fixture = gufo::models::qwen38_flash_next::fixture;
 namespace {
 
 void CheckHip(hipError_t error, const char* operation) {
@@ -827,6 +835,342 @@ void CheckMtpOutputHead(float input_scale) {
     CheckHip(hipFree(p), "MTP free");
 }
 
+/// One dense shape of the AP trunk in Q6_K: the MMQ prefill entry and the
+/// decode GEMV over pre-quantized activations against the FP64 reference over
+/// the dequantized rows, plus the observed per-shape time next to the Q8_0
+/// W8A8 route at the same batch (recorded in EXPERIMENTS.md).
+void CheckQ6KDense(std::size_t m, std::size_t k, std::size_t batch,
+                   std::uint32_t seed, std::size_t reference_rows,
+                   std::size_t reference_tokens) {
+  const auto w = fixture::MakeQ6Weights(m, k, seed, false);
+  const auto x = fixture::MakeIntegerActivations(batch, k, seed ^ 0x5A5AU);
+  void* d_q6 = nullptr;
+  float* d_x = nullptr;
+  float* d_y = nullptr;
+  void* d_q8 = nullptr;
+  void* d_tiled = nullptr;
+  CheckHip(hipMalloc(&d_q6, w.bytes.size() + 4096), "Q6_K weights");
+  CheckHip(hipMalloc(&d_x, x.size() * sizeof(float)), "Q6_K input");
+  CheckHip(hipMalloc(&d_y, batch * m * sizeof(float)), "Q6_K output");
+  CheckHip(hipMalloc(&d_tiled, q::Q8TiledBytes(batch, k)), "Q6_K tiled input");
+  CheckHip(
+      hipMemcpy(d_q6, w.bytes.data(), w.bytes.size(), hipMemcpyHostToDevice),
+      "Q6_K upload");
+  CheckHip(
+      hipMemcpy(d_x, x.data(), x.size() * sizeof(float), hipMemcpyHostToDevice),
+      "Q6_K upload");
+
+  // Prefill MMQ: the tiled arithmetic the executor uses for any batch width.
+  if (qfn_mmq_q6_K_dense(d_q6, d_x, d_y, static_cast<int>(m),
+                         static_cast<int>(batch), static_cast<int>(k),
+                         nullptr) != 0) {
+    throw std::runtime_error("Q6_K MMQ dense failed");
+  }
+  CheckHip(hipDeviceSynchronize(), "Q6_K MMQ");
+  std::vector<float> out(batch * m);
+  CheckHip(hipMemcpy(out.data(), d_y, out.size() * sizeof(float),
+                     hipMemcpyDeviceToHost),
+           "Q6_K download");
+  double scale = 0.0;
+  const std::size_t rows = std::min(reference_rows, m);
+  const std::size_t tokens = std::min(reference_tokens, batch);
+  for (std::size_t sample = 0; sample < rows; ++sample) {
+    const std::size_t row = rows > 1 ? sample * (m - 1) / (rows - 1) : 0;
+    const auto values =
+        fixture::DequantizeRow(w, row, k, gufo::core::GgmlType::kQ6_K);
+    for (std::size_t t = 0; t < tokens; ++t) {
+      const std::size_t token = tokens > 1 ? t * (batch - 1) / (tokens - 1) : 0;
+      double expected = 0.0;
+      double magnitude = 0.0;
+      for (std::size_t i = 0; i < k; ++i) {
+        const double product =
+            values[i] * static_cast<double>(x[token * k + i]);
+        expected += product;
+        magnitude += std::abs(product);
+      }
+      scale = std::max(scale, magnitude);
+      const double actual = out[token * m + row];
+      if (!std::isfinite(actual) ||
+          std::abs(actual - expected) > 5e-3 * std::max(scale, 1e-3)) {
+        throw std::runtime_error("Q6_K MMQ row " + std::to_string(row) +
+                                 " token " + std::to_string(token) +
+                                 " differs: actual=" + std::to_string(actual) +
+                                 " expected=" + std::to_string(expected));
+      }
+    }
+  }
+
+  // Decode GEMV over activations quantized the way the executor prepares them.
+  const std::size_t q8_bytes = qfn_mmq_q8_1_bytes(2, static_cast<int>(k));
+  CheckHip(hipMalloc(&d_q8, q8_bytes), "Q6_K q8 input");
+  if (qfn_mmq_quantize_q8_1(d_x, d_q8, 2, static_cast<int>(k), nullptr) != 0) {
+    throw std::runtime_error("Q6_K activation quantization failed");
+  }
+  if (qfn_mmq_q6_K_dense_vec_preq(d_q6, d_q8, d_y, static_cast<int>(m), 2,
+                                  static_cast<int>(k), nullptr) != 0) {
+    throw std::runtime_error("Q6_K decode GEMV failed");
+  }
+  CheckHip(hipDeviceSynchronize(), "Q6_K GEMV");
+  CheckHip(
+      hipMemcpy(out.data(), d_y, 2 * m * sizeof(float), hipMemcpyDeviceToHost),
+      "Q6_K download");
+  for (std::size_t sample = 0; sample < rows; ++sample) {
+    const std::size_t row = rows > 1 ? sample * (m - 1) / (rows - 1) : 0;
+    const auto values =
+        fixture::DequantizeRow(w, row, k, gufo::core::GgmlType::kQ6_K);
+    for (const std::size_t token : {std::size_t{0}, std::size_t{1}}) {
+      double expected = 0.0, magnitude = 0.0;
+      for (std::size_t i = 0; i < k; ++i) {
+        const double product =
+            values[i] * static_cast<double>(x[token * k + i]);
+        expected += product;
+        magnitude += std::abs(product);
+      }
+      scale = std::max(scale, magnitude);
+      const double actual = out[token * m + row];
+      if (!std::isfinite(actual) ||
+          std::abs(actual - expected) > 5e-3 * std::max(scale, 1e-3)) {
+        throw std::runtime_error("Q6_K GEMV row " + std::to_string(row) +
+                                 " differs: actual=" + std::to_string(actual) +
+                                 " expected=" + std::to_string(expected));
+      }
+    }
+  }
+
+  // Per-shape timing: the Q6_K MMQ entry against the Q8_0 W8A8 route the Q8_0
+  // weights take at the same batch and shape.
+  const auto w8 = MakeWeights(m, k, seed, false);
+  float* d_w8 = nullptr;
+  float* d_out8 = nullptr;
+  CheckHip(hipMalloc(&d_w8, w8.blocks.size() + 4096), "Q8_0 weights");
+  CheckHip(hipMalloc(&d_out8, batch * m * sizeof(float)), "Q8_0 output");
+  CheckHip(hipMemcpy(d_w8, w8.blocks.data(), w8.blocks.size(),
+                     hipMemcpyHostToDevice),
+           "Q8_0 upload");
+  const auto measure = [](const auto& launch) {
+    hipEvent_t start = nullptr, stop = nullptr;
+    CheckHip(hipEventCreate(&start), "event");
+    CheckHip(hipEventCreate(&stop), "event");
+    constexpr int kIterations = 5;
+    for (int i = 0; i < 2; ++i) {
+      launch();
+    }
+    CheckHip(hipDeviceSynchronize(), "warmup");
+    CheckHip(hipEventRecord(start, nullptr), "event record");
+    for (int i = 0; i < kIterations; ++i) {
+      launch();
+    }
+    CheckHip(hipEventRecord(stop, nullptr), "event record");
+    CheckHip(hipEventSynchronize(stop), "event sync");
+    float ms = 0.0F;
+    CheckHip(hipEventElapsedTime(&ms, start, stop), "event elapsed");
+    CheckHip(hipEventDestroy(start), "event");
+    CheckHip(hipEventDestroy(stop), "event");
+    return ms / kIterations;
+  };
+  const double q6_ms = measure([&] {
+    if (qfn_mmq_q6_K_dense(d_q6, d_x, d_y, static_cast<int>(m),
+                           static_cast<int>(batch), static_cast<int>(k),
+                           nullptr) != 0) {
+      throw std::runtime_error("Q6_K timed MMQ failed");
+    }
+  });
+  const double q8_ms = measure([&] {
+    q::QuantizeQ8Tiled(d_x, d_tiled, batch, k, nullptr);
+    if (!q::W8A8Gemm(d_w8, d_tiled, d_out8, batch, m, k, nullptr)) {
+      throw std::runtime_error("Q8_0 timed W8A8 rejected the shape");
+    }
+  });
+  CheckHip(hipDeviceSynchronize(), "timing");
+  std::cout << "dense " << m << "x" << k << " batch " << batch << ": Q6_K MMQ "
+            << q6_ms << " ms, Q8_0 quantize+W8A8 " << q8_ms << " ms\n";
+  for (void* p :
+       {d_q6, static_cast<void*>(d_x), static_cast<void*>(d_y), d_q8, d_tiled,
+        static_cast<void*>(d_w8), static_cast<void*>(d_out8)}) {
+    CheckHip(hipFree(p), "free");
+  }
+}
+
+/// One dense shape of the Swift-1.5 Q4_K_M trunk in Q4_K or Q5_K: the MMQ
+/// prefill entry and the decode GEMV over pre-quantized activations against
+/// the FP64 reference over the dequantized rows, exactly like the Q6_K cases,
+/// plus the observed per-shape time next to the Q8_0 W8A8 route at the same
+/// batch (recorded in EXPERIMENTS.md).
+void CheckSwiftDense(gufo::core::GgmlType type, std::size_t m, std::size_t k,
+                     std::size_t batch, std::uint32_t seed,
+                     std::size_t reference_rows, std::size_t reference_tokens) {
+  const char* const format =
+      type == gufo::core::GgmlType::kQ4_K ? "Q4_K" : "Q5_K";
+  const auto w = type == gufo::core::GgmlType::kQ4_K
+                     ? fixture::MakeQ4KWeights(m, k, seed, false)
+                     : fixture::MakeQ5KWeights(m, k, seed, false);
+  const auto dense = [&](const void* W, const float* X, float* out,
+                         int tokens) {
+    return type == gufo::core::GgmlType::kQ4_K
+               ? qfn_mmq_q4_K_dense(W, X, out, static_cast<int>(m), tokens,
+                                    static_cast<int>(k), nullptr)
+               : qfn_mmq_q5_K_dense(W, X, out, static_cast<int>(m), tokens,
+                                    static_cast<int>(k), nullptr);
+  };
+  const auto gemv = [&](const void* W, const void* X_q8, float* out,
+                        int tokens) {
+    return type == gufo::core::GgmlType::kQ4_K
+               ? qfn_mmq_q4_K_dense_vec_preq(W, X_q8, out, static_cast<int>(m),
+                                             tokens, static_cast<int>(k),
+                                             nullptr)
+               : qfn_mmq_q5_K_dense_vec_preq(W, X_q8, out, static_cast<int>(m),
+                                             tokens, static_cast<int>(k),
+                                             nullptr);
+  };
+  const auto x = fixture::MakeIntegerActivations(batch, k, seed ^ 0x5A5AU);
+  void* d_q = nullptr;
+  float* d_x = nullptr;
+  float* d_y = nullptr;
+  void* d_q8 = nullptr;
+  void* d_tiled = nullptr;
+  CheckHip(hipMalloc(&d_q, w.bytes.size() + 4096), "Swift dense weights");
+  CheckHip(hipMalloc(&d_x, x.size() * sizeof(float)), "Swift dense input");
+  CheckHip(hipMalloc(&d_y, batch * m * sizeof(float)), "Swift dense output");
+  CheckHip(hipMalloc(&d_tiled, q::Q8TiledBytes(batch, k)),
+           "Swift dense tiled input");
+  CheckHip(
+      hipMemcpy(d_q, w.bytes.data(), w.bytes.size(), hipMemcpyHostToDevice),
+      "Swift dense upload");
+  CheckHip(
+      hipMemcpy(d_x, x.data(), x.size() * sizeof(float), hipMemcpyHostToDevice),
+      "Swift dense upload");
+
+  // Prefill MMQ: the tiled arithmetic the executor uses for any batch width.
+  if (dense(d_q, d_x, d_y, static_cast<int>(batch)) != 0) {
+    throw std::runtime_error(std::string(format) + " MMQ dense failed");
+  }
+  CheckHip(hipDeviceSynchronize(), "Swift dense MMQ");
+  std::vector<float> out(batch * m);
+  CheckHip(hipMemcpy(out.data(), d_y, out.size() * sizeof(float),
+                     hipMemcpyDeviceToHost),
+           "Swift dense download");
+  double scale = 0.0;
+  const std::size_t rows = std::min(reference_rows, m);
+  const std::size_t tokens = std::min(reference_tokens, batch);
+  for (std::size_t sample = 0; sample < rows; ++sample) {
+    const std::size_t row = rows > 1 ? sample * (m - 1) / (rows - 1) : 0;
+    const auto values = fixture::DequantizeRow(w, row, k, type);
+    for (std::size_t t = 0; t < tokens; ++t) {
+      const std::size_t token = tokens > 1 ? t * (batch - 1) / (tokens - 1) : 0;
+      double expected = 0.0;
+      double magnitude = 0.0;
+      for (std::size_t i = 0; i < k; ++i) {
+        const double product =
+            values[i] * static_cast<double>(x[token * k + i]);
+        expected += product;
+        magnitude += std::abs(product);
+      }
+      scale = std::max(scale, magnitude);
+      const double actual = out[token * m + row];
+      if (!std::isfinite(actual) ||
+          std::abs(actual - expected) > 5e-3 * std::max(scale, 1e-3)) {
+        throw std::runtime_error(std::string(format) + " MMQ row " +
+                                 std::to_string(row) + " token " +
+                                 std::to_string(token) +
+                                 " differs: actual=" + std::to_string(actual) +
+                                 " expected=" + std::to_string(expected));
+      }
+    }
+  }
+
+  // Decode GEMV over activations quantized the way the executor prepares
+  // them, at the scalar and two-row decode widths.
+  const std::size_t q8_bytes = qfn_mmq_q8_1_bytes(2, static_cast<int>(k));
+  CheckHip(hipMalloc(&d_q8, q8_bytes), "Swift dense q8 input");
+  if (qfn_mmq_quantize_q8_1(d_x, d_q8, 2, static_cast<int>(k), nullptr) != 0) {
+    throw std::runtime_error(std::string(format) +
+                             " activation quantization failed");
+  }
+  for (const std::size_t decode : {std::size_t{1}, std::size_t{2}}) {
+    if (gemv(d_q, d_q8, d_y, static_cast<int>(decode)) != 0) {
+      throw std::runtime_error(std::string(format) + " decode GEMV failed");
+    }
+    CheckHip(hipDeviceSynchronize(), "Swift dense GEMV");
+    CheckHip(hipMemcpy(out.data(), d_y, decode * m * sizeof(float),
+                       hipMemcpyDeviceToHost),
+             "Swift dense download");
+    for (std::size_t sample = 0; sample < rows; ++sample) {
+      const std::size_t row = rows > 1 ? sample * (m - 1) / (rows - 1) : 0;
+      const auto values = fixture::DequantizeRow(w, row, k, type);
+      for (std::size_t token = 0; token < decode; ++token) {
+        double expected = 0.0, magnitude = 0.0;
+        for (std::size_t i = 0; i < k; ++i) {
+          const double product =
+              values[i] * static_cast<double>(x[token * k + i]);
+          expected += product;
+          magnitude += std::abs(product);
+        }
+        scale = std::max(scale, magnitude);
+        const double actual = out[token * m + row];
+        if (!std::isfinite(actual) ||
+            std::abs(actual - expected) > 5e-3 * std::max(scale, 1e-3)) {
+          throw std::runtime_error(
+              std::string(format) + " GEMV " + std::to_string(decode) +
+              " row " + std::to_string(row) + " differs: actual=" +
+              std::to_string(actual) + " expected=" + std::to_string(expected));
+        }
+      }
+    }
+  }
+
+  // Per-shape timing: the Swift-1.5 MMQ entry against the Q8_0 W8A8 route the
+  // Q8_0 weights take at the same batch and shape.
+  const auto w8 = MakeWeights(m, k, seed, false);
+  float* d_w8 = nullptr;
+  float* d_out8 = nullptr;
+  CheckHip(hipMalloc(&d_w8, w8.blocks.size() + 4096), "Q8_0 weights");
+  CheckHip(hipMalloc(&d_out8, batch * m * sizeof(float)), "Q8_0 output");
+  CheckHip(hipMemcpy(d_w8, w8.blocks.data(), w8.blocks.size(),
+                     hipMemcpyHostToDevice),
+           "Q8_0 upload");
+  const auto measure = [](const auto& launch) {
+    hipEvent_t start = nullptr, stop = nullptr;
+    CheckHip(hipEventCreate(&start), "event");
+    CheckHip(hipEventCreate(&stop), "event");
+    constexpr int kIterations = 5;
+    for (int i = 0; i < 2; ++i) {
+      launch();
+    }
+    CheckHip(hipDeviceSynchronize(), "warmup");
+    CheckHip(hipEventRecord(start, nullptr), "event record");
+    for (int i = 0; i < kIterations; ++i) {
+      launch();
+    }
+    CheckHip(hipEventRecord(stop, nullptr), "event record");
+    CheckHip(hipEventSynchronize(stop), "event sync");
+    float ms = 0.0F;
+    CheckHip(hipEventElapsedTime(&ms, start, stop), "event elapsed");
+    CheckHip(hipEventDestroy(start), "event");
+    CheckHip(hipEventDestroy(stop), "event");
+    return ms / kIterations;
+  };
+  const double dense_ms = measure([&] {
+    if (dense(d_q, d_x, d_y, static_cast<int>(batch)) != 0) {
+      throw std::runtime_error(std::string(format) + " timed MMQ failed");
+    }
+  });
+  const double q8_ms = measure([&] {
+    q::QuantizeQ8Tiled(d_x, d_tiled, batch, k, nullptr);
+    if (!q::W8A8Gemm(d_w8, d_tiled, d_out8, batch, m, k, nullptr)) {
+      throw std::runtime_error("Q8_0 timed W8A8 rejected the shape");
+    }
+  });
+  CheckHip(hipDeviceSynchronize(), "timing");
+  std::cout << "dense " << m << "x" << k << " batch " << batch << ": " << format
+            << " MMQ " << dense_ms << " ms, Q8_0 quantize+W8A8 " << q8_ms
+            << " ms\n";
+  for (void* p :
+       {d_q, static_cast<void*>(d_x), static_cast<void*>(d_y), d_q8, d_tiled,
+        static_cast<void*>(d_w8), static_cast<void*>(d_out8)}) {
+    CheckHip(hipFree(p), "free");
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -860,6 +1204,24 @@ int main() {
     // HC down fusion: its first supported batch and a partial final tile.
     ok = Run(96, 320, 10240, 0x320A96U, 2) < 1e-2 && ok;
     ok = Run(2049, 320, 10240, 0x320A2049U, 2) < 1e-2 && ok;
+    // AP trunk Q6_K dense shapes, with their observed times (EXPERIMENTS.md).
+    CheckQ6KDense(10240, 2560, 2048, 0x10240U, 8, 2);
+    CheckQ6KDense(12288, 2560, 2048, 0x12288U, 8, 2);
+    CheckQ6KDense(2560, 6144, 2048, 0x2560U, 8, 2);
+    CheckQ6KDense(248320, 2560, 64, 0x248320U, 8, 2);
+    // The same AP trunk shapes in the Swift-1.5 Q4_K_M dense formats, plus
+    // Q5_K at the attention-output shape. The vocabulary head samples its
+    // reference rows instead of materializing the FP32 matrix.
+    CheckSwiftDense(gufo::core::GgmlType::kQ4_K, 10240, 2560, 2048, 0x10240U, 8,
+                    2);
+    CheckSwiftDense(gufo::core::GgmlType::kQ4_K, 12288, 2560, 2048, 0x12288U, 8,
+                    2);
+    CheckSwiftDense(gufo::core::GgmlType::kQ4_K, 2560, 6144, 2048, 0x2560U, 8,
+                    2);
+    CheckSwiftDense(gufo::core::GgmlType::kQ4_K, 248320, 2560, 64, 0x248320U, 8,
+                    2);
+    CheckSwiftDense(gufo::core::GgmlType::kQ5_K, 2560, 6144, 2048, 0x2560U, 8,
+                    2);
     return ok ? 0 : 1;
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';

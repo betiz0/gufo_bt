@@ -7,6 +7,7 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <optional>
@@ -136,6 +137,19 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
                                          m->mtp_reader_.get(), error_msg);
   if (!m->device_) {
     return nullptr;
+  }
+  if (m->device_->decoded_bytes() > 0) {
+    // One line per tensor, then the total the spec's 1 GiB bound is checked
+    // against, so the decoded memory can be attributed without a debugger.
+    for (const auto& [name, bytes] : m->device_->decoded_tensors()) {
+      std::fprintf(stderr, "[Model Decode]: %s -> %zu bytes\n", name.c_str(),
+                   bytes);
+    }
+    std::fprintf(stderr,
+                 "[Model Decode]: %zu bytes decoded at load "
+                 "(%zu tensors)\n",
+                 m->device_->decoded_bytes(),
+                 m->device_->decoded_tensors().size());
   }
   rocm::Executor::Options exec;
   exec.max_batch = m->PrefillCapacity();

@@ -192,6 +192,33 @@ Experts MakeQ5_1(std::size_t e, std::size_t m, std::size_t k,
   return w;
 }
 
+/// Random Q5_0 blocks: fp16 scale, 32 high bits and 16 packed low nibbles.
+Experts MakeQ5_0(std::size_t e, std::size_t m, std::size_t k,
+                 std::uint32_t seed) {
+  Experts w;
+  const std::size_t blocks = e * m * (k / 32);
+  w.packed.resize(blocks * 22);
+  w.values.resize(e * m * k);
+  for (std::size_t b = 0; b < blocks; ++b) {
+    std::uint8_t* blk = w.packed.data() + b * 22;
+    const __half d = __float2half(Uniform(&seed, 0.02F) + 0.03F);
+    std::memcpy(blk, &d, sizeof(d));
+    const std::uint32_t qh = NextRandom(&seed);
+    std::memcpy(blk + 2, &qh, sizeof(qh));
+    std::uint8_t* qs = blk + 6;
+    for (int i = 0; i < 16; ++i) {
+      qs[i] = static_cast<std::uint8_t>(NextRandom(&seed) & 0xFF);
+    }
+    const float df = __half2float(d);
+    for (int j = 0; j < 32; ++j) {
+      const int low = j < 16 ? (qs[j] & 0xF) : (qs[j - 16] >> 4);
+      const int code = low | (static_cast<int>((qh >> j) & 1U) << 4);
+      w.values[b * 32 + j] = df * static_cast<float>(code - 16);
+    }
+  }
+  return w;
+}
+
 /// Random Q8_0 blocks: d and 32 signed codes.
 Experts MakeQ8_0(std::size_t e, std::size_t m, std::size_t k,
                  std::uint32_t seed) {
@@ -213,6 +240,34 @@ Experts MakeQ8_0(std::size_t e, std::size_t m, std::size_t k,
   return w;
 }
 
+/// Random IQ4_NL blocks: an fp16 scale and 16 bytes of codebook indices
+/// (low nibbles are elements 0-15, high nibbles 16-31).
+Experts MakeIq4Nl(std::size_t e, std::size_t m, std::size_t k,
+                  std::uint32_t seed) {
+  constexpr std::int8_t kCodebook[16] = {
+      -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+  Experts w;
+  const std::size_t blocks = e * m * (k / 32);
+  w.packed.resize(blocks * 18);
+  w.values.resize(e * m * k);
+  for (std::size_t b = 0; b < blocks; ++b) {
+    std::uint8_t* blk = w.packed.data() + b * 18;
+    const __half d = __float2half(Uniform(&seed, 0.02F) + 0.03F);
+    std::memcpy(blk, &d, 2);
+    const float df = __half2float(d);
+    for (int i = 0; i < 16; ++i) {
+      const std::uint8_t low =
+          static_cast<std::uint8_t>(NextRandom(&seed) & 0xF);
+      const std::uint8_t high =
+          static_cast<std::uint8_t>(NextRandom(&seed) & 0xF);
+      blk[2 + i] = static_cast<std::uint8_t>(low | (high << 4U));
+      w.values[b * 32 + i] = df * static_cast<float>(kCodebook[low]);
+      w.values[b * 32 + 16 + i] = df * static_cast<float>(kCodebook[high]);
+    }
+  }
+  return w;
+}
+
 struct Result {
   double vs_mmq;
   double vs_ref;
@@ -228,10 +283,12 @@ Result Run(q::WeightType type, std::size_t n_tokens, std::size_t used,
            std::size_t experts, std::size_t m, std::size_t k,
            std::uint32_t seed, std::uint32_t tile_rows = 48) {
   const Experts w =
-      type == q::WeightType::kQ4_K   ? MakeQ4K(experts, m, k, seed)
-      : type == q::WeightType::kQ5_K ? MakeQ5K(experts, m, k, seed)
-      : type == q::WeightType::kQ5_1 ? MakeQ5_1(experts, m, k, seed)
-                                     : MakeQ8_0(experts, m, k, seed);
+      type == q::WeightType::kQ4_K     ? MakeQ4K(experts, m, k, seed)
+      : type == q::WeightType::kQ5_K   ? MakeQ5K(experts, m, k, seed)
+      : type == q::WeightType::kQ5_1   ? MakeQ5_1(experts, m, k, seed)
+      : type == q::WeightType::kQ5_0   ? MakeQ5_0(experts, m, k, seed)
+      : type == q::WeightType::kIQ4_NL ? MakeIq4Nl(experts, m, k, seed)
+                                       : MakeQ8_0(experts, m, k, seed);
   const std::size_t slots = n_tokens * used;
   // Skewed top-k without replacement: the low experts see most rows.
   std::vector<std::int32_t> ids(slots);
@@ -274,10 +331,12 @@ Result Run(q::WeightType type, std::size_t n_tokens, std::size_t used,
   std::vector<float> zero_out(slots * m, 0.0F);
   float* d_mmq = Upload(zero_out);
 
-  const auto mmq_raw = type == q::WeightType::kQ4_K   ? qfn_mmq_q4_K_moe_raw
-                       : type == q::WeightType::kQ5_K ? qfn_mmq_q5_K_moe_raw
-                       : type == q::WeightType::kQ5_1 ? qfn_mmq_q5_1_moe_raw
-                                                      : qfn_mmq_q8_0_moe_raw;
+  const auto mmq_raw = type == q::WeightType::kQ4_K     ? qfn_mmq_q4_K_moe_raw
+                       : type == q::WeightType::kQ5_K   ? qfn_mmq_q5_K_moe_raw
+                       : type == q::WeightType::kQ5_1   ? qfn_mmq_q5_1_moe_raw
+                       : type == q::WeightType::kQ5_0   ? qfn_mmq_q5_0_moe_raw
+                       : type == q::WeightType::kIQ4_NL ? qfn_mmq_iq4_nl_moe_raw
+                                                        : qfn_mmq_q8_0_moe_raw;
   const int rc =
       mmq_raw(d_w, d_x, d_ids, d_mmq, static_cast<int>(m), static_cast<int>(k),
               static_cast<int>(n_tokens), static_cast<int>(experts),
@@ -324,8 +383,26 @@ Result Run(q::WeightType type, std::size_t n_tokens, std::size_t used,
                         d_f16_half, m, k, nullptr)) {
     throw std::runtime_error("routed F16 GEMM (F16 out) rejected the shape");
   }
+  // IQ4_NL's and Q5_0's vector routes are the adapter entries the executor
+  // takes for single-token decode; they must agree with the tiled WMMA route
+  // on the same input. `used == 1` is the down projection's slot-row view.
+  float* d_vec = nullptr;
+  std::vector<float> vec;
+  if ((type == q::WeightType::kIQ4_NL || type == q::WeightType::kQ5_0) &&
+      used == 1) {
+    d_vec = Upload(zero_out);
+    if (qfn_mmq_moe_vec(static_cast<int>(type), d_w, d_x, d_ids, d_vec,
+                        static_cast<int>(m), static_cast<int>(k),
+                        static_cast<int>(n_tokens), static_cast<int>(experts),
+                        static_cast<int>(used), nullptr) != 0) {
+      throw std::runtime_error("routed vector route failed");
+    }
+  }
   CheckHip(hipDeviceSynchronize(), "routed GEMMs");
   const auto mmq = Download(d_mmq, slots * m);
+  if (d_vec != nullptr) {
+    vec = Download(d_vec, slots * m);
+  }
   const auto f16 = Download(d_f16, slots * m);
   const auto f16_half = Download(d_f16_half, slots * m);
   if (tile_rows == 64) {
@@ -429,6 +506,8 @@ Result Run(q::WeightType type, std::size_t n_tokens, std::size_t used,
   }
 
   Result r{0.0, 0.0, 0.0, 0.0};
+  double vec_vs_f16 = 0.0;
+  double vec_vs_ref = 0.0;
   for (std::size_t s = 0; s < slots; ++s) {
     const std::size_t t = s / used;
     const std::int32_t e = ids[s];
@@ -448,24 +527,48 @@ Result Run(q::WeightType type, std::size_t n_tokens, std::size_t used,
       r.vs_ref = std::max(r.vs_ref, std::abs(ref - f));
       r.mmq_vs_ref = std::max(r.mmq_vs_ref, std::abs(ref - v));
       r.scale = std::max(r.scale, std::abs(ref));
+      if (!vec.empty()) {
+        const double p = vec[s * m + row];
+        if (!std::isfinite(p)) {
+          throw std::runtime_error("IQ4_NL vector output is not finite");
+        }
+        vec_vs_f16 = std::max(vec_vs_f16, std::abs(p - f));
+        vec_vs_ref = std::max(vec_vs_ref, std::abs(ref - p));
+      }
     }
   }
-  std::cout << (type == q::WeightType::kQ4_K   ? "Q4_K"
-                : type == q::WeightType::kQ5_K ? "Q5_K"
-                : type == q::WeightType::kQ5_1 ? "Q5_1"
-                                               : "Q8_0")
+  if (!vec.empty() &&
+      (vec_vs_f16 > 1e-2 * r.scale || vec_vs_ref > 2e-2 * r.scale)) {
+    throw std::runtime_error(
+        "routed vector route disagrees with the tiled route: |vec - F16| " +
+        std::to_string(vec_vs_f16) + ", |vec - F64| " +
+        std::to_string(vec_vs_ref) + " (scale " + std::to_string(r.scale) +
+        ")");
+  }
+  std::cout << (type == q::WeightType::kQ4_K     ? "Q4_K"
+                : type == q::WeightType::kQ5_K   ? "Q5_K"
+                : type == q::WeightType::kQ5_1   ? "Q5_1"
+                : type == q::WeightType::kQ5_0   ? "Q5_0"
+                : type == q::WeightType::kIQ4_NL ? "IQ4_NL"
+                                                 : "Q8_0")
             << " routed n=" << n_tokens << " used=" << used << " E=" << experts
             << " m=" << m << " k=" << k << ": worst |F16 - MMQ| " << r.vs_mmq
             << ", worst |F16 - F64| " << r.vs_ref << ", worst |MMQ - F64| "
-            << r.mmq_vs_ref << " (scale " << r.scale << ", widest bucket "
-            << max_bucket << ")\n";
-  for (void* p : {static_cast<void*>(d_w), static_cast<void*>(d_x),
-                  static_cast<void*>(d_ids), static_cast<void*>(d_counts),
-                  static_cast<void*>(d_bounds), static_cast<void*>(d_cursors),
-                  static_cast<void*>(d_rows_token),
-                  static_cast<void*>(d_rows_slot), static_cast<void*>(d_mmq),
-                  static_cast<void*>(d_x_half), static_cast<void*>(d_tiles),
-                  static_cast<void*>(d_f16), static_cast<void*>(d_f16_half)}) {
+            << r.mmq_vs_ref;
+  if (!vec.empty()) {
+    std::cout << ", worst |vec - F16| " << vec_vs_f16 << ", worst |vec - F64| "
+              << vec_vs_ref;
+  }
+  std::cout << " (scale " << r.scale << ", widest bucket " << max_bucket
+            << ")\n";
+  for (void* p :
+       {static_cast<void*>(d_w), static_cast<void*>(d_x),
+        static_cast<void*>(d_ids), static_cast<void*>(d_counts),
+        static_cast<void*>(d_bounds), static_cast<void*>(d_cursors),
+        static_cast<void*>(d_rows_token), static_cast<void*>(d_rows_slot),
+        static_cast<void*>(d_mmq), static_cast<void*>(d_x_half),
+        static_cast<void*>(d_tiles), static_cast<void*>(d_f16),
+        static_cast<void*>(d_f16_half), static_cast<void*>(d_vec)}) {
     (void)hipFree(p);
   }
   return r;
@@ -487,7 +590,8 @@ void CheckVectorGrouping(bool down = false) {
   constexpr std::size_t guard = 16;
   constexpr float poison = -1234567.0F;
   const std::vector<q::WeightType> formats =
-      down ? std::vector{q::WeightType::kQ5_1, q::WeightType::kQ8_0}
+      down ? std::vector{q::WeightType::kQ5_1, q::WeightType::kQ5_0,
+                         q::WeightType::kQ8_0, q::WeightType::kIQ4_NL}
            : std::vector{q::WeightType::kQ4_K, q::WeightType::kQ5_K,
                          q::WeightType::kQ5_1, q::WeightType::kQ8_0};
   std::vector<float> x(tokens * cols);
@@ -513,9 +617,13 @@ void CheckVectorGrouping(bool down = false) {
     std::vector<Experts> weights, paired_weights;
     if (down) {
       weights = {MakeQ5_1(experts, rows, cols, 17),
-                 MakeQ8_0(experts, rows, cols, 23)};
+                 MakeQ5_0(experts, rows, cols, 19),
+                 MakeQ8_0(experts, rows, cols, 23),
+                 MakeIq4Nl(experts, rows, cols, 29)};
       paired_weights = {MakeQ5_1(experts, rows, cols, 79),
-                        MakeQ8_0(experts, rows, cols, 83)};
+                        MakeQ5_0(experts, rows, cols, 81),
+                        MakeQ8_0(experts, rows, cols, 83),
+                        MakeIq4Nl(experts, rows, cols, 89)};
     } else {
       weights = {
           MakeQ4K(experts, rows, cols, 11), MakeQ5K(experts, rows, cols, 13),
@@ -729,6 +837,20 @@ int main() {
     ok = Ok(Run(q::WeightType::kQ8_0, 3000, 1, 64, 2560, 640, 0x0C0FFEE0U,
                 64)) &&
          ok;
+    // IQ4_NL down view (the AP file's routed down-experts): the tiled route,
+    // the adapter's vector route and the F64 reference must agree.
+    ok = Ok(Run(q::WeightType::kIQ4_NL, 3000, 1, 64, 2560, 640, 0x1A4B0C0DU,
+                64)) &&
+         ok;
+    ok = Ok(Run(q::WeightType::kIQ4_NL, 97, 1, 8, 129, 640, 0x1A4B0C0EU, 64)) &&
+         ok;
+    // Q5_0 down view (the Swift-1.5 file's routed down-experts): the tiled
+    // route, the adapter's vector route and the F64 reference must agree.
+    ok = Ok(Run(q::WeightType::kQ5_0, 3000, 1, 64, 2560, 640, 0x050A0B0CU,
+                64)) &&
+         ok;
+    ok = Ok(Run(q::WeightType::kQ5_0, 97, 1, 8, 129, 640, 0x050A0B0DU, 64)) &&
+         ok;
     // Ragged rows against the 128-row tile and a tiny batch.
     ok = Ok(Run(q::WeightType::kQ4_K, 40, 4, 8, 201, 512, 0xDEADBEEFU)) && ok;
     // The 16-row tile (small buckets) on every type.
@@ -742,6 +864,12 @@ int main() {
                 16)) &&
          ok;
     ok = Ok(Run(q::WeightType::kQ8_0, 3000, 1, 64, 2560, 640, 0x16160004U,
+                16)) &&
+         ok;
+    ok = Ok(Run(q::WeightType::kIQ4_NL, 3000, 1, 64, 2560, 640, 0x16160005U,
+                16)) &&
+         ok;
+    ok = Ok(Run(q::WeightType::kQ5_0, 3000, 1, 64, 2560, 640, 0x16160006U,
                 16)) &&
          ok;
     return ok ? 0 : 1;

@@ -1,0 +1,19 @@
+{
+ "tag": "ap",
+ "model": "Signal-3.8-Flash-Next-AP-Q4_K_XL.gguf",
+ "prompt_tokens": 1958,
+ "words": 1700,
+ "seed": 1,
+ "continuation_tokens": 128,
+ "scored_positions": 2086,
+ "covered_positions": 128,
+ "covered_first": 1957,
+ "covered_last": 2084,
+ "top1_agreement": 1.0,
+ "mean_kl_gufo_llama": 0.007435010996625472,
+ "mean_kl_llama_gufo": 0.012010764343526551,
+ "worst_kl_gufo_llama": 0.17141983951630385,
+ "worst_kl_position": 2078,
+ "context": 4096,
+ "divergence": null
+}

@@ -11,6 +11,7 @@
 
 #include "src/core/gguf_reader.hpp"
 #include "src/models/qwen38_flash_next/config.hpp"
+#include "src/models/qwen38_flash_next/weight_format.hpp"
 
 namespace gufo::models::qwen38_flash_next {
 
@@ -47,6 +48,9 @@ struct TensorRef {
   std::uint64_t file_offset{0};  ///< Byte offset inside the owning shard.
   std::uint32_t shard{0};        ///< Mapped region index in the reader.
   std::string_view name;
+  /// Weight class the tensor was bound as; the device uploader revalidates
+  /// `type` against it before allocating.
+  WeightClass cls{WeightClass::kDense};
 
   [[nodiscard]] bool empty() const noexcept { return data == nullptr; }
   [[nodiscard]] std::uint64_t ElementCount() const noexcept {
@@ -150,6 +154,64 @@ struct MtpWeights {
       const core::GgufReader& reader, const Config& trunk,
       std::string* error_msg = nullptr);
 };
+
+/// Visits every tensor of a bound trunk in a stable order, empty ones
+/// included (an absent optional tensor visits as `empty()`).
+template<typename Visit>
+void ForEachTensor(const HcMixer& mixer, Visit&& visit) {
+  visit(mixer.norm);
+  visit(mixer.down);
+  visit(mixer.up);
+  visit(mixer.inject);
+}
+
+template<typename Visit>
+void ForEachTensor(const LayerWeights& layer, Visit&& visit) {
+  ForEachTensor(layer.hc_attn, visit);
+  ForEachTensor(layer.hc_ffn, visit);
+  for (const TensorRef* t :
+       {&layer.ssm_qkv,        &layer.ssm_gate,       &layer.ssm_conv1d,
+        &layer.ssm_alpha,      &layer.ssm_beta,       &layer.ssm_dt,
+        &layer.ssm_a,          &layer.ssm_norm,       &layer.ssm_out,
+        &layer.attn_q,         &layer.attn_k,         &layer.attn_v,
+        &layer.attn_out,       &layer.attn_q_norm,    &layer.attn_k_norm,
+        &layer.indexer_q,      &layer.indexer_k,      &layer.indexer_q_norm,
+        &layer.indexer_k_norm, &layer.ple_key,        &layer.ple_value,
+        &layer.ple_norm_key,   &layer.ple_norm_query, &layer.ple_norm_conv,
+        &layer.ple_conv1d,     &layer.router,         &layer.ffn_gate_exps,
+        &layer.ffn_up_exps,    &layer.ffn_down_exps,  &layer.shexp_gate_inp,
+        &layer.shexp_gate,     &layer.shexp_up,       &layer.shexp_down,
+        &layer.nextn_enorm,    &layer.nextn_hnorm,    &layer.nextn_eh_proj}) {
+    visit(*t);
+  }
+  ForEachTensor(layer.nextn_head, visit);
+}
+
+template<typename Visit>
+void ForEachTensor(const ModelWeights& weights, Visit&& visit) {
+  visit(weights.token_embd);
+  visit(weights.output);
+  ForEachTensor(weights.hc_head, visit);
+  visit(weights.ple_table);
+  for (const auto& layer : weights.layers) {
+    ForEachTensor(layer, visit);
+  }
+}
+
+template<typename Visit>
+void ForEachTensor(const MtpWeights& weights, Visit&& visit) {
+  ForEachTensor(weights.block, visit);
+}
+
+/// Validates every bound tensor against the weight-class format table and
+/// reports the first offender with the shared refusal message. Bind applies
+/// the same table per tensor; the device uploader revalidates here before it
+/// starts any allocation.
+[[nodiscard]] bool ValidateTensorFormats(const ModelWeights& weights,
+                                         std::string* error_msg);
+
+[[nodiscard]] bool ValidateTensorFormats(const MtpWeights& weights,
+                                         std::string* error_msg);
 
 }  // namespace gufo::models::qwen38_flash_next
 

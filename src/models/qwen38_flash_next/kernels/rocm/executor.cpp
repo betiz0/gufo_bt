@@ -55,6 +55,9 @@ T* Alloc(std::vector<void*>& allocations, std::size_t count,
   return static_cast<T*>(p);
 }
 
+/// Kernel type of a device tensor the executor reads directly. The embedding
+/// lookup reads its table's rows itself, so the 256-element dense formats it
+/// may be stored in map to their own decode.
 WeightType SmallType(GgmlType type) {
   switch (type) {
     case GgmlType::kBF16:
@@ -63,10 +66,61 @@ WeightType SmallType(GgmlType type) {
       return WeightType::kF16;
     case GgmlType::kQ8_0:
       return WeightType::kQ8_0;
+    case GgmlType::kQ4_K:
+      return WeightType::kQ4_K;
+    case GgmlType::kQ5_K:
+      return WeightType::kQ5_K;
+    case GgmlType::kQ6_K:
+      return WeightType::kQ6_K;
+    case GgmlType::kQ5_0:
+      return WeightType::kQ5_0;
+    case GgmlType::kIQ4_NL:
+      return WeightType::kIQ4_NL;
     case GgmlType::kF32:
       return WeightType::kF32;
     default:
       throw std::logic_error("unsupported Flash-Next matrix format");
+  }
+}
+
+/// Dense formats the vendored qfn_mmq adapter executes: the prefill MMQ
+/// projection over F32 activations and the decode GEMV over activations the
+/// executor already quantized with qfn_mmq_quantize_q8_1.
+bool AdapterDense(GgmlType type) {
+  return type == GgmlType::kQ4_K || type == GgmlType::kQ5_K ||
+         type == GgmlType::kQ5_0 || type == GgmlType::kQ6_K ||
+         type == GgmlType::kIQ4_NL;
+}
+
+int AdapterDenseVec(GgmlType type, const void* w, const void* x_q8, float* out,
+                    int m, int n, int k, hipStream_t stream) {
+  switch (type) {
+    case GgmlType::kQ4_K:
+      return qfn_mmq_q4_K_dense_vec_preq(w, x_q8, out, m, n, k, stream);
+    case GgmlType::kQ5_K:
+      return qfn_mmq_q5_K_dense_vec_preq(w, x_q8, out, m, n, k, stream);
+    case GgmlType::kQ5_0:
+      return qfn_mmq_q5_0_dense_vec_preq(w, x_q8, out, m, n, k, stream);
+    case GgmlType::kQ6_K:
+      return qfn_mmq_q6_K_dense_vec_preq(w, x_q8, out, m, n, k, stream);
+    default:
+      return qfn_mmq_iq4_nl_dense_vec_preq(w, x_q8, out, m, n, k, stream);
+  }
+}
+
+int AdapterDenseGemm(GgmlType type, const void* w, const float* x, float* out,
+                     int m, int n, int k, hipStream_t stream) {
+  switch (type) {
+    case GgmlType::kQ4_K:
+      return qfn_mmq_q4_K_dense(w, x, out, m, n, k, stream);
+    case GgmlType::kQ5_K:
+      return qfn_mmq_q5_K_dense(w, x, out, m, n, k, stream);
+    case GgmlType::kQ5_0:
+      return qfn_mmq_q5_0_dense(w, x, out, m, n, k, stream);
+    case GgmlType::kQ6_K:
+      return qfn_mmq_q6_K_dense(w, x, out, m, n, k, stream);
+    default:
+      return qfn_mmq_iq4_nl_dense(w, x, out, m, n, k, stream);
   }
 }
 
@@ -130,6 +184,16 @@ std::uint32_t IndexerCapacity(const Config& c, std::uint32_t batch,
 }
 
 }  // namespace
+
+void Executor::RecordRoute(WeightRoute route, const DeviceTensor& w,
+                           std::uint32_t tokens) const {
+  if (!record_routes_) {
+    return;
+  }
+  routes_.push_back({route, w.type, static_cast<std::uint32_t>(w.rows),
+                     static_cast<std::uint32_t>(w.cols), tokens,
+                     MatrixRows(tokens)});
+}
 
 Session::~Session() {
   TrimRollback(0);
@@ -452,10 +516,28 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   }
   // The wide mixer route (F16 norm for the epilogue, tiled Q8 norm for the
   // W8A8 down projection) needs the four-stream geometry, 32-wide blocks and
-  // a Q8_0 down projection.
-  e->wide_mixer_ = c.hc_count == 4 && c.hidden_size % 32 == 0 &&
-                   !model.layers().empty() &&
-                   model.layers()[0].hc_ffn.down.type == GgmlType::kQ8_0;
+  // Q8_0 Mixer down projections: `HcMix` reads the non-fused down projection
+  // through `W8A8Gemm` and the fused one through `HcDownF16Gemm`, and both
+  // assume Q8_0. Enable it only when every Mixer it can reach stores its down
+  // projection as Q8_0 — each trunk block's, the output head's and, when
+  // bound, the MTP draft block's — so a file that mixes Mixer formats across
+  // blocks (or between trunk and sidecar) executes every projection from its
+  // own encoding through `Dense`.
+  const auto mixer_down_q8_0 = [](const DeviceMixer& mixer) {
+    return mixer.down.type == GgmlType::kQ8_0;
+  };
+  bool wide_mixer = c.hc_count == 4 && c.hidden_size % 32 == 0 &&
+                    !model.layers().empty() && mixer_down_q8_0(model.hc_head());
+  for (const DeviceLayer& layer : model.layers()) {
+    wide_mixer = wide_mixer && mixer_down_q8_0(layer.hc_attn) &&
+                 mixer_down_q8_0(layer.hc_ffn);
+  }
+  if (model.has_mtp()) {
+    wide_mixer = wide_mixer && mixer_down_q8_0(model.mtp().hc_attn) &&
+                 mixer_down_q8_0(model.mtp().hc_ffn) &&
+                 mixer_down_q8_0(model.mtp().nextn_head);
+  }
+  e->wide_mixer_ = wide_mixer;
   if (model.has_mtp()) {
     // The trunk's kept rows are session-owned. Its transient residual and
     // mixer buffers are free while MTP constructs its input. The split
@@ -720,6 +802,22 @@ bool Executor::Dense(const DeviceTensor& w, const Q8Input& q, float* out,
       AssignError(error_msg, "Q8_0 GEMV failed");
       return false;
     }
+    RecordRoute(WeightRoute::kQ8Gemv, w, q.n);
+    return true;
+  }
+  if (AdapterDense(w.type) && q.data != nullptr) {
+    if (w.cols != q.k) {
+      AssignError(error_msg, "quantized input width mismatch");
+      return false;
+    }
+    if (AdapterDenseVec(w.type, w.data, q.data, out, static_cast<int>(w.rows),
+                        static_cast<int>(q.n), static_cast<int>(w.cols),
+                        stream_) != 0) {
+      AssignError(error_msg,
+                  std::string(core::ToString(w.type)) + " GEMV failed");
+      return false;
+    }
+    RecordRoute(WeightRoute::kAdapterGemv, w, q.n);
     return true;
   }
   return Dense(w, q.x, out, q.n, error_msg);
@@ -745,6 +843,20 @@ bool Executor::GatedDense(const DeviceTensor& up, const DeviceTensor& gate,
       AssignError(error_msg, "gated Q8_0 GEMV failed");
       return false;
     }
+    return true;
+  }
+  // The adapter formats share one quantization of the activations, exactly
+  // like the Q8_0 GEMV pair above.
+  if (!MatrixRows(n_tokens) && up.type == gate.type && AdapterDense(up.type) &&
+      up.rows == gate.rows && up.cols == gate.cols) {
+    Q8Input xq;
+    if (!Quantize(x, n_tokens, up.cols, &xq, error_msg) ||
+        !Dense(gate, xq, out, error_msg) ||
+        !Dense(up, xq, s_.shexp_gate, error_msg)) {
+      return false;
+    }
+    Swiglu(out, s_.shexp_gate, static_cast<std::size_t>(n_tokens) * up.rows,
+           stream_);
     return true;
   }
   // Swiglu is in place over its first operand.
@@ -843,11 +955,32 @@ bool Executor::Dense(const DeviceTensor& w, const float* x, float* out,
         return false;
       }
     }
+    RecordRoute(f16 ? WeightRoute::kQ8F16Gemm : WeightRoute::kQ8W8A8, w,
+                n_tokens);
+    return true;
+  }
+  if (AdapterDense(w.type)) {
+    // Decode and verification take the GEMV over the batch's quantized
+    // activations; prefill keeps one tiled arithmetic at every chunk width.
+    if (!MatrixRows(n_tokens)) {
+      Q8Input q;
+      return Quantize(x, n_tokens, w.cols, &q, error_msg) &&
+             Dense(w, q, out, error_msg);
+    }
+    if (AdapterDenseGemm(w.type, w.data, x, out, static_cast<int>(w.rows),
+                         static_cast<int>(n_tokens), static_cast<int>(w.cols),
+                         stream_) != 0) {
+      AssignError(error_msg,
+                  std::string(core::ToString(w.type)) + " MMQ GEMM failed");
+      return false;
+    }
+    RecordRoute(WeightRoute::kAdapterMmq, w, n_tokens);
     return true;
   }
   if (!MatrixRows(n_tokens)) {
     SmallGemm(w.data, SmallType(w.type), x, out, n_tokens, w.rows, w.cols,
               stream_);
+    RecordRoute(WeightRoute::kSmall, w, n_tokens);
     return true;
   }
   // Wide batches of the unquantized projections (router, alpha/beta,
@@ -864,6 +997,7 @@ bool Executor::Dense(const DeviceTensor& w, const float* x, float* out,
       AssignError(error_msg, "hipBLAS GEMM failed");
       return false;
     }
+    RecordRoute(WeightRoute::kBlasGemm, w, n_tokens);
     return true;
   }
   const bool bf16 = w.type == GgmlType::kBF16;
@@ -877,7 +1011,12 @@ bool Executor::Dense(const DeviceTensor& w, const float* x, float* out,
     half_cols_ = w.cols;
     half_bf16_ = bf16;
   }
-  return blaslt_->Gemm(w.data, s_.x_half, out, type, m, n, k, error_msg);
+  const bool ok =
+      blaslt_->Gemm(w.data, s_.x_half, out, type, m, n, k, error_msg);
+  if (ok) {
+    RecordRoute(WeightRoute::kBlasGemm, w, n_tokens);
+  }
+  return ok;
 }
 
 void Executor::RoutedHints(const DeviceTensor& w,
@@ -987,6 +1126,9 @@ bool Executor::Experts(const DeviceTensor& w, const float* x,
   if (!tiled) {
     rc = qfn_mmq_moe_vec(static_cast<int>(w.type), w.data, x, ids, out, M, K, T,
                          E, U, stream_);
+    if (rc == 0) {
+      RecordRoute(WeightRoute::kMoeVector, w, n_tokens);
+    }
   } else {
     switch (w.type) {
       case GgmlType::kQ4_K:
@@ -1001,8 +1143,18 @@ bool Executor::Experts(const DeviceTensor& w, const float* x,
       case GgmlType::kQ8_0:
         rc = qfn_mmq_q8_0_moe_raw(w.data, x, ids, out, M, K, T, E, U, stream_);
         break;
+      case GgmlType::kIQ4_NL:
+        rc =
+            qfn_mmq_iq4_nl_moe_raw(w.data, x, ids, out, M, K, T, E, U, stream_);
+        break;
+      case GgmlType::kQ5_0:
+        rc = qfn_mmq_q5_0_moe_raw(w.data, x, ids, out, M, K, T, E, U, stream_);
+        break;
       default:
         break;
+    }
+    if (rc == 0) {
+      RecordRoute(WeightRoute::kMoeAdapter, w, n_tokens);
     }
   }
   if (rc != 0) {
@@ -1123,6 +1275,7 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
       AssignError(error_msg, "fused HC down projection failed");
       return false;
     }
+    RecordRoute(WeightRoute::kMixerFusedDown, m.down, n_tokens);
   } else {
     if (xn_half_) {
       if (!W8A8Gemm(m.down.data, s_.xn_q8t, s_.lo, n_tokens, m.down.rows,
@@ -1130,6 +1283,7 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
         AssignError(error_msg, "W8A8 mixer down projection failed");
         return false;
       }
+      RecordRoute(WeightRoute::kMixerW8A8Down, m.down, n_tokens);
     } else if (!Dense(m.down, s_.xn, s_.lo, n_tokens, error_msg)) {
       return false;
     }
@@ -1160,6 +1314,7 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
         AssignError(error_msg, "fused HC projection failed");
         return false;
       }
+      RecordRoute(WeightRoute::kMixerFusedUp, m.up, n_tokens);
     } else {
       HcMixEpilogueVec4F16(s_.xn_half, s_.hc_gate,
                            fused_inject ? m.inject.f32() : nullptr, mixed,
@@ -1589,9 +1744,12 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
                              l.ffn_gate_exps.type == GgmlType::kQ5_K) &&
                             l.ffn_up_exps.type == l.ffn_gate_exps.type &&
                             (l.ffn_down_exps.type == GgmlType::kQ5_1 ||
-                             l.ffn_down_exps.type == GgmlType::kQ8_0) &&
+                             l.ffn_down_exps.type == GgmlType::kQ5_0 ||
+                             l.ffn_down_exps.type == GgmlType::kQ8_0 ||
+                             l.ffn_down_exps.type == GgmlType::kIQ4_NL) &&
                             c.hidden_size % 256 == 0 && c.expert_ff % 64 == 0;
   if (wmma_experts) {
+    RecordRoute(WeightRoute::kMoeWmma, l.ffn_down_exps, n_tokens);
     RoutedCompact(s_.ids, s_.expert_counts, s_.routed_bounds, s_.routed_cursors,
                   s_.rows_token, s_.rows_slot, n_tokens, used, c.num_experts,
                   stream_);
@@ -1635,13 +1793,19 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
       AssignError(error_msg, "routed F16 gate/up GEMM failed");
       return false;
     }
-    const WeightType down_type = l.ffn_down_exps.type == GgmlType::kQ8_0
-                                     ? WeightType::kQ8_0
-                                     : WeightType::kQ5_1;
+    const WeightType down_type =
+        l.ffn_down_exps.type == GgmlType::kQ8_0
+            ? WeightType::kQ8_0
+            : (l.ffn_down_exps.type == GgmlType::kIQ4_NL
+                   ? WeightType::kIQ4_NL
+                   : (l.ffn_down_exps.type == GgmlType::kQ5_0
+                          ? WeightType::kQ5_0
+                          : WeightType::kQ5_1));
     // Larger down tiles amortize weight decoding. Reuse the 64-token map
     // when it has no more padded rows than the 48-token map.
     const bool wide_down =
-        (down_type == WeightType::kQ5_1 || down_type == WeightType::kQ8_0) &&
+        (down_type == WeightType::kQ5_1 || down_type == WeightType::kQ5_0 ||
+         down_type == WeightType::kQ8_0 || down_type == WeightType::kIQ4_NL) &&
         routed_tile_rows_ == 48 && routed_64_tiles_ != 0 &&
         routed_64_tiles_ * 4 <= routed_n_tiles_ * 3;
     // The down projection's rows are F16 too: the epilogue reads half the

@@ -14,6 +14,8 @@ endfunction()
 
 add_qwen38_flash_next_test(config gufo_qwen38_flash_next "cpu")
 add_qwen38_flash_next_test(ngram gufo_qwen38_flash_next "cpu")
+add_qwen38_flash_next_test(cpu_ops gufo_qwen38_flash_next_reference "cpu")
+add_qwen38_flash_next_test(format_policy gufo_qwen38_flash_next "cpu")
 add_qwen38_flash_next_test(mtp_sampling gufo_core "cpu")
 
 add_executable(qwen38_flash_next_reference_probe EXCLUDE_FROM_ALL reference_probe.cpp)
@@ -24,7 +26,7 @@ set_source_files_properties(reference_probe.cpp PROPERTIES COMPILE_OPTIONS "-O2"
 if (ENGINE_ENABLE_HIP)
   foreach(name IN ITEMS mtp_ops blaslt_ops hc_mix_ops gdn_ops
       attention_ops moe_epilogue_ops moe_ids_ops projection_ops routed_wmma_ops
-      select_ops)
+      select_ops upload_gate mmq_ops embed_ops mixer_route)
     add_qwen38_flash_next_test(${name} gufo_qwen38_flash_next "hip;gpu;gfx1151")
   endforeach()
 
@@ -41,6 +43,25 @@ if (ENGINE_ENABLE_HIP)
     gufo_qwen38_flash_next)
   add_custom_target(qwen38_flash_next_model_tests
     DEPENDS qwen38_flash_next_session_test qwen38_flash_next_snapshot_test)
+
+  # The CLI load-error check needs the HIP build: without it the `qwen4exp`
+  # branch of prompt/chat/serve is not compiled in.
+  add_test(NAME qwen38_flash_next_cli_load_error
+    COMMAND ${Python3_EXECUTABLE}
+      ${PROJECT_SOURCE_DIR}/tests/cli/flash_next_load_error_test.py
+      $<TARGET_FILE:gufo>
+      $<TARGET_FILE:qwen38_flash_next_format_policy_test>)
+  set_tests_properties(qwen38_flash_next_cli_load_error PROPERTIES
+    LABELS "hip;cli;qwen38_flash_next" TIMEOUT 180)
+
+  # Real-artifact checks: they need a model file in the environment and skip
+  # with 77 when it is unset.
+  add_qwen38_flash_next_test(route_ops gufo_qwen38_flash_next "hip;gpu;gfx1151")
+  set_tests_properties(qwen38_flash_next.route_ops PROPERTIES SKIP_RETURN_CODE 77)
+  add_qwen38_flash_next_test(ap_upload gufo_qwen38_flash_next "hip;gpu;gfx1151")
+  set_tests_properties(qwen38_flash_next.ap_upload PROPERTIES SKIP_RETURN_CODE 77)
+  add_qwen38_flash_next_test(swift_upload gufo_qwen38_flash_next "hip;gpu;gfx1151")
+  set_tests_properties(qwen38_flash_next.swift_upload PROPERTIES SKIP_RETURN_CODE 77)
 
   add_executable(qwen38_flash_next_gpu_probe EXCLUDE_FROM_ALL gpu_probe.cpp
     mtp_audit.cpp)

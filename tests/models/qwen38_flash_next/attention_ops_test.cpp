@@ -1,3 +1,9 @@
+// Attention operator checks for Qwen3.8-Flash-Next: the causal WMMA route and
+// the split-key reference against the per-token reference, chunk and
+// preparation behaviour, and the AP trunk's attention projections in Q6_K and
+// the Swift-1.5 Q4_K/Q5_K mix (attn_q and attn_output, through the MMQ prefill
+// entry and the decode GEMV).
+
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
@@ -14,8 +20,11 @@
 #include <vector>
 
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
+#include "src/models/qwen38_flash_next/kernels/rocm/mmq/qfn_mmq.h"
+#include "tests/models/qwen38_flash_next/quant_fixture.hpp"
 
 namespace q = gufo::models::qwen38_flash_next::rocm;
+namespace fixture = gufo::models::qwen38_flash_next::fixture;
 namespace {
 
 // The model's full-attention geometry: 24 query heads over 2 KV heads,
@@ -602,12 +611,198 @@ void CheckChunks(std::uint32_t n, std::uint32_t split) {
     throw std::runtime_error("attention depends on prefill chunk boundary");
 }
 
+/// The AP trunk's attention projections stored as Q6_K (design D3/D5): the
+/// tiled MMQ prefill entry and the decode GEMV the executor's dense dispatch
+/// selects for attention q/k/v/output, each against the FP64 reference over
+/// the dequantized rows. Shapes are the trunk's own (full-attention layer,
+/// `[out][in]`): q 12288x2560, k/v 512x2560, output 2560x6144.
+void CheckQ6KAttentionProjection(std::size_t rows, std::size_t k,
+                                 std::uint32_t seed) {
+  constexpr std::size_t kPrefill = 5;
+  constexpr std::size_t kDecode = 2;
+  const auto w = fixture::MakeQ6Weights(rows, k, seed, false);
+  const auto x = fixture::MakeIntegerActivations(kPrefill, k, seed ^ 0x5A5AU);
+  HipBuffer<std::uint8_t> d_w(w.bytes.size());
+  HipBuffer<float> d_x(x.size()), d_y(kPrefill * rows);
+  HipBuffer<std::uint8_t> d_q8(
+      qfn_mmq_q8_1_bytes(static_cast<int>(kDecode), static_cast<int>(k)));
+  CheckHip(hipMemcpy(d_w.get(), w.bytes.data(), w.bytes.size(),
+                     hipMemcpyHostToDevice),
+           "Q6_K attention weights");
+  CheckHip(hipMemcpy(d_x.get(), x.data(), x.size() * sizeof(float),
+                     hipMemcpyHostToDevice),
+           "Q6_K attention input");
+
+  double scale = 0.0;
+  const std::size_t rows_checked = std::min<std::size_t>(rows, 6);
+  const auto compare = [&](const std::string& label, std::size_t tokens) {
+    std::vector<float> out(tokens * rows);
+    CheckHip(hipMemcpy(out.data(), d_y.get(), out.size() * sizeof(float),
+                       hipMemcpyDeviceToHost),
+             "Q6_K attention download");
+    for (std::size_t sample = 0; sample < rows_checked; ++sample) {
+      const std::size_t row =
+          rows_checked > 1 ? sample * (rows - 1) / (rows_checked - 1) : 0;
+      const auto values =
+          fixture::DequantizeRow(w, row, k, gufo::core::GgmlType::kQ6_K);
+      for (std::size_t t = 0; t < tokens; ++t) {
+        double expected = 0.0, magnitude = 0.0;
+        for (std::size_t i = 0; i < k; ++i) {
+          const double product = values[i] * static_cast<double>(x[t * k + i]);
+          expected += product;
+          magnitude += std::abs(product);
+        }
+        scale = std::max(scale, magnitude);
+        const double actual = out[t * rows + row];
+        if (!std::isfinite(actual) ||
+            std::abs(actual - expected) > 5e-3 * std::max(scale, 1e-3)) {
+          throw std::runtime_error(
+              label + " row " + std::to_string(row) + " token " +
+              std::to_string(t) + " differs: actual=" + std::to_string(actual) +
+              " expected=" + std::to_string(expected));
+        }
+      }
+    }
+  };
+
+  // Prefill MMQ over F32 activations.
+  if (qfn_mmq_q6_K_dense(d_w.get(), d_x.get(), d_y.get(),
+                         static_cast<int>(rows), static_cast<int>(kPrefill),
+                         static_cast<int>(k), nullptr) != 0) {
+    throw std::runtime_error("Q6_K attention MMQ failed");
+  }
+  CheckHip(hipDeviceSynchronize(), "Q6_K attention MMQ");
+  compare("Q6_K attention MMQ", kPrefill);
+
+  // Decode GEMV over the executor's pre-quantized Q8_1 activations.
+  if (qfn_mmq_quantize_q8_1(d_x.get(), d_q8.get(), static_cast<int>(kDecode),
+                            static_cast<int>(k), nullptr) != 0) {
+    throw std::runtime_error("Q6_K attention quantization failed");
+  }
+  if (qfn_mmq_q6_K_dense_vec_preq(
+          d_w.get(), d_q8.get(), d_y.get(), static_cast<int>(rows),
+          static_cast<int>(kDecode), static_cast<int>(k), nullptr) != 0) {
+    throw std::runtime_error("Q6_K attention GEMV failed");
+  }
+  CheckHip(hipDeviceSynchronize(), "Q6_K attention GEMV");
+  compare("Q6_K attention GEMV", kDecode);
+  std::cout << "Q6_K attention projection " << rows << "x" << k
+            << " matches the reference\n";
+}
+
+/// The AP trunk's attention projections stored in the Swift-1.5 Q4_K_M mix:
+/// the tiled MMQ prefill entry and the decode GEMV, exactly like the Q6_K
+/// cases, each against the FP64 reference over the dequantized rows. The
+/// shapes are the trunk's own (`[out][in]`): Q4_K `attn_q` 12288x2560 and
+/// Q5_K `attn_output` 2560x6144.
+void CheckSwiftAttentionProjection(gufo::core::GgmlType type, std::size_t rows,
+                                   std::size_t k, std::uint32_t seed) {
+  const char* const format =
+      type == gufo::core::GgmlType::kQ4_K ? "Q4_K" : "Q5_K";
+  constexpr std::size_t kPrefill = 5;
+  constexpr std::size_t kDecode = 2;
+  const auto w = type == gufo::core::GgmlType::kQ4_K
+                     ? fixture::MakeQ4KWeights(rows, k, seed, false)
+                     : fixture::MakeQ5KWeights(rows, k, seed, false);
+  const auto dense = [&](const void* W, const float* X, float* out,
+                         int tokens) {
+    return type == gufo::core::GgmlType::kQ4_K
+               ? qfn_mmq_q4_K_dense(W, X, out, static_cast<int>(rows), tokens,
+                                    static_cast<int>(k), nullptr)
+               : qfn_mmq_q5_K_dense(W, X, out, static_cast<int>(rows), tokens,
+                                    static_cast<int>(k), nullptr);
+  };
+  const auto gemv = [&](const void* W, const void* X_q8, float* out,
+                        int tokens) {
+    return type == gufo::core::GgmlType::kQ4_K
+               ? qfn_mmq_q4_K_dense_vec_preq(W, X_q8, out,
+                                             static_cast<int>(rows), tokens,
+                                             static_cast<int>(k), nullptr)
+               : qfn_mmq_q5_K_dense_vec_preq(W, X_q8, out,
+                                             static_cast<int>(rows), tokens,
+                                             static_cast<int>(k), nullptr);
+  };
+  const auto x = fixture::MakeIntegerActivations(kPrefill, k, seed ^ 0x5A5AU);
+  HipBuffer<std::uint8_t> d_w(w.bytes.size());
+  HipBuffer<float> d_x(x.size()), d_y(kPrefill * rows);
+  HipBuffer<std::uint8_t> d_q8(
+      qfn_mmq_q8_1_bytes(static_cast<int>(kDecode), static_cast<int>(k)));
+  CheckHip(hipMemcpy(d_w.get(), w.bytes.data(), w.bytes.size(),
+                     hipMemcpyHostToDevice),
+           "Swift attention weights");
+  CheckHip(hipMemcpy(d_x.get(), x.data(), x.size() * sizeof(float),
+                     hipMemcpyHostToDevice),
+           "Swift attention input");
+
+  double scale = 0.0;
+  const std::size_t rows_checked = std::min<std::size_t>(rows, 6);
+  const auto compare = [&](const std::string& label, std::size_t tokens) {
+    std::vector<float> out(tokens * rows);
+    CheckHip(hipMemcpy(out.data(), d_y.get(), out.size() * sizeof(float),
+                       hipMemcpyDeviceToHost),
+             "Swift attention download");
+    for (std::size_t sample = 0; sample < rows_checked; ++sample) {
+      const std::size_t row =
+          rows_checked > 1 ? sample * (rows - 1) / (rows_checked - 1) : 0;
+      const auto values = fixture::DequantizeRow(w, row, k, type);
+      for (std::size_t t = 0; t < tokens; ++t) {
+        double expected = 0.0, magnitude = 0.0;
+        for (std::size_t i = 0; i < k; ++i) {
+          const double product = values[i] * static_cast<double>(x[t * k + i]);
+          expected += product;
+          magnitude += std::abs(product);
+        }
+        scale = std::max(scale, magnitude);
+        const double actual = out[t * rows + row];
+        if (!std::isfinite(actual) ||
+            std::abs(actual - expected) > 5e-3 * std::max(scale, 1e-3)) {
+          throw std::runtime_error(
+              label + " row " + std::to_string(row) + " token " +
+              std::to_string(t) + " differs: actual=" + std::to_string(actual) +
+              " expected=" + std::to_string(expected));
+        }
+      }
+    }
+  };
+
+  // Prefill MMQ over F32 activations.
+  if (dense(d_w.get(), d_x.get(), d_y.get(), static_cast<int>(kPrefill)) != 0) {
+    throw std::runtime_error(std::string(format) + " attention MMQ failed");
+  }
+  CheckHip(hipDeviceSynchronize(), "Swift attention MMQ");
+  compare(std::string(format) + " attention MMQ", kPrefill);
+
+  // Decode GEMV over the executor's pre-quantized Q8_1 activations.
+  if (qfn_mmq_quantize_q8_1(d_x.get(), d_q8.get(), static_cast<int>(kDecode),
+                            static_cast<int>(k), nullptr) != 0) {
+    throw std::runtime_error(std::string(format) +
+                             " attention quantization failed");
+  }
+  if (gemv(d_w.get(), d_q8.get(), d_y.get(), static_cast<int>(kDecode)) != 0) {
+    throw std::runtime_error(std::string(format) + " attention GEMV failed");
+  }
+  CheckHip(hipDeviceSynchronize(), "Swift attention GEMV");
+  compare(std::string(format) + " attention GEMV", kDecode);
+  std::cout << format << " attention projection " << rows << "x" << k
+            << " matches the reference\n";
+}
+
 }  // namespace
 
 int main() {
   try {
     CheckChunks(136, 94);
     CheckChunks(2048, 1025);
+    // The AP trunk's attention q/k/v/output stored as Q6_K (task 3.4).
+    CheckQ6KAttentionProjection(12288, 2560, 0x1228U);
+    CheckQ6KAttentionProjection(512, 2560, 0x0512U);
+    CheckQ6KAttentionProjection(2560, 6144, 0x2560U);
+    // The Swift-1.5 Q4_K_M attention projections (task 4.2): Q4_K `attn_q`,
+    // Q5_K `attn_output`.
+    CheckSwiftAttentionProjection(gufo::core::GgmlType::kQ4_K, 12288, 2560,
+                                  0x1228U);
+    CheckSwiftAttentionProjection(gufo::core::GgmlType::kQ5_K, 2560, 6144,
+                                  0x2560U);
     CheckPreparation(1, 0, 64);
     CheckPreparation(8, 4096, 64);
     CheckPreparation(65, 131069, 64);

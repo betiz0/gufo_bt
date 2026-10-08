@@ -22,6 +22,55 @@ int qfn_mmq_q8_0_dense(
     int           K,
     hipStream_t  stream);
 
+// Q6_K dense projection: prefill MMQ over F32 activations (`qfn_mmq_*_dense`),
+// or decode GEMV over activations already quantized with
+// qfn_mmq_quantize_q8_1 (`qfn_mmq_*_dense_vec_preq`). K must be a whole number
+// of weight blocks (256 for Q6_K, 32 for IQ4_NL); the decode entry takes at
+// most 8 tokens.
+int qfn_mmq_q6_K_dense(const void* W_q6_K, const float* X_f32,
+                       float* out_f32, int M, int N, int K,
+                       hipStream_t stream);
+
+int qfn_mmq_q6_K_dense_vec_preq(const void* W_q6_K, const void* X_q8,
+                                float* out_f32, int M, int N, int K,
+                                hipStream_t stream);
+
+// IQ4_NL dense projection, same contract as the Q6_K entries.
+int qfn_mmq_iq4_nl_dense(const void* W_iq4_nl, const float* X_f32,
+                         float* out_f32, int M, int N, int K,
+                         hipStream_t stream);
+
+int qfn_mmq_iq4_nl_dense_vec_preq(const void* W_iq4_nl, const void* X_q8,
+                                  float* out_f32, int M, int N, int K,
+                                  hipStream_t stream);
+
+// Q4_K / Q5_K / Q5_0 dense projections (the Swift-1.5 Q4_K_M mix), same
+// contract as the Q6_K entries: K must be a whole number of weight blocks
+// (256 for Q4_K/Q5_K, 32 for Q5_0).
+int qfn_mmq_q4_K_dense(const void* W_q4_K, const float* X_f32,
+                       float* out_f32, int M, int N, int K,
+                       hipStream_t stream);
+
+int qfn_mmq_q4_K_dense_vec_preq(const void* W_q4_K, const void* X_q8,
+                                float* out_f32, int M, int N, int K,
+                                hipStream_t stream);
+
+int qfn_mmq_q5_K_dense(const void* W_q5_K, const float* X_f32,
+                       float* out_f32, int M, int N, int K,
+                       hipStream_t stream);
+
+int qfn_mmq_q5_K_dense_vec_preq(const void* W_q5_K, const void* X_q8,
+                                float* out_f32, int M, int N, int K,
+                                hipStream_t stream);
+
+int qfn_mmq_q5_0_dense(const void* W_q5_0, const float* X_f32,
+                       float* out_f32, int M, int N, int K,
+                       hipStream_t stream);
+
+int qfn_mmq_q5_0_dense_vec_preq(const void* W_q5_0, const void* X_q8,
+                                float* out_f32, int M, int N, int K,
+                                hipStream_t stream);
+
 int qfn_mmq_q4_K_moe_pair_unique(const void* W_a, const void* W_b,
                                  const float* X_f32, const int32_t* ids,
                                  float* out_a, float* out_b, int M, int K,
@@ -76,6 +125,20 @@ int qfn_mmq_q5_1_moe_raw(
     hipStream_t stream);
 
 int qfn_mmq_q5_K_moe_raw(
+    const void * W, const float * X_f32, const int32_t * ids, float * out,
+    int M, int K, int n_tokens, int n_experts, int n_expert_used,
+    hipStream_t stream);
+
+// IQ4_NL routed projection (the down-experts of the AP tier). Same contract
+// as qfn_mmq_q4_K_moe_raw; the vector route additionally accepts IQ4_NL.
+int qfn_mmq_iq4_nl_moe_raw(
+    const void * W, const float * X_f32, const int32_t * ids, float * out,
+    int M, int K, int n_tokens, int n_experts, int n_expert_used,
+    hipStream_t stream);
+
+// Q5_0 routed projection (the down-experts of the Swift-1.5 tier). Same
+// contract as qfn_mmq_q4_K_moe_raw; the vector route accepts Q5_0 as well.
+int qfn_mmq_q5_0_moe_raw(
     const void * W, const float * X_f32, const int32_t * ids, float * out,
     int M, int K, int n_tokens, int n_experts, int n_expert_used,
     hipStream_t stream);

@@ -1,0 +1,43 @@
+{
+ "tag": "ud",
+ "model": "Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf",
+ "prompt_tokens": 1966,
+ "words": 1690,
+ "seed": 0,
+ "continuation_tokens": 128,
+ "scored_positions": 2094,
+ "covered_positions": 128,
+ "covered_first": 1965,
+ "covered_last": 2092,
+ "top1_agreement": 0.984375,
+ "mean_kl_gufo_llama": 0.03429059589046459,
+ "mean_kl_llama_gufo": 0.034180962406755326,
+ "worst_kl_gufo_llama": 0.7483005781686748,
+ "worst_kl_position": 2064,
+ "context": 4096,
+ "llama_batch_requested": 4096,
+ "llama_ubatch_requested": 1024,
+ "llama_n_batch": 4096,
+ "llama_n_ubatch": 1024,
+ "gufo_prefill_chunk": 1024,
+ "divergence": {
+  "position": 1972,
+  "forced_token": 279,
+  "gufo_top1": [
+   13,
+   15.689667701721191
+  ],
+  "gufo_top2": [
+   279,
+   15.647930145263672
+  ],
+  "llama_top1": [
+   279,
+   15.744978904724121
+  ],
+  "llama_top2": [
+   13,
+   15.71357536315918
+  ]
+ }
+}

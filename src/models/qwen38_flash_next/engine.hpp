@@ -86,6 +86,10 @@ public:
     return *tokenizer_;
   }
   [[nodiscard]] std::size_t ResidentBytes() const noexcept;
+  /// Device executor, for the route and device-weight checks.
+  [[nodiscard]] const rocm::Executor& executor() const noexcept {
+    return *executor_;
+  }
   /// Worst-case private device state, including the configured rollback cap.
   [[nodiscard]] std::size_t SessionBytes(core::SessionMode mode,
                                          std::uint32_t context) const noexcept;

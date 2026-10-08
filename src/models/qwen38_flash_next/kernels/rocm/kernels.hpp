@@ -38,17 +38,29 @@ void RestoreGdnState(float* state, RollbackRows snapshots, std::uint32_t keep,
 enum class WeightType : std::uint32_t {
   kF32 = 0,
   kF16 = 1,
+  kQ5_0 = 6,  ///< 32-element blocks: the Swift Mixer up/table and down-experts.
   kQ5_1 = 7,
   kQ8_0 = 8,
   kQ4_K = 12,
   kQ5_K = 13,
+  kQ6_K = 14,    ///< 256-element blocks: embedding rows, decoded on read.
+  kIQ4_NL = 20,  ///< 32-element blocks: the routed down-experts.
   kBF16 = 30,
 };
 
-/// res[t][s][hidden] = table[tokens[t]] for every stream s (Q8_0 rows).
+/// res[t][s][hidden] = table[tokens[t]] for every stream s (Q8_0 or Q6_K
+/// rows).
 void EmbedTokens(const void* table, WeightType type, const std::int32_t* tokens,
                  float* res, std::uint32_t n_tokens, std::uint32_t hidden,
                  std::uint32_t streams, hipStream_t stream);
+
+/// Load-time weight decode for the tensors whose consumers are fixed-size
+/// F32 or F16 kernels: expands `elements` values of a stored GGUF encoding
+/// into F16 (`dst_half`) or F32. Supported sources are the encoded types
+/// without a dense GEMM path (Q6_K, IQ4_NL) plus Q8_0 (the half of a mixed
+/// `ssm_alpha`/`ssm_beta` pair) and F16/BF16/F32. Throws for any other type.
+void DecodeWeights(const void* src, WeightType src_type, void* dst,
+                   bool dst_half, std::size_t elements, hipStream_t stream);
 
 /// out[t][d] = rmsnorm(x[t][d]) * gamma[d]; `groups` independent norms of
 /// `dim/groups` elements each share the gamma row. gamma may be null.
@@ -220,9 +232,9 @@ void RoutedCompact(const std::int32_t* ids, const std::uint32_t* counts,
 /// projection's F32 output over the same rows) turns it into
 /// silu(gate) * result.
 /// `tile_rows` is the token rows per tile the map was built with: 16 or 48,
-/// or 64 for Q5_1/Q8_0.
-/// Q4_K and Q5_K need k % 256 == 0, Q5_1 and Q8_0 k % 64 == 0; other types
-/// and tile widths return false.
+/// or 64 for Q5_1/Q5_0/Q8_0.
+/// Q4_K and Q5_K need k % 256 == 0, Q5_0/Q5_1 and Q8_0 k % 64 == 0; other
+/// types and tile widths return false.
 bool RoutedF16Gemm(const void* w, WeightType type, const __half* x,
                    const std::int32_t* tiles, std::uint32_t n_tiles,
                    std::uint32_t tile_rows, const std::int32_t* pad_bounds,

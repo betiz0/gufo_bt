@@ -3,6 +3,7 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <initializer_list>
 
 #include "src/core/hip/weight_upload.hpp"
@@ -19,19 +20,89 @@ namespace {
 /// activation padding and contribute nothing).
 constexpr std::size_t kTailMargin = 4096;
 
+/// Elements of one stored block of `type` (the stored byte count is
+/// `elements / block * ggml_type_size`, which the reader already validated).
+std::size_t WeightBlockElements(core::GgmlType type) {
+  switch (type) {
+    case core::GgmlType::kQ6_K:
+      return 256;
+    case core::GgmlType::kQ5_0:
+    case core::GgmlType::kQ8_0:
+    case core::GgmlType::kIQ4_NL:
+      return 32;
+    default:
+      return 1;
+  }
+}
+
+std::size_t WeightBlockBytes(core::GgmlType type) {
+  switch (type) {
+    case core::GgmlType::kQ6_K:
+      return 210;
+    case core::GgmlType::kQ5_0:
+      return 22;
+    case core::GgmlType::kQ8_0:
+      return 34;
+    case core::GgmlType::kIQ4_NL:
+      return 18;
+    case core::GgmlType::kF16:
+    case core::GgmlType::kBF16:
+      return 2;
+    default:
+      return 4;
+  }
+}
+
+/// The kernels' WeightType for a stored GGML type. Every format the uploader
+/// may decode at load must map to its own WeightType: a mixed `ssm_alpha`/
+/// `ssm_beta` pair decodes a Q8_0 half through the same path as a Q6_K half,
+/// and reading Q8_0 bytes as F32 would run past the staging buffer.
+WeightType SmallType(core::GgmlType type) {
+  switch (type) {
+    case core::GgmlType::kQ8_0:
+      return WeightType::kQ8_0;
+    case core::GgmlType::kQ5_0:
+      return WeightType::kQ5_0;
+    case core::GgmlType::kQ6_K:
+      return WeightType::kQ6_K;
+    case core::GgmlType::kIQ4_NL:
+      return WeightType::kIQ4_NL;
+    case core::GgmlType::kF16:
+      return WeightType::kF16;
+    case core::GgmlType::kBF16:
+      return WeightType::kBF16;
+    default:
+      return WeightType::kF32;
+  }
+}
+
 struct Conversion {
   void* source;
   void* destination;
   std::size_t count;
 };
 
+/// One tensor decoded at load: a staging copy of its stored encoding and the
+/// destination its consumers read (F16 or F32).
+struct Decode {
+  void* source;
+  void* destination;
+  core::GgmlType type;
+  bool to_half;
+  std::size_t elements;
+};
+
 struct Uploader {
   hip::WeightUpload& stager;
   std::vector<Conversion>& conversions;
+  std::vector<Decode>& decodes;
   std::vector<void*>& allocations;
   std::size_t& bytes;
   std::size_t& max_half_cols;
   std::size_t& max_q8_cols;
+  std::size_t& decoded_bytes;
+  std::vector<std::pair<std::string, std::size_t>>* decoded_ptr;
+  std::vector<DeviceModel::UploadedTensor>& uploaded;
   std::string* error;
   bool ok{true};
   std::uint32_t shard_base{0};
@@ -62,6 +133,7 @@ struct Uploader {
            (error != nullptr ? ": " + *error : std::string()));
       return d;
     }
+    uploaded.push_back({std::string(t.name), size, size + kTailMargin});
     (void)hipMemsetAsync(static_cast<std::uint8_t*>(ptr) + size, 0, kTailMargin,
                          nullptr);
     d.data = ptr;
@@ -75,6 +147,143 @@ struct Uploader {
     if (t.type == core::GgmlType::kQ8_0 && t.experts == 1) {
       max_q8_cols = std::max<std::size_t>(max_q8_cols, t.cols);
     }
+    return d;
+  }
+
+  /// Load-time decode of one tensor whose consumers read F32 or F16: the
+  /// stored bytes are staged, expanded by DecodeWeights after the disk
+  /// pipeline drains, and the staging copy is released. A tensor already in
+  /// the destination format is uploaded as stored.
+  DeviceTensor DecodeTensor(const TensorRef& t, bool to_half) {
+    if (t.empty()) {
+      return {};
+    }
+    const core::GgmlType target =
+        to_half ? core::GgmlType::kF16 : core::GgmlType::kF32;
+    if (t.type == target) {
+      return Copy(t);
+    }
+    DeviceTensor d;
+    if (!ok) {
+      return d;
+    }
+    const std::size_t size = t.SizeBytes();
+    void* staging = nullptr;
+    if (hipMalloc(&staging, size + kTailMargin) != hipSuccess) {
+      Fail("hipMalloc failed for " + std::string(t.name) + " (" +
+           std::to_string(size) + " bytes)");
+      return d;
+    }
+    allocations.push_back(staging);
+    bytes += size + kTailMargin;
+    if (!stager.Copy(shard_base + t.shard, t.file_offset, size, staging,
+                     error)) {
+      Fail("upload failed for " + std::string(t.name) +
+           (error != nullptr ? ": " + *error : std::string()));
+      return d;
+    }
+    const std::size_t element_bytes =
+        to_half ? sizeof(std::uint16_t) : sizeof(float);
+    const std::size_t decoded = t.ElementCount() * element_bytes;
+    void* dst = nullptr;
+    if (hipMalloc(&dst, decoded + kTailMargin) != hipSuccess) {
+      Fail("hipMalloc failed for decoded " + std::string(t.name));
+      return d;
+    }
+    allocations.push_back(dst);
+    bytes += decoded + kTailMargin;
+    decoded_bytes += decoded;
+    if (decoded_ptr != nullptr) {
+      decoded_ptr->emplace_back(std::string(t.name), decoded);
+    }
+    (void)hipMemsetAsync(static_cast<std::uint8_t*>(dst) + decoded, 0,
+                         kTailMargin, nullptr);
+    decodes.push_back({staging, dst, t.type, to_half, t.ElementCount()});
+    d.data = dst;
+    d.type = target;
+    d.cols = static_cast<std::uint32_t>(t.cols);
+    d.rows = static_cast<std::uint32_t>(t.rows);
+    d.experts = static_cast<std::uint32_t>(t.experts);
+    if (to_half) {
+      max_half_cols = std::max<std::size_t>(max_half_cols, t.cols);
+    }
+    return d;
+  }
+
+  /// Hyper-connection down/up projections: Q6_K and IQ4_NL are decoded to
+  /// F16 (their consumers are fixed-size F16 kernels); the formats with a
+  /// dense path of their own stay in their stored encoding.
+  DeviceTensor MixerProjection(const TensorRef& t) {
+    if (t.type == core::GgmlType::kQ6_K || t.type == core::GgmlType::kIQ4_NL) {
+      return DecodeTensor(t, true);
+    }
+    return Copy(t);
+  }
+
+  DeviceMixer Mixer(const HcMixer& m) {
+    return {Copy(m.norm), MixerProjection(m.down), MixerProjection(m.up),
+            m.inject.type == core::GgmlType::kQ6_K
+                ? DecodeTensor(m.inject, false)
+                : Copy(m.inject)};
+  }
+
+  /// ssm_alpha | ssm_beta as one F16 block of rows. Q8_0 pairs keep their
+  /// storable encoding (the decode GEMV reads them merged anyway).
+  DeviceTensor StackAlphaBeta(const TensorRef& a, const TensorRef& b) {
+    if (a.type == core::GgmlType::kQ8_0 && b.type == core::GgmlType::kQ8_0) {
+      return Stack({&a, &b});
+    }
+    DeviceTensor d;
+    if (!ok) {
+      return d;
+    }
+    if (a.cols != b.cols || a.empty() || b.empty()) {
+      Fail("stacked alpha/beta tensors disagree");
+      return d;
+    }
+    const std::size_t rows = a.rows + b.rows;
+    const std::size_t payload =
+        (a.ElementCount() + b.ElementCount()) * sizeof(std::uint16_t);
+    void* dst = nullptr;
+    if (hipMalloc(&dst, payload + kTailMargin) != hipSuccess) {
+      Fail("hipMalloc failed for the alpha/beta stack");
+      return d;
+    }
+    allocations.push_back(dst);
+    bytes += payload + kTailMargin;
+    decoded_bytes += payload;
+    if (decoded_ptr != nullptr) {
+      decoded_ptr->emplace_back(std::string(a.name) + "+" + std::string(b.name),
+                                payload);
+    }
+    (void)hipMemsetAsync(static_cast<std::uint8_t*>(dst) + payload, 0,
+                         kTailMargin, nullptr);
+    const auto stage = [&](const TensorRef& t, std::size_t row_offset) {
+      const std::size_t size = t.SizeBytes();
+      void* staging = nullptr;
+      if (hipMalloc(&staging, size + kTailMargin) != hipSuccess) {
+        Fail("hipMalloc failed for " + std::string(t.name));
+        return;
+      }
+      allocations.push_back(staging);
+      bytes += size + kTailMargin;
+      if (stager.Copy(shard_base + t.shard, t.file_offset, size, staging,
+                      error)) {
+        auto* destination = static_cast<std::uint8_t*>(dst) +
+                            row_offset * t.cols * sizeof(std::uint16_t);
+        decodes.push_back(
+            {staging, destination, t.type, true, t.ElementCount()});
+      } else {
+        Fail("upload failed for " + std::string(t.name));
+      }
+    };
+    stage(a, 0);
+    stage(b, a.rows);
+    d.data = dst;
+    d.type = core::GgmlType::kF16;
+    d.cols = static_cast<std::uint32_t>(a.cols);
+    d.rows = static_cast<std::uint32_t>(rows);
+    max_half_cols = std::max<std::size_t>(max_half_cols, d.cols);
     return d;
   }
 
@@ -186,10 +395,6 @@ struct Uploader {
     return d;
   }
 
-  DeviceMixer Mixer(const HcMixer& m) {
-    return {Copy(m.norm), Copy(m.down), Copy(m.up), Copy(m.inject)};
-  }
-
   DeviceLayer Layer(const LayerWeights& l) {
     DeviceLayer d;
     d.linear = l.linear;
@@ -214,7 +419,7 @@ struct Uploader {
     }
     d.ssm_conv1d = Copy(l.ssm_conv1d);
     if (l.linear) {
-      d.ssm_alpha_beta = Stack({&l.ssm_alpha, &l.ssm_beta});
+      d.ssm_alpha_beta = StackAlphaBeta(l.ssm_alpha, l.ssm_beta);
     }
     d.ssm_dt = Copy(l.ssm_dt);
     d.ssm_a = Copy(l.ssm_a);
@@ -239,7 +444,8 @@ struct Uploader {
     d.ple_norm_key = Copy(l.ple_norm_key);
     d.ple_norm_query = Copy(l.ple_norm_query);
     d.ple_norm_conv = Copy(l.ple_norm_conv);
-    d.ple_conv1d = Copy(l.ple_conv1d);
+    // The convolution reads F32 taps; an F16-stored kernel is decoded here.
+    d.ple_conv1d = DecodeTensor(l.ple_conv1d, false);
     d.router = Stack({&l.router, &l.shexp_gate_inp});
     d.ffn_gate_exps = Copy(l.ffn_gate_exps);
     d.ffn_up_exps = Copy(l.ffn_up_exps);
@@ -268,22 +474,14 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
     const ModelWeights& w, const core::GgufReader& reader,
     const MtpWeights* mtp, const core::GgufReader* mtp_reader,
     std::string* error_msg) {
-  // The CPU reference also reads Q6_K, but the production embedding, dense
-  // and routed kernels do not. Reject it before allocating device weights.
-  const auto supported = [&](const TensorRef& t) {
-    if (t.type != core::GgmlType::kQ6_K)
-      return true;
-    if (error_msg != nullptr)
-      *error_msg = "unsupported HIP tensor format Q6_K: " + std::string(t.name);
-    return false;
-  };
-  const auto layer_supported = [&](const LayerWeights& l) {
-    return supported(l.ffn_gate_exps) && supported(l.ffn_up_exps) &&
-           supported(l.ffn_down_exps);
-  };
-  if (!supported(w.token_embd) || !supported(w.output) ||
-      !std::all_of(w.layers.begin(), w.layers.end(), layer_supported) ||
-      (mtp != nullptr && !layer_supported(mtp->block))) {
+  // Every tensor must use a format its weight class accepts (the one table
+  // in weight_format.hpp, applied per tensor at bind time). Revalidating here
+  // keeps the failure ahead of any allocation, names the tensor and format,
+  // and covers a ModelWeights that was not produced by Bind.
+  if (!ValidateTensorFormats(w, error_msg)) {
+    return nullptr;
+  }
+  if (mtp != nullptr && !ValidateTensorFormats(*mtp, error_msg)) {
     return nullptr;
   }
   std::unique_ptr<DeviceModel> m(new DeviceModel());
@@ -305,8 +503,11 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
     return nullptr;
   }
   std::vector<Conversion> conversions;
-  Uploader up{*stager,           conversions,     m->allocations_, m->bytes_,
-              m->max_half_cols_, m->max_q8_cols_, error_msg};
+  std::vector<Decode> decodes;
+  Uploader up{*stager,         conversions,       decodes,
+              m->allocations_, m->bytes_,         m->max_half_cols_,
+              m->max_q8_cols_, m->decoded_bytes_, &m->decoded_,
+              m->uploaded_,    error_msg};
   m->token_embd_ = up.Copy(w.token_embd);
   m->output_ =
       w.output.data == w.token_embd.data ? m->token_embd_ : up.Copy(w.output);
@@ -332,6 +533,12 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
     NarrowActivations(static_cast<const float*>(c.source), c.destination, false,
                       c.count, nullptr);
   }
+  // Decode the tensors whose consumers are fixed-size F32/F16 kernels. The
+  // staging copies stay resident until here, exactly like the F32 narrowings.
+  for (const auto& d : decodes) {
+    DecodeWeights(d.source, SmallType(d.type), d.destination, d.to_half,
+                  d.elements, nullptr);
+  }
   const auto status = hipDeviceSynchronize();
   if (status != hipSuccess) {
     if (error_msg != nullptr) {
@@ -344,6 +551,13 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
     std::erase(m->allocations_, c.source);
     (void)hipFree(c.source);
     m->bytes_ -= c.count * sizeof(float) + kTailMargin;
+  }
+  for (const auto& d : decodes) {
+    std::erase(m->allocations_, d.source);
+    (void)hipFree(d.source);
+    m->bytes_ -=
+        d.elements * WeightBlockBytes(d.type) / WeightBlockElements(d.type) +
+        kTailMargin;
   }
   return m;
 }

@@ -1,0 +1,38 @@
+{
+ "tag": "ap",
+ "model": "Signal-3.8-Flash-Next-AP-Q4_K_XL.gguf",
+ "prompt_tokens": 1966,
+ "words": 1690,
+ "seed": 0,
+ "continuation_tokens": 128,
+ "scored_positions": 2094,
+ "covered_positions": 128,
+ "covered_first": 1965,
+ "covered_last": 2092,
+ "top1_agreement": 0.984375,
+ "mean_kl_gufo_llama": 0.08146284510319082,
+ "mean_kl_llama_gufo": 0.06532884559595141,
+ "worst_kl_gufo_llama": 1.4418115640735207,
+ "worst_kl_position": 2059,
+ "context": 4096,
+ "divergence": {
+  "position": 1969,
+  "forced_token": 279,
+  "gufo_top1": [
+   29123,
+   15.245348930358887
+  ],
+  "gufo_top2": [
+   279,
+   15.163222312927246
+  ],
+  "llama_top1": [
+   279,
+   15.336214065551758
+  ],
+  "llama_top2": [
+   29123,
+   15.281521797180176
+  ]
+ }
+}

@@ -25,6 +25,8 @@ struct Format {
       return {1, 2};
     case GgmlType::kQ8_0:
       return {32, 34};
+    case GgmlType::kQ5_0:
+      return {32, 22};
     case GgmlType::kQ5_1:
       return {32, 24};
     case GgmlType::kIQ4_NL:
@@ -52,10 +54,10 @@ struct Binder {
     ok = false;
   }
 
-  /// Binds `name` with the exact shape and one of the accepted formats.
+  /// Binds `name` with the exact shape and one of the formats the class
+  /// accepts (weight_format.hpp).
   TensorRef Get(const std::string& name, std::uint64_t cols, std::uint64_t rows,
-                std::uint64_t experts, std::initializer_list<GgmlType> types,
-                bool required = true) {
+                std::uint64_t experts, WeightClass cls, bool required = true) {
     TensorRef t;
     const auto* info = reader.FindTensor(name);
     if (info == nullptr) {
@@ -76,14 +78,10 @@ struct Binder {
            std::to_string(rows) + ", " + std::to_string(experts) + "]");
       return t;
     }
-    bool type_ok = false;
-    for (auto type : types) {
-      type_ok = type_ok || info->type == type;
-    }
     const Format format = FormatOf(info->type);
-    if (!type_ok || format.block == 0 || cols % format.block != 0) {
-      Fail("tensor " + name + " has unsupported format " +
-           std::string(core::ToString(info->type)));
+    if (!FormatAccepted(cls, info->type) || format.block == 0 ||
+        cols % format.block != 0) {
+      Fail(UnsupportedFormatMessage(name, info->type, cls));
       return t;
     }
     t.data = info->data;
@@ -92,6 +90,7 @@ struct Binder {
     t.rows = rows;
     t.experts = experts;
     t.name = info->name;
+    t.cls = cls;
     // Locate the shard so disk readers can address the payload directly, and
     // so a payload running past its shard is caught here rather than as a
     // fault later.
@@ -117,16 +116,14 @@ struct Binder {
   HcMixer Mixer(const std::string& prefix, const Config& c, bool with_inject) {
     HcMixer m;
     const std::uint64_t hc_dim = c.HcDim();
-    m.norm = Get(prefix + "_norm.weight", hc_dim, 1, 1, {GgmlType::kF32});
-    m.down =
-        Get(prefix + "_down.weight", hc_dim, c.hc_low_rank, 1,
-            {GgmlType::kQ8_0, GgmlType::kBF16, GgmlType::kF16, GgmlType::kF32});
-    m.up =
-        Get(prefix + "_up.weight", c.hc_low_rank, hc_dim, 1,
-            {GgmlType::kQ8_0, GgmlType::kBF16, GgmlType::kF16, GgmlType::kF32});
+    m.norm = Get(prefix + "_norm.weight", hc_dim, 1, 1, WeightClass::kF32Only);
+    m.down = Get(prefix + "_down.weight", hc_dim, c.hc_low_rank, 1,
+                 WeightClass::kMixerDownUp);
+    m.up = Get(prefix + "_up.weight", c.hc_low_rank, hc_dim, 1,
+               WeightClass::kMixerDownUp);
     if (with_inject) {
       m.inject = Get(prefix + "_inject.weight", hc_dim, c.hc_count, 1,
-                     {GgmlType::kF32, GgmlType::kQ8_0, GgmlType::kBF16});
+                     WeightClass::kMixerInject);
     }
     return m;
   }
@@ -138,10 +135,8 @@ struct Binder {
     const std::string p = "blk." + std::to_string(il) + ".";
     const std::uint64_t hidden = c.hidden_size;
     const std::uint64_t hc_dim = c.HcDim();
-    const auto dense = {GgmlType::kQ8_0, GgmlType::kBF16, GgmlType::kF16,
-                        GgmlType::kF32};
-    const auto experts = {GgmlType::kQ4_K, GgmlType::kQ5_K, GgmlType::kQ6_K,
-                          GgmlType::kQ5_1, GgmlType::kQ8_0};
+    constexpr WeightClass dense = WeightClass::kDense;
+    constexpr WeightClass f32 = WeightClass::kF32Only;
 
     l.hc_attn = Mixer(p + "hc_attn", c, true);
     l.hc_ffn = Mixer(p + "hc_ffn", c, true);
@@ -152,16 +147,14 @@ struct Binder {
       l.ssm_gate =
           Get(p + "attn_gate.weight", hidden, c.SsmValueDim(), 1, dense);
       l.ssm_conv1d = Get(p + "ssm_conv1d.weight", c.ssm_conv_kernel,
-                         c.SsmConvChannels(), 1, {GgmlType::kF32});
+                         c.SsmConvChannels(), 1, f32);
       l.ssm_alpha = Get(p + "ssm_alpha.weight", hidden, c.ssm_num_v_heads, 1,
-                        {GgmlType::kF32, GgmlType::kBF16, GgmlType::kQ8_0});
+                        WeightClass::kSsmGate);
       l.ssm_beta = Get(p + "ssm_beta.weight", hidden, c.ssm_num_v_heads, 1,
-                       {GgmlType::kF32, GgmlType::kBF16, GgmlType::kQ8_0});
-      l.ssm_dt =
-          Get(p + "ssm_dt.bias", c.ssm_num_v_heads, 1, 1, {GgmlType::kF32});
-      l.ssm_a = Get(p + "ssm_a", c.ssm_num_v_heads, 1, 1, {GgmlType::kF32});
-      l.ssm_norm =
-          Get(p + "ssm_norm.weight", c.ssm_head_dim, 1, 1, {GgmlType::kF32});
+                       WeightClass::kSsmGate);
+      l.ssm_dt = Get(p + "ssm_dt.bias", c.ssm_num_v_heads, 1, 1, f32);
+      l.ssm_a = Get(p + "ssm_a", c.ssm_num_v_heads, 1, 1, f32);
+      l.ssm_norm = Get(p + "ssm_norm.weight", c.ssm_head_dim, 1, 1, f32);
       l.ssm_out = Get(p + "ssm_out.weight", c.SsmValueDim(), hidden, 1, dense);
     } else {
       l.attn_q =
@@ -170,44 +163,37 @@ struct Binder {
       l.attn_v = Get(p + "attn_v.weight", hidden, c.AttentionKvDim(), 1, dense);
       l.attn_out =
           Get(p + "attn_output.weight", c.AttentionQDim(), hidden, 1, dense);
-      l.attn_q_norm =
-          Get(p + "attn_q_norm.weight", c.head_dim, 1, 1, {GgmlType::kF32});
-      l.attn_k_norm =
-          Get(p + "attn_k_norm.weight", c.head_dim, 1, 1, {GgmlType::kF32});
+      l.attn_q_norm = Get(p + "attn_q_norm.weight", c.head_dim, 1, 1, f32);
+      l.attn_k_norm = Get(p + "attn_k_norm.weight", c.head_dim, 1, 1, f32);
       l.indexer_q = Get(p + "indexer.q_proj.weight", hidden,
                         c.indexer_heads * c.indexer_head_dim, 1, dense);
       l.indexer_k = Get(p + "indexer.k_proj.weight", hidden, c.indexer_head_dim,
                         1, dense);
-      l.indexer_q_norm = Get(p + "indexer.q_norm.weight", c.indexer_head_dim, 1,
-                             1, {GgmlType::kF32});
-      l.indexer_k_norm = Get(p + "indexer.k_norm.weight", c.indexer_head_dim, 1,
-                             1, {GgmlType::kF32});
+      l.indexer_q_norm =
+          Get(p + "indexer.q_norm.weight", c.indexer_head_dim, 1, 1, f32);
+      l.indexer_k_norm =
+          Get(p + "indexer.k_norm.weight", c.indexer_head_dim, 1, 1, f32);
     }
 
     if (ple) {
       const std::uint64_t ple_dim = c.PleEmbeddingDim();
       l.ple_key = Get(p + "ple_key.weight", ple_dim, hc_dim, 1, dense);
       l.ple_value = Get(p + "ple_value.weight", ple_dim, hidden, 1, dense);
-      l.ple_norm_key =
-          Get(p + "ple_norm_key.weight", hc_dim, 1, 1, {GgmlType::kF32});
-      l.ple_norm_query =
-          Get(p + "ple_norm_query.weight", hc_dim, 1, 1, {GgmlType::kF32});
-      l.ple_norm_conv =
-          Get(p + "ple_norm_conv.weight", hc_dim, 1, 1, {GgmlType::kF32});
+      l.ple_norm_key = Get(p + "ple_norm_key.weight", hc_dim, 1, 1, f32);
+      l.ple_norm_query = Get(p + "ple_norm_query.weight", hc_dim, 1, 1, f32);
+      l.ple_norm_conv = Get(p + "ple_norm_conv.weight", hc_dim, 1, 1, f32);
       l.ple_conv1d = Get(p + "ple_conv1d.weight", c.ple_conv_kernel, hc_dim, 1,
-                         {GgmlType::kF32});
+                         WeightClass::kPleConv1d);
     }
 
-    l.router = Get(p + "ffn_gate_inp.weight", hidden, c.num_experts, 1,
-                   {GgmlType::kF32});
+    l.router = Get(p + "ffn_gate_inp.weight", hidden, c.num_experts, 1, f32);
     l.ffn_gate_exps = Get(p + "ffn_gate_exps.weight", hidden, c.expert_ff,
-                          c.num_experts, experts);
+                          c.num_experts, WeightClass::kRoutedGateUp);
     l.ffn_up_exps = Get(p + "ffn_up_exps.weight", hidden, c.expert_ff,
-                        c.num_experts, experts);
+                        c.num_experts, WeightClass::kRoutedGateUp);
     l.ffn_down_exps = Get(p + "ffn_down_exps.weight", c.expert_ff, hidden,
-                          c.num_experts, experts);
-    l.shexp_gate_inp =
-        Get(p + "ffn_gate_inp_shexp.weight", hidden, 1, 1, {GgmlType::kF32});
+                          c.num_experts, WeightClass::kRoutedDown);
+    l.shexp_gate_inp = Get(p + "ffn_gate_inp_shexp.weight", hidden, 1, 1, f32);
     l.shexp_gate =
         Get(p + "ffn_gate_shexp.weight", hidden, c.shared_expert_ff, 1, dense);
     l.shexp_up =
@@ -216,10 +202,8 @@ struct Binder {
         Get(p + "ffn_down_shexp.weight", c.shared_expert_ff, hidden, 1, dense);
 
     if (nextn) {
-      l.nextn_enorm =
-          Get(p + "nextn.enorm.weight", hidden, 1, 1, {GgmlType::kF32});
-      l.nextn_hnorm =
-          Get(p + "nextn.hnorm.weight", hc_dim, 1, 1, {GgmlType::kF32});
+      l.nextn_enorm = Get(p + "nextn.enorm.weight", hidden, 1, 1, f32);
+      l.nextn_hnorm = Get(p + "nextn.hnorm.weight", hc_dim, 1, 1, f32);
       l.nextn_eh_proj =
           Get(p + "nextn.eh_proj.weight", 2 * hidden, hidden, 1, dense);
       l.nextn_head = Mixer(p + "nextn.hc_head", c, false);
@@ -248,8 +232,7 @@ std::optional<ModelWeights> ModelWeights::Bind(const core::GgufReader& reader,
   ModelWeights w;
   w.config = *config;
   const Config& c = w.config;
-  const auto dense = {GgmlType::kQ8_0, GgmlType::kQ6_K, GgmlType::kBF16,
-                      GgmlType::kF16, GgmlType::kF32};
+  constexpr WeightClass dense = WeightClass::kDense;
 
   {
     // The vocabulary is the embedding row count; no metadata key carries it.
@@ -279,7 +262,7 @@ std::optional<ModelWeights> ModelWeights::Bind(const core::GgufReader& reader,
       b.Fail("per_layer_token_embd.weight is missing or too short");
     } else {
       w.ple_table = b.Get("per_layer_token_embd.weight", c.ple_head_dim, rows,
-                          1, {GgmlType::kIQ4_NL, GgmlType::kBF16});
+                          1, WeightClass::kPleTable);
     }
   }
   w.layers.reserve(c.num_layers);
@@ -316,6 +299,38 @@ std::optional<MtpWeights> MtpWeights::Bind(const core::GgufReader& reader,
     return std::nullopt;
   }
   return m;
+}
+
+namespace {
+
+/// Reports the first tensor whose format its class does not accept.
+template<typename Weights>
+bool ValidateFormats(const Weights& weights, std::string* error_msg) {
+  const TensorRef* offender = nullptr;
+  ForEachTensor(weights, [&](const TensorRef& t) {
+    if (offender == nullptr && !t.empty() && !FormatAccepted(t.cls, t.type)) {
+      offender = &t;
+    }
+  });
+  if (offender == nullptr) {
+    return true;
+  }
+  if (error_msg != nullptr) {
+    *error_msg =
+        UnsupportedFormatMessage(offender->name, offender->type, offender->cls);
+  }
+  return false;
+}
+
+}  // namespace
+
+bool ValidateTensorFormats(const ModelWeights& weights,
+                           std::string* error_msg) {
+  return ValidateFormats(weights, error_msg);
+}
+
+bool ValidateTensorFormats(const MtpWeights& weights, std::string* error_msg) {
+  return ValidateFormats(weights, error_msg);
 }
 
 }  // namespace gufo::models::qwen38_flash_next

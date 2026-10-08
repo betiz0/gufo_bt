@@ -1,0 +1,43 @@
+{
+ "tag": "swift",
+ "model": "Swift-1.5-Qwen3.8-Flash-Next-Q4_K_M-00001-of-00003.gguf",
+ "prompt_tokens": 1966,
+ "words": 1690,
+ "seed": 0,
+ "continuation_tokens": 128,
+ "scored_positions": 2094,
+ "covered_positions": 128,
+ "covered_first": 1965,
+ "covered_last": 2092,
+ "top1_agreement": 0.9765625,
+ "mean_kl_gufo_llama": 0.005891668358753758,
+ "mean_kl_llama_gufo": 0.005415359272574689,
+ "worst_kl_gufo_llama": 0.12378506905461198,
+ "worst_kl_position": 2013,
+ "context": 4096,
+ "llama_batch_requested": 2048,
+ "llama_ubatch_requested": 512,
+ "llama_n_batch": 2048,
+ "llama_n_ubatch": 512,
+ "gufo_prefill_chunk": 512,
+ "divergence": {
+  "position": 1970,
+  "forced_token": 279,
+  "gufo_top1": [
+   29123,
+   15.470946311950684
+  ],
+  "gufo_top2": [
+   279,
+   15.458051681518555
+  ],
+  "llama_top1": [
+   279,
+   15.559350967407227
+  ],
+  "llama_top2": [
+   29123,
+   15.416038513183594
+  ]
+ }
+}

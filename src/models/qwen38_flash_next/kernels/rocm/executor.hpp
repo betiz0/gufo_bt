@@ -132,6 +132,39 @@ private:
   void TrimRollback(std::uint32_t depth) noexcept;
 };
 
+/// Projection route the executor selected. This is a test-visible record for
+/// the route checks, not a CLI or configuration surface (design D8).
+enum class WeightRoute : std::uint8_t {
+  kSmall,           ///< F32/BF16/F16 narrow-batch F32 GEMM.
+  kQ8Gemv,          ///< Q8_0 decode GEMV over the batch's quantized input.
+  kQ8F16Gemm,       ///< Q8_0 wide F16 WMMA GEMM.
+  kQ8W8A8,          ///< Q8_0 wide int8 WMMA GEMM.
+  kAdapterMmq,      ///< Q6_K/IQ4_NL tiled MMQ projection.
+  kAdapterGemv,     ///< Q6_K/IQ4_NL decode GEMV.
+  kBlasGemm,        ///< F32/BF16/F16 wide-batch hipBLAS(Lt) GEMM.
+  kMixerFusedDown,  ///< Fused HC down projection (Q8_0).
+  kMixerW8A8Down,   ///< W8A8 HC down projection over the F16 norm (Q8_0).
+  kMixerFusedUp,    ///< Fused HC up projection and epilogue (Q8_0).
+  kMoeWmma,         ///< Routed F16 WMMA expert GEMM.
+  kMoeAdapter,      ///< Routed adapter MMQ (tiled prefill).
+  kMoeVector,       ///< Routed adapter vector projection (decode).
+};
+
+/// One recorded projection: its route, the weight format it read, the output
+/// row count, the reduction width, the batch width and the batch class the
+/// parent commit's `MatrixRows` would have seen (prefill phase or more than
+/// the vector-width tokens). The class is recorded, not inferred from the
+/// token count: a prefill's logit head runs outside the prefill phase, and a
+/// short prefill chunk runs inside it.
+struct RouteRecord {
+  WeightRoute route;
+  core::GgmlType type;
+  std::uint32_t rows;
+  std::uint32_t cols;
+  std::uint32_t tokens;
+  bool tiled;
+};
+
 /// Runs the trunk graph on the GPU for one session at a time. Buffers are
 /// sized once for `max_batch` tokens; longer prompts are fed in chunks.
 class Executor {
@@ -285,8 +318,26 @@ public:
   }
   [[nodiscard]] bool has_mtp() const noexcept { return model_->has_mtp(); }
 
+  /// Device weights this executor runs (test/introspection surface).
+  [[nodiscard]] const DeviceModel& device() const noexcept { return *model_; }
+
+  /// Routes selected since the last ResetRoutes(): one entry per dense and
+  /// Mixer projection, plus one per routed expert call. Empty unless a test
+  /// called EnableRouteRecording (design D8): a production executor records
+  /// nothing, so the log cannot grow across a server's prefill and verify
+  /// batches.
+  [[nodiscard]] const std::vector<RouteRecord>& routes() const noexcept {
+    return routes_;
+  }
+  void ResetRoutes() const noexcept { routes_.clear(); }
+  /// Turns the test-visible route log on. Off in production.
+  void EnableRouteRecording() const noexcept { record_routes_ = true; }
+
 private:
   Executor() = default;
+
+  void RecordRoute(WeightRoute route, const DeviceTensor& w,
+                   std::uint32_t tokens) const;
 
   /// Visits every device region of a snapshot in payload order with
   /// (device pointer or null when sizing, payload offset, bytes, name).
@@ -558,6 +609,10 @@ private:
   /// Partial sums per inject logit the last HcMix left in s_.inject.
   mutable std::uint32_t inject_parts_{1};
   mutable unsigned q8_slot_{0};
+  /// Route log for the route checks; one entry per recorded projection while
+  /// a test has enabled recording.
+  mutable std::vector<RouteRecord> routes_;
+  mutable bool record_routes_{false};
 };
 
 }  // namespace gufo::models::qwen38_flash_next::rocm
