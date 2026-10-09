@@ -89,5 +89,6 @@ VRAM と GPU を使うテストは並列実行しない。`ctest` に `-j`／`--
 - [x] 6.2 マージをコミットする。6.1 で不合格がない場合、または不合格について利用者が判断した後に、解決したファイルだけをステージして `git commit -m "chore: merge upstream/main f17e37b"` を実行する。完了条件: `git log -1 --format=%P` の親が `d64a25c` と `f17e37b` の 2 つで、`git diff --name-only --diff-filter=U` が空
   - 根拠（2026-10-09）: `git commit -m "chore: merge upstream/main f17e37b"` = `f224da5`。`git log -1 --format=%P` の親は `d64a25c` と `f17e37b` の 2 つ、`git diff --name-only --diff-filter=U` は空。解決 7 ファイルに加え、ビルド修正（serve.cpp の重複 sampling 検証削除、KVarN/qk_rope/graph_ops テスト更新、fp16.hpp 追加）と 5.7 の断言修正（serving_test.cpp）を同梱
 - [ ] 6.3 利用者の確認を得てから `git push origin kvarn-kv-cache-quantization` を実行する（fast-forward。push 後のロールバックは design の Migration Plan の `git revert -m 1`）。完了条件: `git rev-list --count origin/kvarn-kv-cache-quantization..HEAD` が 0
+  - 状況（2026-10-09）: マージコミット `f224da5` と変更アーティファクト `e3c451b` をローカルに作成済み（作業ツリーはクリーン）。利用者の判断で push は保留（「まだ push しない」）。実行時は fast-forward（ローカルが `origin/kvarn-kv-cache-quantization` より 74 コミット先行）
 - [x] 6.4 マージの結果（`upstream/main` のコミット、解決した 7 ファイル、テスト結果、同一性キーの更新によるキャッシュ無効化）を各タスクの根拠として記録する。完了条件: 各タスクに実行ログの要点が入り、`openspec validate merge-upstream-main --strict` が通る
   - 根拠（2026-10-09）: 各タスクの根拠を記録（1〜6 章、実行ログの要点付き）。`openspec validate merge-upstream-main --strict` = 「変更 'merge-upstream-main' は有効です」（exit 0）
