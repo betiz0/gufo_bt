@@ -22,6 +22,7 @@
 #include "src/models/qwen/hip/kvarn.hpp"
 #include "src/models/qwen/kvarn_reference.hpp"
 #include "tests/models/qwen/hip/support/device.hpp"
+#include "tests/models/qwen/hip/support/fp16.hpp"
 #include "tests/testing/test_common.hpp"
 
 namespace {
@@ -125,13 +126,12 @@ struct SealHarness {
     std::vector<std::uint16_t> rows(kRows * kCols);
     for (std::uint32_t r = 0; r < kRows; ++r) {
       for (std::uint32_t c = 0; c < kCols; ++c) {
-        rows[r * kCols + c] =
-            __half_as_ushort(__float2half_rn(tile[r * kCols + c]));
+        rows[r * kCols + c] = gufo::test::FloatToFp16Bits(tile[r * kCols + c]);
       }
     }
     if (non_finite) {
-      rows[5 * kCols + 11] = __half_as_ushort(
-          __float2half_rn(std::numeric_limits<float>::infinity()));
+      rows[5 * kCols + 11] =
+          gufo::test::FloatToFp16Bits(std::numeric_limits<float>::infinity());
     }
     const std::size_t plane_bytes = tail_plane * sizeof(std::uint16_t);
     HIP_CHECK(hipMemcpy(tail, rows.data(), rows.size() * sizeof(std::uint16_t),

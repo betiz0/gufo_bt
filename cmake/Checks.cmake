@@ -3,7 +3,9 @@
 set(gufo_pr_targets
   arg_parser_test json_test json_constraint_test gguf_reader_test gguf_identity_test
   logit_sampler_test ggml_dequant_test
-  openai_chat_test http_server_test audio_websocket_test text_generation_scheduler_test
+  quote_tracker_test
+  openai_chat_test http_server_test trace_test audio_websocket_test
+  text_generation_scheduler_test
   text_model_runner_test continuation_disk_store_test
   bench_cli_test prompt_cli_test eval_http_client_test
   qwen_tokenizer_test qwen_chat_template_test
@@ -23,7 +25,8 @@ list(APPEND gufo_pr_tests
   "qwen38_flash_next\\.config" "qwen38_flash_next\\.format_policy"
   "qwen38_flash_next\\.mtp_sampling"
   "ds4\\.sampling" "ds4\\.template" "ds4\\.cli"
-  gufo_version gufo_help serve_cli_test eval_http_test)
+  gufo_version gufo_help serve_cli_test eval_http_test functional_runner_test
+  kernel_resources_parser_test)
 list(JOIN gufo_pr_tests "|" gufo_pr_pattern)
 add_custom_target(check-pr
   COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure --no-tests=error

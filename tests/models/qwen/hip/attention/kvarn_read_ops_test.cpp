@@ -24,6 +24,7 @@
 #include "src/models/qwen/hip/ops/attention.hpp"
 #include "src/models/qwen/kvarn_reference.hpp"
 #include "tests/models/qwen/hip/support/device.hpp"
+#include "tests/models/qwen/hip/support/fp16.hpp"
 #include "tests/testing/test_common.hpp"
 
 namespace {
@@ -108,8 +109,7 @@ struct ReadHarness {
       for (const bool is_value : {false, true}) {
         std::vector<std::uint16_t> row(kHeadDim);
         for (std::uint32_t c = 0; c < kHeadDim; ++c) {
-          row[c] = __half_as_ushort(
-              __float2half_rn(KeyValue(position, c, is_value)));
+          row[c] = gufo::test::FloatToFp16Bits(KeyValue(position, c, is_value));
         }
         std::uint8_t* destination = nullptr;
         std::size_t plane = 0;

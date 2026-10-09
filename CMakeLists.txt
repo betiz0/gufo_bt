@@ -23,6 +23,8 @@ find_package(Threads REQUIRED)
 find_package(CURL REQUIRED)
 find_package(PNG REQUIRED)
 find_package(JPEG REQUIRED)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(WEBP REQUIRED IMPORTED_TARGET libwebp)
 find_package(OpenSSL REQUIRED COMPONENTS Crypto)
 set(GUFO_FFMPEG_EXECUTABLE "ffmpeg" CACHE STRING
   "FFmpeg executable used for generated media")
@@ -138,7 +140,7 @@ target_compile_definitions(gufo_core PRIVATE
   GUFO_FFMPEG_EXECUTABLE="${GUFO_FFMPEG_EXECUTABLE}"
   GUFO_FFPROBE_EXECUTABLE="${GUFO_FFPROBE_EXECUTABLE}")
 target_link_libraries(gufo_core PUBLIC ICU::uc ICU::i18n Threads::Threads
-  PNG::PNG JPEG::JPEG CURL::libcurl OpenSSL::Crypto)
+  PNG::PNG JPEG::JPEG PkgConfig::WEBP CURL::libcurl OpenSSL::Crypto)
 
 add_subdirectory(src/models/qwen)
 add_subdirectory(src/models/qwen_image_21)
@@ -186,9 +188,16 @@ if(ENGINE_ENABLE_HIP)
     gufo_qwen38_flash_next)
 endif()
 
-add_library(gufo_logging STATIC src/cli/serve/logging.cpp)
+add_library(gufo_logging STATIC src/cli/serve/logging.cpp src/cli/serve/trace.cpp)
 target_include_directories(gufo_logging PUBLIC ${PROJECT_SOURCE_DIR})
 target_compile_features(gufo_logging PUBLIC cxx_std_20)
+
+# The imported DeepSeek V4 Flash runtime routes its informational messages
+# through the shared logger instead of writing to stderr directly, so it needs
+# the threshold that `--log-level` arms.
+if (ENGINE_ENABLE_HIP)
+  target_link_libraries(gufo_deepseek_v4_flash PUBLIC gufo_logging)
+endif()
 
 add_library(gufo_http STATIC
   src/cli/serve/image_api.cpp
@@ -291,6 +300,12 @@ if (BUILD_TESTING)
   add_compile_options(-UNDEBUG)
   find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
+  # Opt-in live process-failure checks, never preloaded into hosted tests or
+  # production. No HIP headers are needed for these stable C ABI hooks.
+  add_library(device_loss_faults SHARED EXCLUDE_FROM_ALL
+    tests/functional/device_loss_faults.cpp)
+  target_link_libraries(device_loss_faults PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
+
   add_subdirectory(tests/models/qwen)
   add_subdirectory(tests/models/qwen27b)
   gufo_qwen3_asr_register_tests()
@@ -347,6 +362,8 @@ if (BUILD_TESTING)
 
   add_executable(json_constraint_test tests/core/json_constraint_test.cpp)
   target_link_libraries(json_constraint_test PRIVATE gufo_core)
+  target_compile_definitions(json_constraint_test PRIVATE
+    GUFO_LLAMA_TOOL_GRAMMAR_GOLDENS="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/llama_cpp_tool_grammar.json")
   add_test(NAME json_constraint_test COMMAND json_constraint_test)
   set_tests_properties(json_constraint_test PROPERTIES LABELS "cpu;json;sampling")
 
@@ -357,12 +374,23 @@ if (BUILD_TESTING)
 
   add_executable(openai_chat_test
     tests/cli/openai_chat_test.cpp
+    src/cli/serve/logging.cpp
     src/cli/serve/openai_chat.cpp
   )
   target_link_libraries(openai_chat_test PRIVATE gufo_core)
   add_test(NAME openai_chat_test COMMAND openai_chat_test)
   set_tests_properties(openai_chat_test PROPERTIES
     LABELS "cpu;server;api;openai;streaming;tools")
+
+  add_executable(quote_tracker_test tests/cli/quote_tracker_test.cpp)
+  target_link_libraries(quote_tracker_test PRIVATE gufo_core)
+  add_test(NAME quote_tracker_test COMMAND quote_tracker_test)
+  set_tests_properties(quote_tracker_test PROPERTIES LABELS "cpu;server;api")
+
+  add_executable(trace_test tests/cli/trace_test.cpp)
+  target_link_libraries(trace_test PRIVATE gufo_logging)
+  add_test(NAME trace_test COMMAND trace_test)
+  set_tests_properties(trace_test PROPERTIES LABELS "cpu;server;trace")
 
   add_executable(http_server_test tests/cli/http_server_test.cpp)
   target_link_libraries(http_server_test PRIVATE gufo_http)
@@ -377,6 +405,28 @@ if (BUILD_TESTING)
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/cli/serve_test.py
       $<TARGET_FILE:gufo>)
   set_tests_properties(serve_cli_test PROPERTIES LABELS "cpu;server;cli" TIMEOUT 30)
+
+  add_test(NAME kernel_resources_parser_test
+    COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/tools/kernel_resources_test.py)
+  set_tests_properties(kernel_resources_parser_test PROPERTIES
+    LABELS "cpu;kernels" TIMEOUT 30)
+
+  if(ENGINE_ENABLE_HIP)
+    # A compiler update can make a kernel spill with no source change. Clang 23
+    # increased the scratch of the Q8 prefill GEMM from 0 to 480 bytes. This
+    # test fails if a kernel uses more scratch than the baseline allows. It
+    # reads the code objects in the binary and does not use a GPU.
+    get_filename_component(GUFO_HIP_BIN_DIR ${CMAKE_HIP_COMPILER} DIRECTORY)
+    add_test(NAME kernel_resources_test
+      COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tools/ci/check-kernel-resources.py
+        $<TARGET_FILE:gufo>
+        --baseline ${CMAKE_CURRENT_SOURCE_DIR}/tools/ci/kernel-resources.json
+        --bundler ${GUFO_HIP_BIN_DIR}/clang-offload-bundler)
+    set_tests_properties(kernel_resources_test PROPERTIES
+      LABELS "cpu;kernels" TIMEOUT 120)
+  endif()
 
   add_subdirectory(tests/models/deepseek_v4_flash)
   add_subdirectory(tests/models/qwen38_flash_next)
@@ -405,7 +455,7 @@ if (BUILD_TESTING)
   add_executable(continuation_cache_test
     tests/cli/continuation_cache_test.cpp
     src/cli/serve/continuation_cache.cpp)
-  target_link_libraries(continuation_cache_test PRIVATE gufo_core)
+  target_link_libraries(continuation_cache_test PRIVATE gufo_core gufo_logging)
   add_test(NAME continuation_cache_test COMMAND continuation_cache_test)
   set_tests_properties(continuation_cache_test PROPERTIES
     LABELS "cpu;server;cache;state;lifecycle")
@@ -534,6 +584,11 @@ if (BUILD_TESTING)
       ${CMAKE_CURRENT_SOURCE_DIR}/tests/tools/serving_bench_test.py)
   set_tests_properties(serving_bench_test PROPERTIES
     LABELS "cpu;tools;server;benchmarks;statistics;json")
+
+  add_test(NAME functional_runner_test
+    COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/functional/test_runner.py)
+  set_tests_properties(functional_runner_test PROPERTIES LABELS "cpu;server;functional")
 
   add_test(NAME speculative_corpus_test
     COMMAND ${Python3_EXECUTABLE}

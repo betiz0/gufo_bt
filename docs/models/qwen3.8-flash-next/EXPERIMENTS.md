@@ -2,6 +2,16 @@
 
 | Experiment | Decision / evidence |
 | --- | --- |
+| Final-layer AR prefill pruning | Retained: pp2048 reaches 1501.84 tok/s at 128K (+1.8%) and 1713.11 at d0 (+1.2%) in matched single-run controls. Only unused output rows are skipped; target logits and cache replay remain exact. MTP needs the full hidden sequence. [Evidence](artifacts/prefill-final-rows.json). |
+| Further 128K selector/attention tuning | Rejected: FP32 key staging, lane/register scheduling, histogram aggregation and attention LDS/row tiling retained exact outputs but did not improve complete operations. [Profile](artifacts/prefill-final-rows.json). |
+| Bounded selector score scratch | Retained: exact deep-context logits; pp2048 gains about 1.4% AR / 1.2% MTP at 128K in single-run controls, with no measured shallow-context regression. Shared scratch falls from 128 to 20 MiB. [Evidence](artifacts/prefill-deep-context.json). |
+| Deep attention packing and skipped work | Rejected: shared selection lists and skipping masked matrix rows were slower; rescaling and fragment prefetch gave no compelling model-level gain. [Experiments](artifacts/prefill-deep-context.json). |
+| Skip unused final HC normalization | Retained: residuals and 64 full-vocabulary logit rows are exact. PP is within 0.3% of main at d0/d32K, AR and MTP; no significant speedup demonstrated. [Controls](artifacts/prefill-normalization.json). |
+| Prefill expert tiles, load scheduling and GDN stores | Rejected: mixed expert tiles slowed PP about 1.1%; smaller dense tiles and streaming loads were slower; GDN changes had no repeatable gain. [Experiments](artifacts/prefill-normalization.json). |
+| Conversation checkpoints and asynchronous capture | Retained: edits, growing histories and rotation with bounded RAM; AR/MTP cancellation, image replay and disk restart pass, including four execution sessions. Intermediate copies allow peers to continue, and coincident RAM/disk boundaries share one copy. [Functional checks](../../../tests/functional/README.md). |
+| Prefix-independent MTP cache projections | Retained: exact seeded replay across prompt splits and checkpoint replacement, using shared Q8 row arithmetic. [Checks and timings](artifacts/mtp-cache-replay.json). |
+| Skip discarded MTP outputs | Retained: K/V-only prefill, compact catch-up and wider projection tiles; C1 costs remeasured. Prefill is within 0.3% of main; d0 TG remains 1.1% slower, d4K TG is 0.4% faster. |
+| Group vocabulary rows per block | Rejected: no measurable end-to-end gain. |
 | Full-width MTP RMSNorm and split projection | Retained after independent CPU stage audit; one 10240-wide normalization, embedding projection shared across HC branches. |
 | Full Q8 vocabulary head | Retained; private Q4 shortlist removed. Sampled top-64 proposals use exact target verification. |
 | Batched MTP transformer and heads | Retained; independent body/head comparisons, private KV/recurrent/rollback/RNG state. |
@@ -49,6 +59,9 @@
 | Live final frontier and async prompt snapshots | Retained; immutable branch snapshot, worker capture, bounded persistence outside the lookup lock. |
 | Thread-local decode graph capture | Retained; independent snapshot workers no longer invalidate a peer's capture. Snapshot bytes and captured/replayed logits are exact; no request serialization added. |
 | Chunk-equivalent projections/attention | Retained with exact continued-image/cache/full-logit gates; one-token tails keep prefill arithmetic. |
+| Dense split at the indexer budget | Retained; pre-budget queries always take the dense tiles, so prefill logits no longer depend on the prefill batch. Before: batches 4096 and 8192 differed from 2048 on 4/4 repository documents; after: byte-identical decode dumps at 2048/4096/8192. |
+| 4096-token prefill chunks | Retained together with 128 readers and the next-chunk prefetch; exact given the dense split (byte-identical dumps on 4/4 repository documents, identical served greedy outputs). Served repository prompts on two gfx1151 machines, ABBA, 8+ samples per prompt: 24K–102K-token prompts +6–11% (median per prompt), 7K–8K prompts −0.1% to +0.6% in dedicated rechecks; pp4096 +5.3%/+5.4% at d0 and +5.8%/+5.9% at d32K; TG unchanged. Peak memory at 262K +1.3 GiB. Prefill beside an active decode stays at `--prefill-chunk` (512); two-session gaps unchanged. |
+| Next-chunk n-gram prefetch | Retained; a prefill chunk reads the next chunk's rows once its own have arrived, and a batch uses them only with identical tokens and history, so output is unchanged. With 4096-token chunks the gather then overlaps a whole chunk's forward instead of only layer 0. Adds one row buffer (≤ 40 MiB pageable, allocated on first use). |
 | More Q8 vocabulary rows/block | Rejected: no C1 improvement. |
 | Private shared-expert F16 rows | Retained; the shared expert's SwiGLU rows for its F16 down projection get their own buffer instead of overwriting the routed experts' narrowed token rows, which removes one full-batch narrowing pass per layer. Every GEMM reads identical bytes; greedy output, chunk-boundary logits and the C2–C8 batch checks are exact. Interleaved Nix A/B at d0: 1559.6 → 1568.1 tok/s (+0.6%); the profiled kernel time fell 1362.8 → 1333.1 ms. |
 | 256-row routed down-projection blocks | Rejected: exact output, Q5_1 unchanged and Q8_0 slower. The routed kernels already stream expert weights at roughly two thirds of DRAM bandwidth, so per-block prologue/epilogue and activation restaging were not the bound. |
@@ -73,6 +86,10 @@
 | Agention AP-Q4_K_XL teacher-forced comparison | Gate **fails**: re-scored on the 128 continuation positions only (the specification's scored range) with llama.cpp `b11197-a1de614ba` (Vulkan), the AP tier's d0 mean KL is 0.0815 against the unsloth baseline's 0.0140, so the per-prompt paired gate rejects the tier. d1 passes (AP 0.0074, top-1 1.000, against the baseline's 0.0105 / 0.961); pooled also fails (AP 0.0444 against 0.0123). The earlier "pooled passes" came from scoring ~300 prompt positions per prompt, which dilutes the continuation disagreement. The AP logits are also prefill-chunk-width dependent (Q6_K dense MMQ): `--batch 32` gives AP 0.0430 against the baseline's unchanged 0.0140. Per-prompt summaries are `artifacts/teacher-forced-{ap,ud}-d{… |
 | Sparse attention tiles cut across selection windows | Retained; distribute tiles across splits using a 64-block carry, keeping four resident blocks/CU. Independent review: AR +6.7% at 32K and +16.5% at 128K, d0 unchanged. Same keys, reassociated FP32 sums; FP64 operator and model-level rounding checks pass. [Evidence](artifacts/attention-tiles-review.json). |
 | Whole-tile carry across windows | Rejected: same output, but 16.5 KiB of LDS cost a resident block per CU and slowed d2K eight-row verification 8.5%. |
+| GPU greedy penalties and linear CPU anchor selection | Retained; exact FP64 penalties, unchanged proposals and snapshots. Short heat-pump tg400: 32.12 → 33.80 tok/s; C2/4/6/8 improve 7.6/8.5/16.3/14.2%. Unpenalized control unchanged. [Evidence](artifacts/penalty-verification.json). |
+| Prefill projection, attention and indexer kernels | Retained; bit-identical logit dumps and greedy hashes, plus a bitwise GEMM sweep against hipBLASLt for every routed n ≤ 4096. pp4096 +1.4% at d0 and +2.5–2.8% at 32K/115K (interleaved ABBA, `-r 6`, two machines); repository prompts 6.5K–102K +3.2% median; tg unchanged. The indexer projections use the own kernel only when hipBLASLt selects algorithm 4438 and otherwise stay on the library. |
+| 128 n-gram readers | Retained with 4096-token chunks, which double each gather; readers block in `pread`, so the pool sets the queue depth. Readers are woken per read, so small gathers do not wake the pool; 96 more threads. |
+| Paired routed GEMM code-cache blend | Retained: blend the four cached chunks with masks. A conditional over `uint4` lvalues becomes an address select, and clang 23 then keeps the cache in scratch (80 B, 0 spills). Clang 23 pp2048 +0.7%, pp8–pp64 +1.6–2.7%, MTP pp2048 +0.9%. Output is byte-identical. Clang 22 pp2048 is 0.7% slower. |
 
 Separate d32K pp2048 profiling attributes 29.1% of kernel time to MoE, 34.9%
 to dense projections and 12.6% to attention/indexing. Final-tile catch-up
@@ -94,7 +111,7 @@ work; this is not pure scheduler overhead. These are profile observations,
 not unprofiled throughput measurements.
 
 Next: improve prefill at depth and target/draft batch projection reuse while
-preserving [quality](QUALITY.md). The 1700 tok/s PP and flat d0–d128K
+preserving [quality](QUALITY.md). The 1750 tok/s PP and flat d0–d128K
 objectives remain unmet; see [current benchmarks](BENCHMARKS.md).
 
 The Agention AP-Q4_K_XL trunk's teacher-forced agreement with llama.cpp

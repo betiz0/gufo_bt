@@ -885,10 +885,14 @@ int main(int argc, const char* const* argv) {
       Expect(restored_continuation.cache_hit &&
                  restored_continuation.cache_disk_hit,
              "fresh Qwen backend did not restore its disk prefix");
-      Expect(restored_continuation.cached_prompt_tokens == chat_prompt.size() &&
+      // The disk store keeps the stable boundary (the complete prefix before
+      // the assistant framing) since upstream's #348/#382, so the restored
+      // prefix is shorter than the rendered chat; the output equality below
+      // is the functional contract.
+      Expect(restored_continuation.cached_prompt_tokens > 0 &&
                  restored_continuation.cached_prompt_tokens <
                      restored_continuation.prompt_tokens,
-             "Qwen disk restore did not report its exact reusable prefix");
+             "Qwen disk restore did not report a reusable prefix");
       Expect(restored_continuation.cache_restore_bytes > 0,
              "Qwen disk restore did not report restored bytes");
       Expect(restored_continuation.tokens == direct_continuation,
@@ -1005,13 +1009,13 @@ int main(int argc, const char* const* argv) {
         Expect(restored_dflash_continuation.cache_hit &&
                    restored_dflash_continuation.cache_disk_hit,
                "fresh DFlash backend did not restore its disk prefix");
-        Expect(restored_dflash_continuation.cached_prompt_tokens ==
-                       chat_prompt.size() &&
-                   warm_dflash_continuation.cached_prompt_tokens >=
+        // Same stable-boundary semantics as the FP16 disk case above.
+        Expect(warm_dflash_continuation.cached_prompt_tokens >=
                        restored_dflash_continuation.cached_prompt_tokens &&
+                   restored_dflash_continuation.cached_prompt_tokens > 0 &&
                    restored_dflash_continuation.cached_prompt_tokens <
                        restored_dflash_continuation.prompt_tokens,
-               "DFlash disk restore did not report its exact prefix");
+               "DFlash disk restore did not report a reusable prefix");
         Expect(restored_dflash_continuation.tokens ==
                    warm_dflash_continuation.tokens,
                "DFlash disk restore changed continuation tokens");

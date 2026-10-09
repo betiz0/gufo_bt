@@ -63,6 +63,15 @@ if (ENGINE_ENABLE_HIP)
   add_qwen38_flash_next_test(swift_upload gufo_qwen38_flash_next "hip;gpu;gfx1151")
   set_tests_properties(qwen38_flash_next.swift_upload PROPERTIES SKIP_RETURN_CODE 77)
 
+  add_executable(qwen38_flash_next_dense_gemm_bench EXCLUDE_FROM_ALL
+    dense_gemm_bench.cpp)
+  target_link_libraries(qwen38_flash_next_dense_gemm_bench PRIVATE
+    gufo_qwen38_flash_next hip::host)
+
+  add_executable(qwen38_flash_next_attn_bench EXCLUDE_FROM_ALL attn_bench.cpp)
+  target_link_libraries(qwen38_flash_next_attn_bench PRIVATE
+    gufo_qwen38_flash_next hip::host)
+
   add_executable(qwen38_flash_next_gpu_probe EXCLUDE_FROM_ALL gpu_probe.cpp
     mtp_audit.cpp)
   target_link_libraries(qwen38_flash_next_gpu_probe PRIVATE

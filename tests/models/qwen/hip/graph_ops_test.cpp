@@ -33,6 +33,7 @@
 #include "tests/models/qwen/hip/support/bfloat16.hpp"
 #include "tests/models/qwen/hip/support/comparisons.hpp"
 #include "tests/models/qwen/hip/support/device.hpp"
+#include "tests/models/qwen/hip/support/fp16.hpp"
 
 void TestHipGraphDecodeStep() {
   hipStream_t stream = nullptr;
@@ -240,7 +241,7 @@ void TestKvarnGraphCapture() {
         const float value =
             is_value ? 0.25F * std::cos(position * 0.05F + c * 0.017F)
                      : 0.3F * std::sin(position * 0.07F + c * 0.013F);
-        row[c] = __half_as_ushort(__float2half_rn(value));
+        row[c] = gufo::test::FloatToFp16Bits(value);
       }
       std::uint8_t* destination = nullptr;
       std::size_t plane = 0;

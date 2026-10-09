@@ -9,21 +9,65 @@
 #include <cassert>
 #include <chrono>
 #include <csignal>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <semaphore>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
+#include <vector>
 
 #include "src/cli/serve/logging.hpp"
+#include "src/cli/serve/trace.hpp"
 
 namespace {
 
 using gufo::server::HttpServer;
+using gufo::server::Logger;
+using gufo::server::LogLevel;
+using gufo::server::LogLevelFromName;
+using gufo::server::LogLevelName;
 using gufo::server::TextGenerationBackend;
+
+/// Reports an optional admission and fixed prompt progress before delegating
+/// token generation.
+class ProgressRequest final : public TextGenerationBackend::GenerationRequest {
+public:
+  ProgressRequest(std::shared_ptr<GenerationRequest> inner,
+                  std::vector<TextGenerationBackend::PromptProgress> progress,
+                  bool admit = false)
+      : inner_(std::move(inner)),
+        progress_(std::move(progress)),
+        admit_(admit) {}
+
+  TextGenerationBackend::Result Wait(
+      const TextGenerationBackend::TokenCallback& on_token,
+      const TextGenerationBackend::ProgressCallback& on_progress,
+      const TextGenerationBackend::StartCallback& on_start) override {
+    if (admit_ && on_start && !on_start())
+      inner_->Cancel();
+    for (const auto& value : progress_) {
+      if (on_progress && !on_progress(value)) {
+        inner_->Cancel();
+        break;
+      }
+    }
+    return inner_->Wait(on_token, on_progress, on_start);
+  }
+  void Cancel() noexcept override { inner_->Cancel(); }
+
+private:
+  std::shared_ptr<GenerationRequest> inner_;
+  std::vector<TextGenerationBackend::PromptProgress> progress_;
+  bool admit_;
+};
 
 class FakeBackend final : public TextGenerationBackend {
 public:
@@ -34,6 +78,7 @@ public:
     gufo::sampling::SamplingConfig sampling;
     std::string client_id;
     std::vector<std::string> stop_sequences;
+    std::string trace_request;
   };
   Call LastCall() {
     const std::lock_guard lock(mutex_);
@@ -45,22 +90,44 @@ public:
   }
   std::string model_id() const override { return "test"; }
   bool ready() const override { return true; }
+  bool device_lost() const override { return lost.load(); }
+  bool supports_images() const override { return image_support.load(); }
+  std::atomic<bool> image_support{false};
   std::uint32_t max_context() const override { return 65536; }
+  std::vector<SessionState> session_states() const override { return sessions; }
+  std::vector<SessionState> sessions;
   std::shared_ptr<GenerationRequest> start_complete(
       std::string_view prompt, std::size_t max_tokens,
       const gufo::sampling::SamplingConfig& sampling,
       const CancellationCheck& cancellation, bool stream, bool ignore_eos,
       std::string_view client_id,
-      const std::vector<std::string>& stop_sequences) override {
+      const std::vector<std::string>& stop_sequences,
+      bool return_progress) override {
     last_ignore_eos = ignore_eos;
-    return TextGenerationBackend::start_complete(prompt, max_tokens, sampling,
-                                                 cancellation, stream, false,
-                                                 client_id, stop_sequences);
+    return std::make_shared<ProgressRequest>(
+        TextGenerationBackend::start_complete(
+            prompt, max_tokens, sampling, cancellation, stream, false,
+            client_id, stop_sequences, return_progress),
+        progress, admit.load());
+  }
+  std::shared_ptr<GenerationRequest> start_chat(
+      const gufo::server::ChatRequest& request, std::size_t max_tokens,
+      const gufo::sampling::SamplingConfig& sampling,
+      const CancellationCheck& cancellation, bool stream) override {
+    return std::make_shared<ProgressRequest>(
+        TextGenerationBackend::start_chat(request, max_tokens, sampling,
+                                          cancellation, stream),
+        std::vector<PromptProgress>{}, admit.load());
   }
   SamplingDefaults sampling_defaults() const override { return defaults; }
   SamplingDefaults defaults;
   gufo::ReasoningOptions reasoning_defaults() const override {
     return reasoning;
+  }
+  InitialOutputState initial_output_state(
+      const gufo::server::ChatRequest& request) const override {
+    return initial_output_state_override.value_or(
+        TextGenerationBackend::initial_output_state(request));
   }
   std::size_t count_tokens(std::string_view text) const override {
     return text.size();
@@ -76,6 +143,18 @@ public:
       throw std::length_error("context exceeded");
     if (failure == 2)
       throw std::invalid_argument("invalid prompt");
+    // A failed probe: the scheduler reports device loss from then on.
+    if (failure == 3) {
+      lost = true;
+      throw gufo::server::TextGenerationError(
+          gufo::server::TextGenerationErrorCode::kDeviceLost,
+          gufo::server::kDeviceLostMessage);
+    }
+    // A failure on a device that still accepts work.
+    if (failure == 4)
+      throw std::runtime_error("unspecified launch failure");
+    if (failure == 5)
+      throw std::runtime_error("");
     Result result;
     if (wait_for_disconnect) {
       entered.release();
@@ -94,13 +173,15 @@ public:
                .max_tokens = limit,
                .sampling = sampling,
                .client_id = std::string(client_id),
-               .stop_sequences = stop_sequences};
+               .stop_sequences = stop_sequences,
+               .trace_request = gufo::server::Trace::CurrentRequest()};
       result.text = output_;
     }
     result.prompt_tokens = 10;
     result.cached_prompt_tokens = 8;
     result.cache_hit = true;
     result.draft_accepted_tokens = 4;
+    result.draft_rounds = 2;
     result.draft_tokens = 8;
     result.prefill_tokens = 2;
     result.prefill_ms = 4;
@@ -112,8 +193,18 @@ public:
       result.finish_reason = FinishReason::kStopSequence;
       result.stop_sequence = forced_stop_sequence;
     }
-    if (token)
+    if (token && failure != 8) {
+      std::this_thread::sleep_for(token_delay);
       (void)token(result.text);
+    }
+    if (failure == 6)
+      throw std::runtime_error("context exceeded");
+    if (failure == 7) {
+      lost = true;
+      throw gufo::server::TextGenerationError(
+          gufo::server::TextGenerationErrorCode::kDeviceLost,
+          gufo::server::kDeviceLostMessage);
+    }
     return result;
   }
   Result chat(const gufo::server::ChatRequest& request, std::size_t limit,
@@ -130,9 +221,15 @@ public:
   }
   std::atomic<int> calls{0};
   std::atomic<bool> last_ignore_eos{false};
+  std::vector<PromptProgress> progress;
+  // Report a scheduler admission before generation, as the HIP backend does.
+  std::atomic<bool> admit{false};
+  std::chrono::milliseconds token_delay{0};
   std::atomic<int> failure{0};
+  std::atomic<bool> lost{false};
   std::string forced_stop_sequence;
   gufo::ReasoningOptions reasoning;
+  std::optional<InitialOutputState> initial_output_state_override;
   bool wait_for_disconnect{false};
   std::atomic<bool> disconnected{false};
   std::binary_semaphore entered{0};
@@ -176,6 +273,28 @@ public:
               },
           .stream_log = log,
       };
+    });
+    server.add("POST", "/sse-idle", [](const auto&, auto&) {
+      return gufo::server::HttpResponse{
+          .headers = {{"Content-Type", "text/event-stream"}},
+          .streaming_body =
+              [](const auto& write) {
+                (void)write("data: first\n\n");
+                std::this_thread::sleep_for(std::chrono::milliseconds(90));
+                (void)write("data: last\n\n");
+                (void)write("data: [DONE]\n\n");
+              },
+      };
+    });
+    server.add("POST", "/sse-finish", [](const auto& request, auto&) {
+      return gufo::server::HttpResponse{
+          .headers = {{"Content-Type", "text/event-stream"}},
+          .streaming_body = [fail = !request.body.empty()](const auto& write) {
+            (void)write("data: first\n\n");
+            if (fail)
+              throw std::runtime_error("injected SSE failure");
+            (void)write("data: [DONE]\n\n");
+          }};
     });
     std::string error;
     assert(server.start(&error));
@@ -281,10 +400,19 @@ void TestAuthorization() {
   assert(secured.backend->calls == 1);
 }
 
-void TestRequestLogging() {
-  std::ostringstream output;
-  auto* previous = std::clog.rdbuf(output.rdbuf());
+struct CapturedLogs {
+  std::string text;
   std::string request_id;
+};
+
+// Drives one pass of traffic at a fixed verbosity. The process-wide filter is
+// shared by every test in this binary, so the previous level is restored.
+CapturedLogs CaptureTraffic(LogLevel level) {
+  const LogLevel previous = Logger::Level();
+  Logger::SetLevel(level);
+  std::ostringstream output;
+  auto* previous_sink = std::clog.rdbuf(output.rdbuf());
+  CapturedLogs captured;
   {
     RunningServer server;
     ExpectStatus(server.Send("GET /health HTTP/1.1\r\n\r\n"), 200);
@@ -295,28 +423,274 @@ void TestRequestLogging() {
     const auto header = response.find("X-Request-ID: ");
     assert(header != std::string::npos);
     const auto begin = header + std::string("X-Request-ID: ").size();
-    request_id = response.substr(begin, response.find("\r\n", begin) - begin);
+    captured.request_id =
+        response.substr(begin, response.find("\r\n", begin) - begin);
 
     const auto failed = server.Post("/stream-error", "");
     ExpectStatus(failed, 200);
     assert(failed.find("first chunk") != std::string::npos);
     assert(failed.find("HTTP/1.1", 1) == std::string::npos);
+
+    ExpectStatus(server.Send("GET /not-a-route HTTP/1.1\r\n\r\n"), 404);
   }
-  gufo::server::Logger::Info("test", "escaped\n\x1b[31m");
-  std::clog.rdbuf(previous);
-  const auto log = output.str();
-  assert(log.find("request=" + request_id + " event=received") !=
+  Logger::Info("test", "escaped\n\x1b[31m");
+  std::clog.rdbuf(previous_sink);
+  Logger::SetLevel(previous);
+  captured.text = output.str();
+  return captured;
+}
+
+void TestRequestLogging() {
+  const CapturedLogs info = CaptureTraffic(LogLevel::kInfo);
+  const std::string& log = info.text;
+  assert(log.find("request=" + info.request_id + " event=received") !=
          std::string::npos);
-  assert(log.find("request=" + request_id + " event=completed") !=
+  assert(log.find("request=" + info.request_id + " event=completed") !=
          std::string::npos);
   assert(log.find("cache=memory") != std::string::npos);
   assert(log.find("acceptance_pct=50.0") != std::string::npos);
   assert(log.find("rss_mib=") != std::string::npos);
   assert(log.find("error_code=server_exception") != std::string::npos);
+  // A successful poll is quiet at the default level, and so is the received
+  // line for a GET that is not on the inference list.
   assert(log.find("path=/health") == std::string::npos);
+  // Statuses never are: 4xx keeps escalating to WARN under any filter.
+  assert(log.find("path=/not-a-route status=404") != std::string::npos);
+  assert(log.find("[WARN]") != std::string::npos);
   assert(log.find("private-query") == std::string::npos);
   assert(log.find("private-prompt") == std::string::npos);
   assert(log.find("escaped\\x0a\\x1b[31m") != std::string::npos);
+  // The startup confirmation is INFO-tier, so the default level reports it.
+  // TestQuietTiersSuppressLifecycle covers the tiers that do not.
+  assert(log.find("event=listening") != std::string::npos);
+
+  const CapturedLogs debug = CaptureTraffic(LogLevel::kDebug);
+  assert(debug.text.find("[DEBUG]") != std::string::npos);
+  assert(debug.text.find("event=received method=GET path=/health") !=
+         std::string::npos);
+  assert(debug.text.find("path=/health status=200") != std::string::npos);
+  // Debug adds lines; it must not downgrade an inference completion to DEBUG,
+  // nor pull a refused 4xx back under the threshold.
+  assert(debug.text.find("[INFO] [http] request=" + debug.request_id +
+                         " event=completed") != std::string::npos);
+  assert(debug.text.find("path=/not-a-route status=404") != std::string::npos);
+  // The higher tier must still hide every byte of the request.
+  assert(debug.text.find("private-query") == std::string::npos);
+  assert(debug.text.find("private-prompt") == std::string::npos);
+  // Options are echoed by `gufo serve`, not by the HTTP layer itself.
+  assert(debug.text.find("event=options") == std::string::npos);
+}
+
+std::string ResponseRequestId(const std::string& response) {
+  const auto header = response.find("X-Request-ID: ");
+  assert(header != std::string::npos);
+  const auto begin = header + std::string("X-Request-ID: ").size();
+  return response.substr(begin, response.find("\r\n", begin) - begin);
+}
+
+// The body of a chunked HTTP/1.1 response, as the client reassembles it.
+std::string ChunkedBody(const std::string& response) {
+  std::size_t cursor = response.find("\r\n\r\n");
+  assert(cursor != std::string::npos);
+  cursor += 4;
+  std::string body;
+  for (;;) {
+    const auto line_end = response.find("\r\n", cursor);
+    assert(line_end != std::string::npos);
+    const auto size =
+        std::stoul(response.substr(cursor, line_end - cursor), nullptr, 16);
+    if (size == 0) {
+      return body;
+    }
+    body += response.substr(line_end + 2, size);
+    cursor = line_end + 2 + size + 2;
+  }
+}
+
+// `--trace` keeps what a text request carried in and out under the id the
+// logs name. Polls, other routes and unauthenticated requests stay out.
+void TestContentTrace() {
+  namespace fs = std::filesystem;
+  using gufo::server::Trace;
+  const auto path =
+      fs::temp_directory_path() /
+      ("gufo-trace-test-" + std::to_string(::getpid()) + ".jsonl");
+  fs::remove(path);
+  assert(!Trace::Open(path.string()).has_value());
+  std::string plain_id;
+  std::string stream_id;
+  std::string stream_wire;
+  std::string invalid_id;
+  {
+    RunningServer server(
+        {.api_key = "test-secret",
+         .sse_heartbeat_interval = std::chrono::milliseconds(5)});
+    server.backend->SetOutput("<tool_call>leak");
+    const auto post = [&](std::string_view route, std::string_view body,
+                          bool authorized = true) {
+      return server.Send(
+          "POST " + std::string(route) + " HTTP/1.1\r\n" +
+          (authorized ? "Authorization: Bearer test-secret\r\n" : "") +
+          "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" +
+          std::string(body));
+    };
+    const auto plain = post("/v1/completions",
+                            R"({"prompt":"private-prompt","max_tokens":8})");
+    ExpectStatus(plain, 200);
+    plain_id = ResponseRequestId(plain);
+    // The id is bound where the backend generates, so the scheduler's record
+    // can name it.
+    assert(server.backend->LastCall().trace_request == plain_id);
+    // Admission commits the stream before a slow first token, so keepalives
+    // reach the client and must reach the trace too.
+    server.backend->admit = true;
+    server.backend->token_delay = std::chrono::milliseconds(40);
+    const auto streamed =
+        post("/v1/completions",
+             R"({"prompt":"streamed-prompt","max_tokens":8,"stream":true})");
+    ExpectStatus(streamed, 200);
+    stream_id = ResponseRequestId(streamed);
+    stream_wire = ChunkedBody(streamed);
+    assert(stream_wire.find(": ping\n\n") != std::string::npos);
+    assert(server.backend->LastCall().trace_request == stream_id);
+    const auto invalid = post("/v1/completions", "{");
+    ExpectStatus(invalid, 400);
+    invalid_id = ResponseRequestId(invalid);
+    ExpectStatus(
+        post("/v1/completions", R"({"prompt":"unauthorized-prompt"})", false),
+        401);
+    ExpectStatus(post("/echo", "echo-body"), 200);
+    ExpectStatus(server.Send("GET /health HTTP/1.1\r\nAuthorization: Bearer "
+                             "test-secret\r\n\r\n"),
+                 200);
+  }
+  Trace::Close();
+
+  assert((fs::status(path).permissions() & fs::perms::all) ==
+         (fs::perms::owner_read | fs::perms::owner_write));
+  std::vector<gufo::json::Value> records;
+  {
+    std::ifstream input(path);
+    for (std::string line; std::getline(input, line);) {
+      assert(line.find("unauthorized-prompt") == std::string::npos);
+      assert(line.find("echo-body") == std::string::npos);
+      records.push_back(gufo::json::parse(line));
+    }
+  }
+  fs::remove(path);
+  assert(records.size() == 6);
+  const auto record = [&](std::string_view event,
+                          const std::string& id) -> const gufo::json::Value& {
+    for (const auto& candidate : records) {
+      if (candidate.member_str("event") == event &&
+          candidate.member_str("request") == id) {
+        assert(!candidate.member_str("time").empty());
+        return candidate;
+      }
+    }
+    std::abort();
+  };
+
+  const auto& request = record("request", plain_id);
+  assert(request.member_str("method") == "POST");
+  assert(request.member_str("path") == "/v1/completions");
+  assert(request.member_str("body") ==
+         R"({"prompt":"private-prompt","max_tokens":8})");
+  const auto& reply = record("response", plain_id);
+  assert(reply.member_size("status") == 200);
+  assert(reply.member_str("outcome") == "completed");
+  assert(!reply.find("stream")->as_bool());
+  const auto body = gufo::json::parse(reply.member_str("body"));
+  assert(body.find("choices")->items()[0].member_str("text") ==
+         "<tool_call>leak");
+
+  assert(
+      record("request", stream_id).member_str("body").find("streamed-prompt") !=
+      std::string::npos);
+  const auto& streamed = record("response", stream_id);
+  assert(streamed.find("stream")->as_bool());
+  assert(streamed.member_str("body") == stream_wire);
+  assert(stream_wire.find("<tool_call>leak") != std::string::npos);
+
+  assert(record("request", invalid_id).member_str("body") == "{");
+  assert(record("response", invalid_id).member_size("status") == 400);
+}
+
+// The threshold covers the lifecycle lines too: `--log-level=warn|error` boots
+// and stops without a word, which docs/SERVER.md states, while an escalation
+// keeps its own tier and a filtered INFO receipt line never reaches the log.
+void TestQuietTiersSuppressLifecycle() {
+  const CapturedLogs warn = CaptureTraffic(LogLevel::kWarn);
+  assert(warn.text.find("event=listening") == std::string::npos);
+  assert(warn.text.find("event=received") == std::string::npos);
+  assert(warn.text.find("path=/not-a-route status=404") != std::string::npos);
+
+  const CapturedLogs error = CaptureTraffic(LogLevel::kError);
+  assert(error.text.find("event=listening") == std::string::npos);
+  assert(error.text.find("event=received") == std::string::npos);
+  assert(error.text.find("path=/not-a-route status=404") == std::string::npos);
+}
+
+void TestLogLevelFilter() {
+  const LogLevel previous = Logger::Level();
+  assert(previous == LogLevel::kInfo);
+
+  std::ostringstream output;
+  auto* previous_sink = std::clog.rdbuf(output.rdbuf());
+  Logger::SetLevel(LogLevel::kError);
+  Logger::Debug("probe", "hidden-debug");
+  Logger::Info("probe", "hidden-info");
+  Logger::Warn("probe", "hidden-warn");
+  Logger::Error("probe", "visible-error");
+  // The printf-style entry point the imported DeepSeek runtime uses has to
+  // filter before it formats: an INFO loader line stays silent at an absolute
+  // threshold while an ERROR line survives.
+  Logger::LogFormatted(LogLevel::kInfo, "ds4", "hidden-ds4-info %d", 1);
+  Logger::LogFormatted(LogLevel::kError, "ds4", "visible-ds4-error %d", 2);
+  Logger::LogRequest("r-quiet", "GET", "/health", 200, 1.0, "", "completed",
+                     LogLevel::kDebug);
+  Logger::LogRequest("r-404", "GET", "/missing", 404, 1.0);
+  Logger::LogRequest("r-500", "POST", "/boom", 500, 1.0);
+  Logger::SetLevel(LogLevel::kWarn);
+  Logger::Debug("probe", "still-hidden-debug");
+  Logger::Warn("probe", "visible-at-warn");
+  Logger::LogFormatted(LogLevel::kInfo, "ds4", "still-hidden-ds4-info");
+  Logger::LogFormatted(LogLevel::kWarn, "ds4", "visible-ds4-warn");
+  Logger::LogRequest("r-404b", "GET", "/missing", 404, 1.0);
+  std::clog.rdbuf(previous_sink);
+  Logger::SetLevel(previous);
+
+  const std::string log = output.str();
+  assert(log.find("hidden-debug") == std::string::npos);
+  assert(log.find("hidden-info") == std::string::npos);
+  assert(log.find("hidden-warn") == std::string::npos);
+  assert(log.find("still-hidden-debug") == std::string::npos);
+  assert(log.find("hidden-ds4-info") == std::string::npos);
+  assert(log.find("still-hidden-ds4-info") == std::string::npos);
+  assert(log.find("visible-error") != std::string::npos);
+  assert(log.find("visible-at-warn") != std::string::npos);
+  assert(log.find("visible-ds4-error 2") != std::string::npos);
+  assert(log.find("visible-ds4-warn") != std::string::npos);
+  assert(log.find("[DEBUG]") == std::string::npos);
+  // A poll that is quiet by default stays filtered, while an escalation keeps
+  // its own tier: `--log-level error` means errors only, not "hide failures".
+  assert(log.find("request=r-quiet event=completed") == std::string::npos);
+  assert(log.find("request=r-404 event=completed") == std::string::npos);
+  assert(log.find("request=r-500 event=completed") != std::string::npos);
+  assert(log.find("request=r-404b event=completed") != std::string::npos);
+  assert(Logger::Level() == LogLevel::kInfo);
+}
+
+void TestLogLevelNames() {
+  assert(LogLevelFromName("debug") == LogLevel::kDebug);
+  assert(LogLevelFromName("info") == LogLevel::kInfo);
+  assert(LogLevelFromName("warn") == LogLevel::kWarn);
+  assert(LogLevelFromName("error") == LogLevel::kError);
+  assert(!LogLevelFromName("trace").has_value());
+  assert(!LogLevelFromName("DEBUG").has_value());
+  assert(!LogLevelFromName("").has_value());
+  assert(LogLevelName(LogLevel::kDebug) == "debug");
+  assert(LogLevelName(LogLevel::kError) == "error");
 }
 
 void TestFramingAndMetrics() {
@@ -358,6 +732,184 @@ void TestFramingAndMetrics() {
   assert(timings->member_double("cache_n") == 8);
   assert(timings->member_double("prompt_per_second") == 500);
   assert(timings->member_double("prompt_per_token_ms") == 2);
+}
+
+void TestFallbackBackendMetrics() {
+  namespace metrics = gufo::server::detail;
+  RunningServer server;
+  struct Endpoint {
+    const char* path;
+    const char* body;
+  };
+  for (const auto& endpoint : {
+           Endpoint{"/v1/chat/completions",
+                    R"({"messages":[{"role":"user","content":"hi"}]})"},
+           Endpoint{"/v1/completions", R"({"prompt":"hi"})"},
+           Endpoint{"/v1/responses", R"({"input":"hi"})"},
+       }) {
+    for (const bool stream : {false, true}) {
+      const auto prompt_before = metrics::TotalPromptTokens().load();
+      const auto generated_before = metrics::TotalGenTokens().load();
+      const auto cached_before = metrics::TotalCachedPromptTokens().load();
+      const auto rounds_before = metrics::TotalDraftRounds().load();
+      const auto drafts_before = metrics::TotalDraftTokens().load();
+      const auto accepted_before = metrics::TotalDraftAcceptedTokens().load();
+      const auto prompt_seconds_before = metrics::TotalPromptSeconds().load();
+      const auto gen_seconds_before = metrics::TotalGenSeconds().load();
+      auto body = gufo::json::parse(endpoint.body);
+      body["model"] = "test";
+      body["stream"] = stream;
+      ExpectStatus(server.Post(endpoint.path, body.dump()), 200);
+      const auto response = server.Send("GET /metrics HTTP/1.1\r\n\r\n");
+      ExpectStatus(response, 200);
+      // The backend reports 10 prompt tokens, of which 8 were cached.
+      assert(response.find("llamacpp:prompt_tokens_total " +
+                           std::to_string(prompt_before + 2) + "\n") !=
+             std::string::npos);
+      assert(response.find("llamacpp:prompt_tokens_cached_total " +
+                           std::to_string(cached_before + 8) + "\n") !=
+             std::string::npos);
+      assert(response.find("llamacpp:spec_decode_num_drafts_total " +
+                           std::to_string(rounds_before + 2) + "\n") !=
+             std::string::npos);
+      assert(response.find("llamacpp:spec_decode_num_draft_tokens_total " +
+                           std::to_string(drafts_before + 8) + "\n") !=
+             std::string::npos);
+      assert(response.find("llamacpp:spec_decode_num_accepted_tokens_total " +
+                           std::to_string(accepted_before + 4) + "\n") !=
+             std::string::npos);
+      assert(metrics::TotalPromptSeconds().load() - prompt_seconds_before >
+                 0.0039 &&
+             metrics::TotalGenSeconds().load() - gen_seconds_before > 0.0019);
+      assert(metrics::MaxSequenceTokens().load() >= 11);
+      assert(response.find("llamacpp:tokens_predicted_total " +
+                           std::to_string(generated_before + 1) + "\n") !=
+             std::string::npos);
+    }
+  }
+  struct Case {
+    std::size_t prefill, cached;
+    bool cancelled;
+    std::size_t expected_prompt;
+  };
+  for (const auto& test : {
+           Case{6, 4, false, 6},
+           Case{0, 4, false, 6},
+           Case{0, 10, false, 0},
+           Case{0, 20, false, 0},
+           Case{0, 0, true, 0},
+           Case{3, 0, true, 3},
+       }) {
+    const auto prompt_before = metrics::TotalPromptTokens().load();
+    const auto generated_before = metrics::TotalGenTokens().load();
+    TextGenerationBackend::Result result;
+    result.prompt_tokens = 10;
+    result.cached_prompt_tokens = test.cached;
+    result.prefill_tokens = test.prefill;
+    result.completion_tokens = 2;
+    result.cancelled = test.cancelled;
+    gufo::server::RecordServerMetrics(result);
+    assert(metrics::TotalPromptTokens().load() ==
+           prompt_before + test.expected_prompt);
+    assert(metrics::TotalGenTokens().load() == generated_before + 2);
+  }
+}
+
+void TestLlamaSlotsAndMetrics() {
+  RunningServer server;
+  const auto get = [&](const std::string& path) {
+    const auto response = server.Send("GET " + path + " HTTP/1.1\r\n\r\n");
+    ExpectStatus(response, 200);
+    return response.substr(response.find("\r\n\r\n") + 4);
+  };
+  const auto expect_slot = [](const gufo::json::Value& slot, std::size_t id,
+                              bool processing) {
+    assert(slot.member_size("id", 99) == id);
+    assert(slot.member_size("n_ctx") == 65536);
+    assert(slot.find("speculative")->is_bool());
+    assert(slot.find("is_processing")->as_bool(!processing) == processing);
+    assert(slot.find("state")->as_double() == (processing ? 1 : 0));
+    assert(slot.find("task_id")->as_double() ==
+           slot.find("id_task")->as_double());
+    for (const char* key : {"n_prompt_tokens", "n_prompt_tokens_cache",
+                            "n_prompt_tokens_processed"}) {
+      assert(slot.find(key)->is_number());
+    }
+    assert(slot.find("prompt")->is_string() &&
+           slot.member_str("prompt").empty());
+    assert(slot.member_str("model") == "test");
+    const auto* next = slot.find("next_token");
+    assert(next != nullptr && next->is_array() && next->size() == 1);
+    const auto& token = next->items().front();
+    assert(token.find("has_next_token")->as_bool(!processing) == processing);
+    assert(token.find("has_new_line")->is_bool());
+    assert(token.find("n_remain")->is_number() &&
+           token.find("n_decoded")->is_number());
+  };
+
+  // Backends without a session pool report one idle slot.
+  auto slots = gufo::json::parse(get("/slots"));
+  assert(slots.is_array() && slots.size() == 1);
+  const auto& fallback = slots.items().front();
+  expect_slot(fallback, 0, false);
+  assert(fallback.find("id_task")->as_double() == -1);
+  assert(fallback.member_size("n_prompt_tokens", 99) == 0);
+  assert(fallback.find("next_token")
+             ->items()
+             .front()
+             .find("n_remain")
+             ->as_double() == -1);
+  assert(get("/metrics").find("llamacpp:kv_cache_usage_ratio 0\n") !=
+         std::string::npos);
+
+  server.backend->sessions.resize(2);
+  server.backend->sessions[1] = {
+      .processing = true,
+      .speculative = true,
+      .request_id = 42,
+      .prompt_tokens = 10,
+      .cached_prompt_tokens = 8,
+      .processed_prompt_tokens = 2,
+      .generated_tokens = 3,
+      .remaining_tokens = 5,
+  };
+  slots = gufo::json::parse(get("/v1/slots"));
+  assert(slots.size() == 2);
+  expect_slot(slots.items()[0], 0, false);
+  const auto& busy = slots.items()[1];
+  expect_slot(busy, 1, true);
+  assert(busy.find("speculative")->as_bool() &&
+         busy.member_size("id_task") == 42 &&
+         busy.member_size("n_prompt_tokens") == 10 &&
+         busy.member_size("n_prompt_tokens_cache") == 8 &&
+         busy.member_size("n_prompt_tokens_processed") == 2);
+  const auto& token = busy.find("next_token")->items().front();
+  assert(token.member_size("n_remain") == 5 &&
+         token.member_size("n_decoded") == 3);
+
+  const auto metrics = get("/metrics");
+  assert(metrics.find("# HELP gufo_device_lost_total ") != std::string::npos);
+  assert(metrics.find("# TYPE gufo_device_lost_total counter\n") !=
+         std::string::npos);
+  assert(metrics.find("gufo_device_lost_total 0\n") != std::string::npos);
+  const std::string ratio_prefix = "llamacpp:kv_cache_usage_ratio ";
+  const auto ratio_pos = metrics.find("\n" + ratio_prefix);
+  assert(ratio_pos != std::string::npos);
+  assert(std::stod(metrics.substr(ratio_pos + 1 + ratio_prefix.size())) ==
+         13.0 / (2.0 * 65536));
+  for (const std::string counter :
+       {"prompt_tokens_total", "prompt_tokens_cached_total",
+        "prompt_seconds_total", "tokens_predicted_total",
+        "tokens_predicted_seconds_total", "n_tokens_max",
+        "spec_decode_num_drafts_total", "spec_decode_num_draft_tokens_total",
+        "spec_decode_num_accepted_tokens_total"}) {
+    assert(metrics.find("# HELP llamacpp:" + counter + " ") !=
+           std::string::npos);
+    assert(metrics.find("# TYPE llamacpp:" + counter + " counter\n") !=
+           std::string::npos);
+  }
+  assert(metrics.find("# TYPE llamacpp:kv_cache_usage_ratio gauge\n") !=
+         std::string::npos);
 }
 
 void TestCompatibilityRequests() {
@@ -435,6 +987,13 @@ void TestCompatibilityRequests() {
              "length");
     }
     const int calls = server.backend->calls;
+    for (const auto& [field, value] :
+         {std::pair{"temperature", 2.01}, std::pair{"presence_penalty", 2.01},
+          std::pair{"frequency_penalty", -2.01}}) {
+      auto invalid = body;
+      invalid[field] = value;
+      ExpectStatus(server.Post(endpoint.path, invalid.dump()), 400);
+    }
     for (const auto value : {"0", "-1", "1.5", "1e100", "\"1\"", "null"}) {
       auto invalid = body;
       invalid[endpoint.limit] = parse(value);
@@ -484,6 +1043,23 @@ void TestCompatibilityRequests() {
                501);
   assert(server.backend->calls == calls);
 
+  for (const auto& [url, expected] :
+       {std::pair{"data:image/gif;base64,AA==", "image/gif"},
+        std::pair{"data:image/png,AA==", "base64"},
+        std::pair{"data:image/png;base64,A===", "base64"}}) {
+    const auto input = parse(
+        R"({"input":[{"role":"user","content":[{"type":"input_image","image_url":)" +
+        gufo::json::Value(url).dump() +
+        R"(},{"type":"input_text","text":"describe"}]}]})");
+    const auto rejected = server.Post("/v1/responses", input.dump());
+    ExpectStatus(rejected, 400);
+    const auto parsed = parse(rejected.substr(rejected.find("\r\n\r\n") + 4));
+    const auto& error = *parsed.find("error");
+    assert(error.member_str("code") == "invalid_request");
+    assert(error.member_str("message").find(expected) != std::string::npos);
+  }
+  assert(server.backend->calls == calls);
+
   const auto structured =
       response_body(server.Post("/v1/responses",
                                 R"({"input":[{"role":"user","content":[
@@ -521,7 +1097,7 @@ void TestCompatibilityRequests() {
                                      : "event: response.completed") !=
            std::string::npos);
   }
-  server.backend->failure = 1;
+  server.backend->failure = 6;
   const auto failed_stream =
       server.Post("/v1/responses", R"({"input":"hi","stream":true})");
   ExpectStatus(failed_stream, 200);  // Fake backend fails after headers.
@@ -552,6 +1128,158 @@ void TestCompatibilityRequests() {
          replay_messages[1].thought == "Thoughts" &&
          replay_messages[1].content == "Answer");
 
+  // Codex replays reasoning items with the null content and encrypted_content
+  // fields it serialized from the response; only non-null payload is rejected.
+  const auto null_replay = response_body(
+      server.Post("/v1/responses",
+                  R"({"input":[{"role":"user","content":"First question"},
+        {"type":"reasoning","id":"rs_1","status":"completed",
+         "summary":[{"type":"summary_text","text":"Thoughts"}],
+         "content":null,"encrypted_content":null},
+        {"type":"message","role":"assistant","content":[
+          {"type":"output_text","text":"Answer","annotations":[]}]}]})"));
+  assert(null_replay.member_str("status") == "completed");
+  const auto null_replay_messages = server.backend->LastCall().chat.messages;
+  assert(null_replay_messages.size() == 2 &&
+         null_replay_messages[1].thought == "Thoughts" &&
+         null_replay_messages[1].content == "Answer");
+  const auto opaque_replay =
+      server.Post("/v1/responses",
+                  R"({"input":[{"role":"user","content":"question"},
+        {"type":"reasoning","id":"rs_1",
+         "summary":[],"encrypted_content":"gAAAA"}]})");
+  ExpectStatus(opaque_replay, 400);
+
+  // Codex re-sends developer items mid-conversation. They stay in place, so
+  // the prompt before them is unchanged and reusable.
+  const auto in_place =
+      response_body(server.Post("/v1/responses",
+                                R"({"instructions":"Base rules.","input":[
+        {"role":"user","content":"first"},
+        {"type":"message","role":"assistant","content":[
+          {"type":"output_text","text":"noted","annotations":[]}]},
+        {"type":"message","role":"developer","content":[
+          {"type":"input_text","text":"Compacted state"}]},
+        {"role":"user","content":"second"}]})"));
+  assert(in_place.member_str("status") == "completed");
+  const auto in_place_messages = server.backend->LastCall().chat.messages;
+  assert(in_place_messages.size() == 5 &&
+         in_place_messages[0].role == gufo::tokenization::ChatRole::kSystem &&
+         in_place_messages[0].content == "Base rules." &&
+         in_place_messages[1].content == "first" &&
+         in_place_messages[2].content == "noted" &&
+         in_place_messages[3].role ==
+             gufo::tokenization::ChatRole::kDeveloper &&
+         in_place_messages[3].content == "Compacted state" &&
+         in_place_messages[4].content == "second");
+
+  // A developer item inside a replayed reasoning/function_call group waits
+  // for the group to end instead of splitting the assistant turn.
+  const auto replay_items = gufo::json::parse(R"([
+      {"role":"user","content":"Check state."},
+      {"type":"reasoning","summary":[
+        {"type":"summary_text","text":"I will inspect."}]},
+      {"type":"function_call","call_id":"call_1","name":"lookup",
+       "arguments":"{\"key\":\"state\"}"},
+      {"type":"function_call_output","call_id":"call_1","output":"OK"}])");
+  const auto developer =
+      gufo::json::parse(R"({"role":"developer","content":"Follow policy."})");
+  for (const std::size_t position : {2U, 3U}) {
+    auto input = gufo::json::Value::array();
+    for (std::size_t i = 0; i < replay_items.size(); ++i) {
+      if (i == position)
+        input.push_back(developer);
+      input.push_back(replay_items.items()[i]);
+    }
+    auto body = gufo::json::Value::object();
+    body["input"] = std::move(input);
+    const auto replay =
+        response_body(server.Post("/v1/responses", body.dump()));
+    assert(replay.member_str("status") == "completed");
+    const auto grouped = server.backend->LastCall().chat.messages;
+    assert(grouped.size() == 4);
+    assert(grouped[0].role == gufo::tokenization::ChatRole::kUser &&
+           grouped[1].role == gufo::tokenization::ChatRole::kAssistant &&
+           grouped[1].content.empty() &&
+           grouped[1].thought == "I will inspect." &&
+           grouped[1].tool_calls.size() == 1 &&
+           grouped[1].tool_calls[0].id == "call_1" &&
+           grouped[2].role == gufo::tokenization::ChatRole::kDeveloper &&
+           grouped[2].content == "Follow policy." &&
+           grouped[3].role == gufo::tokenization::ChatRole::kTool &&
+           grouped[3].tool_call_id == "call_1" && grouped[3].content == "OK");
+  }
+
+  // The Responses API carries request-only fields with no native effect here
+  // (hosted tool types, include, reasoning.summary, text.verbosity). Accept
+  // them and keep every executable function tool, flattening the client-side
+  // namespace grouping. Codex is one such client.
+  const auto hosted = response_body(server.Post(
+      "/v1/responses",
+      R"({"model":"test","instructions":"You are a coding agent.","input":[
+          {"type":"message","role":"developer","content":[
+            {"type":"input_text","text":"AGENTS instructions"}]},
+          {"type":"message","role":"user","content":[
+            {"type":"input_text","text":"say hi"}]}],
+        "reasoning":{"effort":"medium","summary":"auto"},
+        "text":{"verbosity":"low"},
+        "tool_choice":"auto","parallel_tool_calls":true,
+        "store":false,"stream":false,
+        "include":["reasoning.encrypted_content"],
+        "prompt_cache_key":"cache-1","client_metadata":{"thread_id":"t-1"},
+        "tools":[
+          {"type":"function","name":"exec_command","strict":false,
+           "parameters":{"type":"object",
+             "properties":{"cmd":{"type":"string"}},"required":["cmd"]}},
+          {"type":"namespace","name":"multi_agent_v1","tools":[
+            {"type":"function","name":"close_agent","strict":false,
+             "parameters":{"type":"object","properties":{}}}]},
+          {"type":"web_search","external_web_access":false}]})"));
+  assert(hosted.member_str("status") == "completed");
+  const auto hosted_call = server.backend->LastCall();
+  assert(hosted_call.chat.tools.size() == 2 &&
+         hosted_call.chat.tools[0].name == "exec_command" &&
+         hosted_call.chat.tools[1].name == "close_agent");
+  assert(hosted_call.chat.reasoning.enabled == true &&
+         hosted_call.chat.reasoning.effort == gufo::ReasoningEffort::kMedium);
+  assert(hosted_call.chat.messages.size() == 3 &&
+         hosted_call.chat.messages[0].role ==
+             gufo::tokenization::ChatRole::kSystem &&
+         hosted_call.chat.messages[0].content == "You are a coding agent." &&
+         hosted_call.chat.messages[2].content == "say hi");
+
+  // Responses replays function calls and their outputs between turns under the
+  // same call_id; the adapter folds them back into the prompt.
+  const auto tool_replay = response_body(server.Post("/v1/responses",
+                                                     R"({"input":[
+          {"type":"message","role":"user","content":[
+            {"type":"input_text","text":"list files"}]},
+          {"type":"function_call","id":"fc_1","call_id":"call_1",
+           "name":"exec_command","arguments":"{\"cmd\":\"ls\"}",
+           "status":"completed"},
+          {"type":"function_call_output","call_id":"call_1","output":"file.txt"},
+          {"type":"message","role":"assistant","content":[
+            {"type":"output_text","text":"Here are the files.",
+             "annotations":[]}]}]})"));
+  assert(tool_replay.member_str("status") == "completed");
+  const auto tool_messages = server.backend->LastCall().chat.messages;
+  assert(tool_messages.size() == 4);
+  assert(tool_messages[1].role == gufo::tokenization::ChatRole::kAssistant &&
+         tool_messages[1].tool_calls.size() == 1 &&
+         tool_messages[1].tool_calls[0].id == "call_1" &&
+         tool_messages[1].tool_calls[0].name == "exec_command");
+  assert(tool_messages[2].content == "file.txt" &&
+         tool_messages[3].content == "Here are the files.");
+
+  // The include leniency is Responses-only: endpoints that run the shared
+  // compatibility validator (Messages) still reject it.
+  ExpectStatus(
+      server.Post(
+          "/v1/messages",
+          R"({"messages":[{"role":"user","content":"hi"}],"max_tokens":2,
+                      "include":["x"]})"),
+      400);
+
   const auto anthropic = response_body(
       server.Post("/v1/messages",
                   R"({"system":[{"type":"text","text":"Be concise."}],
@@ -559,6 +1287,135 @@ void TestCompatibilityRequests() {
           "max_tokens":2})"));
   assert(anthropic.member_str("stop_reason") == "end_turn");
   assert(server.backend->LastCall().chat.messages[0].content == "Be concise.");
+
+  // Messages reports reasoning in its own block and restores replayed blocks
+  // as the assistant thought.
+  server.backend->SetOutput("<think>plan</think>answer");
+  const auto thinking = response_body(server.Post(
+      "/v1/messages", R"({"messages":[{"role":"user","content":"hi"}],
+          "thinking":{"type":"enabled","budget_tokens":1024}})"));
+  const auto blocks = thinking.find("content")->items();
+  assert(blocks.size() == 2 && blocks[0].member_str("type") == "thinking" &&
+         blocks[0].member_str("thinking") == "plan" &&
+         blocks[0].contains("signature") &&
+         blocks[1].member_str("type") == "text" &&
+         blocks[1].member_str("text") == "answer");
+  assert(server.backend->LastCall().chat.reasoning.enabled == true);
+  response_body(server.Post("/v1/messages", R"({"messages":[
+      {"role":"user","content":"hi"},
+      {"role":"assistant","content":[
+        {"type":"thinking","thinking":"plan","signature":""},
+        {"type":"text","text":"answer"}]},
+      {"role":"user","content":"next"}],
+    "thinking":{"type":"disabled"}})"));
+  const auto replayed = server.backend->LastCall().chat;
+  assert(replayed.reasoning.enabled == false);
+  assert(replayed.messages.size() == 3 &&
+         replayed.messages[1].thought == "plan" &&
+         replayed.messages[1].content == "answer");
+
+  // An explicit content phase preserves requested literal reasoning tags.
+  // The default automatic phase above still recognizes reasoning blocks.
+  server.backend->initial_output_state_override =
+      FakeBackend::InitialOutputState::kContent;
+  const std::string literal_thinking = "<think>literal example</think>";
+  server.backend->SetOutput(literal_thinking);
+  const auto literal = response_body(
+      server.Post("/v1/messages", R"({"messages":[{"role":"user","content":
+        "Copy this XML exactly: <think>literal example</think>"}],
+        "thinking":{"type":"disabled"}})"));
+  assert(server.backend->LastCall().chat.reasoning.enabled == false);
+  const auto literal_blocks = literal.find("content")->items();
+  assert(literal_blocks.size() == 1 &&
+         literal_blocks[0].member_str("type") == "text" &&
+         literal_blocks[0].member_str("text") == literal_thinking &&
+         "disabled thinking preserves literal tags as one text block");
+  server.backend->initial_output_state_override.reset();
+
+  server.backend->SetOutput("answer");
+  const auto plain = response_body(server.Post(
+      "/v1/messages", R"({"messages":[{"role":"user","content":"hi"}]})"));
+  assert(plain.find("content")->items().size() == 1 &&
+         plain.find("content")->items()[0].member_str("text") == "answer");
+  for (const auto* invalid :
+       {R"({"messages":[{"role":"user","content":[
+           {"type":"thinking","thinking":"plan"}]}]})",
+        R"({"messages":[{"role":"user","content":"hi"}],"thinking":true})",
+        R"({"messages":[{"role":"user","content":"hi"}],
+            "thinking":{"type":"enabled","budget_tokens":0}})",
+        R"({"messages":[{"role":"user","content":"hi"}],
+            "thinking":{"type":"adaptive","display":"full"}})",
+        R"({"messages":[{"role":"user","content":"hi"}],
+            "output_config":{"effort":"adaptive"}})",
+        R"({"messages":[{"role":"user","content":"hi"}],
+            "output_config":{"effort":"minimal"}})",
+        R"({"messages":[{"role":"user","content":"hi"}],
+            "output_config":"high"})",
+        R"({"messages":[{"role":"user","content":"hi"}],
+            "output_config":{"format":{"type":"json_schema"}}})",
+        R"({"messages":[{"role":"user","content":"hi"}],
+            "reasoning_effort":"high"})",
+        R"({"messages":[{"role":"user","content":"hi"}],
+            "chat_template_kwargs":{"enable_thinking":true}})"})
+    ExpectStatus(server.Post("/v1/messages", invalid), 400);
+
+  // The reasoning fields Claude Code sends on every request. Adaptive keeps
+  // the server's thinking default and the reasoning is still returned.
+  server.backend->SetOutput("<think>plan</think>answer");
+  for (const bool server_thinking : {false, true}) {
+    server.backend->reasoning.enabled = server_thinking;
+    server.backend->reasoning.effort = gufo::ReasoningEffort::kLow;
+    const auto adaptive = response_body(
+        server.Post("/v1/messages", R"({"max_tokens":256,"stream":false,
+            "thinking":{"type":"adaptive","display":"omitted"},
+            "output_config":{"effort":"xhigh"},
+            "messages":[{"role":"user","content":"hi"}]})"));
+    if (server_thinking)
+      assert(adaptive.find("content")->items()[0].member_str("thinking") ==
+             "plan");
+    const auto reasoning = server.backend->LastCall().chat.reasoning;
+    assert(reasoning.enabled == server_thinking);
+    assert(reasoning.effort == gufo::ReasoningEffort::kXHigh);
+  }
+  server.backend->reasoning = {};
+  const auto updates = response_body(server.Post(
+      "/v1/messages", R"({"messages":[{"role":"user","content":"hi"}],
+          "thinking":{"type":"enabled","display":"updates"}})"));
+  assert(updates.find("content")->items()[0].member_str("thinking") == "plan");
+  // Effort never enables thinking.
+  response_body(server.Post("/v1/messages",
+                            R"({"messages":[{"role":"user","content":"hi"}],
+          "thinking":{"type":"disabled"},"output_config":{"effort":"low"}})"));
+  assert(server.backend->LastCall().chat.reasoning.enabled == false);
+  assert(server.backend->LastCall().chat.reasoning.effort ==
+         gufo::ReasoningEffort::kLow);
+  server.backend->SetOutput("ok");
+}
+
+void TestModelInputModalities() {
+  RunningServer server;
+  // Keep the same model ID: capability follows the loaded backend, not its
+  // name.
+  for (const bool images : {false, true, false}) {
+    server.backend->image_support = images;
+    const auto response = server.Send("GET /v1/models HTTP/1.1\r\n\r\n");
+    ExpectStatus(response, 200);
+    const auto listing =
+        gufo::json::parse(response.substr(response.find("\r\n\r\n") + 4));
+    assert(listing.member_str("object") == "list");
+    const auto& models = listing.find("data")->items();
+    assert(models.size() == 1);
+    const auto& model = models[0];
+    assert(model.member_str("id") == "test");
+    assert(model.member_str("owned_by") == "gufo");
+    assert(model.member_size("context_length") == 65536);
+    const auto* architecture = model.find("architecture");
+    assert(architecture != nullptr);
+    const auto* modalities = architecture->find("input_modalities");
+    assert(modalities != nullptr);
+    assert(modalities->dump() ==
+           (images ? R"(["text","image"])" : R"(["text"])"));
+  }
 }
 
 void TestRawCompletionStreaming() {
@@ -599,6 +1456,12 @@ void TestRawCompletionStreaming() {
   assert(terminal.find("choices")->items()[0].member_str("finish_reason") ==
          "stop");
   assert(terminal.find("usage") == nullptr);
+  const auto* timings = terminal.find("timings");
+  assert(timings != nullptr);
+  assert(timings->member_size("prompt_n") == 2);
+  assert(timings->member_double("prompt_ms") == 4);
+  assert(timings->member_size("predicted_n") == 1);
+  assert(timings->member_size("cache_n") == 8);
   const auto& usage = events[2];
   assert(usage.find("choices")->items().empty());
   assert(usage.find("usage")->member_size("completion_tokens") == 1);
@@ -607,15 +1470,48 @@ void TestRawCompletionStreaming() {
   assert(server.backend->last_ignore_eos);
   assert(server.backend->LastCall().max_tokens == 256);
 
-  server.backend->failure = 1;
-  const auto failed = server.Post(
-      "/v1/completions",
-      R"({"prompt":"hello","stream":true,"stream_options":{"include_usage":true}})");
-  ExpectStatus(failed, 200);
-  assert(failed.find("\"code\":\"generation_failed\"") != std::string::npos);
-  assert(failed.find("\"message\":\"generation failed\"") != std::string::npos);
-  assert(failed.find("context exceeded") == std::string::npos);
-  assert(failed.find("data: [DONE]\n\n") != std::string::npos);
+  const auto without_usage =
+      server.Post("/v1/completions", R"({"prompt":"hello","stream":true})");
+  ExpectStatus(without_usage, 200);
+  assert(without_usage.find("\"timings\":") != std::string::npos);
+  assert(without_usage.find("\"usage\":") == std::string::npos);
+
+  for (const int failure : {1, 5, 6}) {
+    server.backend->failure = failure;
+    const std::string message =
+        failure == 5 ? "generation failed" : "context exceeded";
+    for (
+        const auto& [path, body] : {
+            std::pair{
+                "/v1/completions",
+                R"({"prompt":"hello","stream":true,"stream_options":{"include_usage":true}})"},
+            std::pair{
+                "/v1/chat/completions",
+                R"({"model":"test","messages":[{"role":"user","content":"hello"}],"stream":true})"},
+            std::pair{"/v1/responses", R"({"input":"hello","stream":true})"},
+        }) {
+      const auto failed = server.Post(path, body);
+      ExpectStatus(failed, failure == 6 ? 200 : 500);
+      assert(failed.find("\"message\":\"" + message + "\"") !=
+             std::string::npos);
+      if (failure != 6) {
+        assert(failed.find("Content-Type: application/json") !=
+               std::string::npos);
+        assert(failed.find("data: ") == std::string::npos);
+        assert(failed.find("\"code\":\"server_exception\"") !=
+               std::string::npos);
+        continue;
+      }
+      const bool responses = std::string_view(path) == "/v1/responses";
+      assert(failed.find(responses ? "\"code\":\"server_error\""
+                                   : "\"code\":\"generation_failed\"") !=
+             std::string::npos);
+      assert(failed.find(responses ? "event: response.failed"
+                                   : "data: [DONE]\n\n") != std::string::npos);
+      assert(failed.find("event: response.completed") == std::string::npos);
+      assert(failed.ends_with("0\r\n\r\n"));
+    }
+  }
   server.backend->failure = 0;
 
   for (
@@ -636,6 +1532,124 @@ void TestRawCompletionStreaming() {
           "/v1/chat/completions",
           R"({"model":"test","messages":[{"role":"user","content":"hi"}],"max_tokens":8,"ignore_eos":true})"),
       400);
+}
+
+void TestDeviceLoss() {
+  std::atomic<int> hook_calls{0};
+  RunningServer server({.on_device_lost = [&] { ++hook_calls; }});
+  const std::string chat =
+      R"({"model":"test","messages":[{"role":"user","content":"hi"}]})";
+
+  // A failure while the device still accepts work keeps the existing contract.
+  server.backend->failure = 4;
+  const auto failed = server.Post("/v1/completions", R"({"prompt":"hello"})");
+  ExpectStatus(failed, 500);
+  assert(failed.find("\"code\":\"server_exception\"") != std::string::npos);
+  ExpectStatus(server.Send("GET /health HTTP/1.1\r\n\r\n"), 200);
+  ExpectStatus(server.Send("GET /ready HTTP/1.1\r\n\r\n"), 200);
+  assert(hook_calls == 0);
+
+  // A stream has committed its status; the terminal event names the loss.
+  server.backend->failure = 7;
+  const auto stream =
+      server.Post("/v1/completions", R"({"prompt":"hello","stream":true})");
+  ExpectStatus(stream, 200);
+  assert(stream.find("\"code\":\"device_lost\"") != std::string::npos);
+  assert(stream.find(gufo::server::kDeviceLostMessage) != std::string::npos);
+  assert(hook_calls == 1);
+
+  server.backend->failure = 0;
+  for (const std::string path : {"/health", "/v1/health", "/healthz", "/ready",
+                                 "/v1/ready", "/readyz"}) {
+    const auto response = server.Send("GET " + path + " HTTP/1.1\r\n\r\n");
+    ExpectStatus(response, 503);
+    assert(response.find("\"status\":\"device_lost\"") != std::string::npos);
+    assert(response.find("\"code\":\"device_lost\"") != std::string::npos);
+  }
+  const int calls = server.backend->calls;
+  for (const auto& [path, body] :
+       {std::pair<std::string, std::string>{"/v1/chat/completions", chat},
+        {"/v1/completions", R"({"prompt":"hello","stream":true})"},
+        {"/v1/embeddings", R"({"input":"hello"})"}}) {
+    const auto response = server.Post(path, body);
+    ExpectStatus(response, 503);
+    assert(response.find("\"code\":\"device_lost\"") != std::string::npos);
+    assert(response.find("Retry-After") == std::string::npos);
+  }
+  assert(server.backend->calls == calls);
+  // Routes that never reach the device keep answering.
+  ExpectStatus(server.Send("GET /v1/models HTTP/1.1\r\n\r\n"), 200);
+  ExpectStatus(server.Send("GET /metrics HTTP/1.1\r\n\r\n"), 200);
+  assert(hook_calls == 1);
+
+  // Before a response starts, the failing request itself gets the 503.
+  std::atomic<int> first_hook_calls{0};
+  RunningServer first({.on_device_lost = [&] { ++first_hook_calls; }});
+  first.backend->failure = 3;
+  for (const auto& [path, body] :
+       {std::pair<std::string, std::string>{"/v1/completions",
+                                            R"({"prompt":"hello"})"},
+        {"/v1/chat/completions", chat}}) {
+    const auto response = first.Post(path, body);
+    ExpectStatus(response, 503);
+    assert(response.find("\"code\":\"device_lost\"") != std::string::npos);
+    assert(response.find(gufo::server::kDeviceLostMessage) !=
+           std::string::npos);
+    assert(response.find("Retry-After") == std::string::npos);
+  }
+  assert(first.backend->calls == 1);
+  assert(first_hook_calls == 1);
+  for (
+      const auto& [path, body] :
+      {std::pair{"/v1/completions", R"({"prompt":"hello","stream":true})"},
+       std::pair{
+           "/v1/chat/completions",
+           R"({"model":"test","messages":[{"role":"user","content":"hello"}],"stream":true})"},
+       std::pair{"/v1/responses", R"({"input":"hello","stream":true})"}}) {
+    RunningServer early;
+    early.backend->failure = 3;
+    const auto response = early.Post(path, body);
+    ExpectStatus(response, 503);
+    assert(response.find("\"code\":\"device_lost\"") != std::string::npos);
+    assert(response.find("data: ") == std::string::npos);
+  }
+}
+
+void TestDeviceLossWhileWriterBlocked() {
+  std::atomic<int> hook_calls{0};
+  std::binary_semaphore hook_called{0};
+  std::binary_semaphore writing{0};
+  std::atomic<bool> write_finished{false};
+  RunningServer server({.sse_heartbeat_interval = std::chrono::milliseconds(0),
+                        .on_device_lost = [&] {
+                          ++hook_calls;
+                          hook_called.release();
+                        }});
+  server.server.add("POST", "/blocked", [&](const auto&, auto&) {
+    return gufo::server::HttpResponse{
+        .headers = {{"Content-Type", "text/event-stream"}},
+        .streaming_body = [&](const auto& write) {
+          const std::string chunk(8 * 1024 * 1024, 'x');
+          writing.release();
+          (void)write(chunk);
+          write_finished = true;
+        }};
+  });
+  const int fd = server.Connect();
+  const int receive_buffer = 1024;
+  assert(::setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &receive_buffer,
+                      sizeof(receive_buffer)) == 0);
+  const std::string request = "POST /blocked HTTP/1.1\r\n\r\n";
+  assert(::send(fd, request.data(), request.size(), MSG_NOSIGNAL) ==
+         static_cast<ssize_t>(request.size()));
+  assert(writing.try_acquire_for(std::chrono::seconds(2)));
+  // The peer never drains the response. No health request or completed write
+  // is available to trigger shutdown; the listener must observe the loss.
+  server.backend->lost = true;
+  assert(hook_called.try_acquire_for(std::chrono::seconds(2)));
+  assert(hook_calls == 1 && !write_finished);
+  ::shutdown(fd, SHUT_RDWR);
+  ::close(fd);
 }
 
 void TestInvalidBindSettings() {
@@ -887,6 +1901,147 @@ void TestStreamingFraming() {
          std::string("a\0bend", 6));
 }
 
+void TestSseHeartbeat() {
+  RunningServer server(
+      {.sse_heartbeat_interval = std::chrono::milliseconds(20)});
+  const auto response = server.Post("/sse-idle", "");
+  ExpectStatus(response, 200);
+  const auto first = response.find("data: first\n\n");
+  const auto ping = response.find(": ping\n\n", first);
+  const auto second_ping = response.find(": ping\n\n", ping + 1);
+  const auto last = response.find("data: last\n\n", second_ping);
+  assert(first != std::string::npos);
+  assert(ping != std::string::npos);
+  assert(second_ping != std::string::npos);
+  assert(last != std::string::npos);
+  assert(response.find("data: [DONE]\n\n", last) != std::string::npos);
+  assert(response.ends_with("0\r\n\r\n"));
+
+  const auto legacy = server.Send("POST /sse-idle HTTP/1.0\r\n\r\n");
+  assert(legacy.find("Transfer-Encoding:") == std::string::npos);
+  assert(legacy.find(": ping\n\n") != std::string::npos);
+  assert(legacy.ends_with("data: [DONE]\n\n"));
+
+  RunningServer disabled({.sse_heartbeat_interval = {}});
+  assert(disabled.Post("/sse-idle", "").find(": ping") == std::string::npos);
+}
+
+void TestDeferredStreamHeaders() {
+  RunningServer server(
+      {.sse_heartbeat_interval = std::chrono::milliseconds(5)});
+  server.server.add("POST", "/early-failure", [](const auto&, auto&) {
+    return gufo::server::HttpResponse{
+        .headers = {{"Content-Type", "text/event-stream"}},
+        .streaming_body =
+            [](const auto&) {
+              std::this_thread::sleep_for(std::chrono::milliseconds(30));
+              throw std::runtime_error("early generation failure");
+            },
+        .defer_stream_headers = true};
+  });
+  const auto failed = server.Post("/early-failure", "");
+  ExpectStatus(failed, 500);
+  assert(failed.find(": ping") == std::string::npos);
+  for (
+      const auto& [path, body] :
+      {std::pair{"/v1/completions", R"({"prompt":"hello","stream":true})"},
+       std::pair{
+           "/v1/chat/completions",
+           R"({"model":"test","messages":[{"role":"user","content":"hello"}],"stream":true})"},
+       std::pair{"/v1/responses", R"({"input":"hello","stream":true})"}}) {
+    server.backend->failure =
+        8;  // Successful termination without a token callback.
+    server.backend->SetOutput("");
+    const auto empty = server.Post(path, body);
+    ExpectStatus(empty, 200);
+    assert(empty.ends_with("0\r\n\r\n"));
+  }
+  // Opt-in progress deliberately starts the stream before tokens exist.
+  server.backend->progress = {{.total = 100, .processed = 10}};
+  server.backend->failure = 4;
+  const auto progress =
+      server.Post("/v1/completions",
+                  R"({"prompt":"hello","stream":true,"return_progress":true})");
+  ExpectStatus(progress, 200);
+  assert(progress.find("prompt_progress") != std::string::npos);
+  assert(progress.find("\"code\":\"generation_failed\"") != std::string::npos);
+  server.backend->progress.clear();
+  for (
+      const auto& [path, body] :
+      {std::pair{"/v1/completions",
+                 R"({"prompt":"hello","stream":true,"return_progress":true})"},
+       std::pair{
+           "/v1/chat/completions",
+           R"({"model":"test","messages":[{"role":"user","content":"hello"}],"stream":true,"return_progress":true})"},
+       std::pair{
+           "/v1/responses",
+           R"({"input":"hello","stream":true,"return_progress":true})"}}) {
+    const auto failure = server.Post(path, body);
+    ExpectStatus(failure, 200);
+    assert(failure.find(std::string_view(path) == "/v1/responses"
+                            ? "\"code\":\"server_error\""
+                            : "\"code\":\"generation_failed\"") !=
+           std::string::npos);
+    assert(failure.ends_with("0\r\n\r\n"));
+  }
+}
+
+void TestAdmittedStreamHeaders() {
+  RunningServer server(
+      {.sse_heartbeat_interval = std::chrono::milliseconds(5)});
+  server.backend->admit = true;
+  const std::pair<const char*, const char*> requests[] = {
+      {"/v1/completions", R"({"prompt":"hello","stream":true})"},
+      {"/v1/chat/completions",
+       R"({"model":"test","messages":[{"role":"user","content":"hello"}],"stream":true})"},
+      {"/v1/responses", R"({"input":"hello","stream":true})"}};
+  // Admission commits headers, so keepalives cover prefill before a token.
+  server.backend->token_delay = std::chrono::milliseconds(40);
+  for (const auto& [path, body] : requests) {
+    const auto response = server.Post(path, body);
+    ExpectStatus(response, 200);
+    const auto ping = response.find(": ping\n\n");
+    assert(ping != std::string::npos);
+    const auto token = response.find(R"("ok")");
+    assert(token != std::string::npos);
+    assert(ping < token);
+    assert(response.ends_with("0\r\n\r\n"));
+  }
+  // After admission, failures before any token are terminal SSE errors.
+  for (const auto& [path, body] : requests) {
+    RunningServer lost;
+    lost.backend->admit = true;
+    lost.backend->failure = 3;
+    const auto failed = lost.Post(path, body);
+    ExpectStatus(failed, 200);
+    assert(failed.find(gufo::server::kDeviceLostMessage) != std::string::npos);
+    assert(failed.find("data: ") != std::string::npos);
+    assert(failed.ends_with("0\r\n\r\n"));
+  }
+}
+
+void TestSseHeartbeatShutdown() {
+  // Quick completion and exceptions can request stop while the heartbeat
+  // thread is entering its wait. Cleanup must not wait for this deadline:
+  // Send() has a three-second socket timeout.
+  RunningServer server({.sse_heartbeat_interval = std::chrono::seconds(30)});
+  std::vector<std::jthread> clients;
+  for (int client = 0; client < 8; ++client) {
+    clients.emplace_back([&] {
+      for (int request = 0; request < 16; ++request) {
+        const bool fail = request % 2 != 0;
+        const auto response = server.Post("/sse-finish", fail ? "fail" : "");
+        ExpectStatus(response, 200);
+        assert(response.find("data: first\n\n") != std::string::npos);
+        assert(response.find(": ping") == std::string::npos);
+        assert(response.ends_with("0\r\n\r\n") == !fail);
+        assert((response.find("data: [DONE]\n\n") != std::string::npos) ==
+               !fail);
+      }
+    });
+  }
+}
+
 void TestSignalShutdown() {
   // Process signals must never terminate the test runner itself. Prove that
   // both idle listeners and active generation return through normal cleanup.
@@ -931,20 +2086,70 @@ void TestSignalShutdown() {
 
 }  // namespace
 
+void TestRawCompletionPromptProgress() {
+  RunningServer server;
+  server.backend->progress = {
+      {.total = 4, .cache = 1, .processed = 4, .time_ms = 2}};
+  const auto response =
+      server.Post("/v1/completions",
+                  R"({"prompt":"hello","stream":true,"return_progress":true})");
+  ExpectStatus(response, 200);
+  const auto progress = response.find(
+      R"("choices":[{"text":"","index":0,"logprobs":null,"finish_reason":null}],)"
+      R"("prompt_progress":{"total":4,"cache":1,"processed":4,"time_ms":2}})");
+  assert(progress != std::string::npos);
+  assert(progress < response.find(R"("text":"ok")"));
+
+  const auto plain =
+      server.Post("/v1/completions", R"({"prompt":"hello","stream":true})");
+  ExpectStatus(plain, 200);
+  assert(plain.find("prompt_progress") == std::string::npos);
+  const auto null_progress =
+      server.Post("/v1/completions",
+                  R"({"prompt":"hello","stream":true,"return_progress":null})");
+  ExpectStatus(null_progress, 200);
+  assert(null_progress.find("prompt_progress") == std::string::npos);
+  const auto buffered = server.Post(
+      "/v1/completions", R"({"prompt":"hello","return_progress":true})");
+  ExpectStatus(buffered, 200);
+  assert(buffered.find("prompt_progress") == std::string::npos);
+  ExpectStatus(server.Post("/v1/completions",
+                           R"({"prompt":"hello","return_progress":1})"),
+               400);
+}
+
 int main() {
+  // The log assertions below match "[LEVEL] [component]" text written to a
+  // redirected stderr sink, so the real stderr's TTY state must not add ANSI
+  // tint around the level tag.
+  ::setenv("NO_COLOR", "1", 1);
   TestRequestLogging();
+  TestContentTrace();
+  TestQuietTiersSuppressLifecycle();
+  TestLogLevelFilter();
+  TestLogLevelNames();
   TestInvalidBindSettings();
   TestQueryParameters();
   TestAuthorization();
   TestFramingAndMetrics();
+  TestFallbackBackendMetrics();
+  TestLlamaSlotsAndMetrics();
   TestCompatibilityRequests();
+  TestModelInputModalities();
   TestRawCompletionStreaming();
+  TestDeviceLoss();
+  TestDeviceLossWhileWriterBlocked();
+  TestRawCompletionPromptProgress();
   TestCompatibilityStopSequences();
   TestCompatibilityThinkingDefaults();
   TestResponseSamplingDefaults();
   TestCompatibilityUtf8();
   TestPeerDisconnect();
   TestStreamingFraming();
+  TestSseHeartbeat();
+  TestSseHeartbeatShutdown();
+  TestDeferredStreamHeaders();
+  TestAdmittedStreamHeaders();
   TestSignalShutdown();
   std::cout << "HTTP transport checks passed.\n";
 }

@@ -1,4 +1,5 @@
 #include <arpa/inet.h>
+#include <webp/encode.h>
 
 #include <algorithm>
 #include <array>
@@ -10,7 +11,14 @@
 #include <string>
 #include <unordered_map>
 
+#include "src/models/qwen/control_tokens.hpp"
 #include "src/models/qwen/vision/prompt.hpp"
+
+using gufo::tokenization::kImagePad;
+using gufo::tokenization::kImEnd;
+using gufo::tokenization::kImStart;
+using gufo::tokenization::kVisionEnd;
+using gufo::tokenization::kVisionStart;
 
 #if defined(ENGINE_ENABLE_HIP)
 #include "src/models/qwen/vision/encoder.hpp"
@@ -63,6 +71,18 @@ void TestPositionLayout() {
     rejected = true;
   }
   assert(rejected);
+  RopeLayout many;
+  for (std::uint32_t i = 0; i < 257; ++i)
+    many.images.push_back({i * 64, 8, 8});
+  many.Validate(257 * 64);
+  assert(many.PrefixLength() == 257 * 64);
+  rejected = false;
+  try {
+    many.Validate(257 * 64 - 1);
+  } catch (const std::invalid_argument&) {
+    rejected = true;
+  }
+  assert(rejected);
 }
 
 void TestPreprocessing() {
@@ -74,11 +94,18 @@ void TestPreprocessing() {
   input = {256, 256, std::vector<std::uint8_t>(256 * 256 * 3, 42)};
   assert(ResizeImage(input).pixels == input.pixels);
   const std::vector<std::uint8_t> payload{0xff, 0xd8, 0, 1, 2};
-  assert(gufo::core::ReadImageUrl("data:image/jpeg;base64,/9gAAQI=") ==
+  for (const auto* accepted :
+       {"data:image/jpeg;base64,/9gAAQI=", "data:image/jpg;base64,/9gAAQI=",
+        "data:IMAGE/JPEG;BASE64,/9gAAQI=",
+        "data:image/jpeg;name=photo.jpg;base64,/9gAAQI="})
+    assert(gufo::core::ReadImageUrl(accepted) == payload);
+  assert(gufo::core::ReadImageUrl("data:image/webp;base64,/9gAAQI=") ==
          payload);
   for (const auto* invalid :
        {"data:image/png;base64,A===", "data:image/png;base64,AB==",
-        "data:image/png;base64,AAAA=", "file:///tmp/image.png"}) {
+        "data:image/png;base64,AAAA=", "file:///tmp/image.png",
+        "data:image/gif;base64,/9gAAQI=", "data:image/png,/9gAAQI=",
+        "data:image/png;base64"}) {
     bool rejected = false;
     try {
       (void)gufo::core::ReadImageUrl(invalid);
@@ -87,6 +114,54 @@ void TestPreprocessing() {
     }
     assert(rejected);
   }
+}
+
+// Clients such as chat front ends often re-encode uploads as WebP.
+void TestWebpDecoding() {
+  const std::vector<std::uint8_t> rgb{255, 0,  0,  0,  255, 0,  0,  0,  255,
+                                      10,  20, 30, 40, 50,  60, 70, 80, 90};
+  std::uint8_t* encoded = nullptr;
+  const auto size = WebPEncodeLosslessRGB(rgb.data(), 3, 2, 9, &encoded);
+  assert(size > 0);
+  const std::vector<std::uint8_t> bytes(encoded, encoded + size);
+  WebPFree(encoded);
+  const auto image = gufo::core::DecodeImage(bytes);
+  assert(image.width == 3 && image.height == 2 && image.pixels == rgb);
+
+  // Dropping alpha must retain RGB, not blend it onto a background.
+  std::vector<std::uint8_t> rgba;
+  for (std::size_t i = 0; i < rgb.size(); i += 3) {
+    rgba.insert(rgba.end(), rgb.begin() + i, rgb.begin() + i + 3);
+    rgba.push_back(128);
+  }
+  const auto alpha_size =
+      WebPEncodeLosslessRGBA(rgba.data(), 3, 2, 12, &encoded);
+  assert(alpha_size > 0);
+  const std::vector<std::uint8_t> alpha_bytes(encoded, encoded + alpha_size);
+  WebPFree(encoded);
+  assert(gufo::core::DecodeImage(alpha_bytes).pixels == rgb);
+
+  const auto rejects = [](const std::vector<std::uint8_t>& input,
+                          std::string_view message) {
+    bool rejected = false;
+    try {
+      (void)gufo::core::DecodeImage(input);
+    } catch (const std::invalid_argument& error) {
+      rejected = std::string_view(error.what()).find(message) !=
+                 std::string_view::npos;
+    }
+    assert(rejected);
+  };
+  auto truncated = bytes;
+  truncated.resize(24);
+  rejects(truncated, "invalid WebP");
+  // VP8L's packed dimensions: 8192x8192 exceeds the decoded pixel budget.
+  auto oversized = bytes;
+  assert(oversized[20] == 0x2f);
+  const std::uint32_t dimensions = 8191U | (8191U << 14);
+  for (std::size_t i = 0; i < 4; ++i)
+    oversized[21 + i] = static_cast<std::uint8_t>(dimensions >> (8 * i));
+  rejects(oversized, "decoded pixel limit");
 }
 
 void TestImageTransportLimits() {
@@ -133,7 +208,12 @@ void TestImageTransportLimits() {
   budget.deadline = std::chrono::steady_clock::now();
   rejects("data:image/png;base64,AQID", budget);
   budget = {};
-  budget.remaining_images = 0;
+  budget.remaining_bytes = 17 * 3;
+  for (unsigned i = 0; i < 17; ++i)
+    assert(
+        gufo::core::ReadImageUrl("data:image/png;base64,AQID", budget).size() ==
+        3);
+  assert(budget.remaining_bytes == 0);
   rejects("data:image/png;base64,AQID", budget);
 }
 
@@ -152,7 +232,7 @@ void TestRendering() {
                     "<|vision_start|><|image_pad|><|vision_end|>after") !=
          std::string::npos);
   for (auto offset : offsets)
-    assert(text->substr(offset, 13) == "<|image_pad|>");
+    assert(text->substr(offset, 13) == kImagePad);
 }
 
 void TestToolReasoningCheckpoint() {
@@ -161,9 +241,9 @@ void TestToolReasoningCheckpoint() {
   for (int i = 0; i < 256; ++i)
     vocab.emplace_back(1, static_cast<char>(i));
   std::unordered_map<std::string, TokenId> specials;
-  for (const auto* token : {"<|im_start|>", "<|im_end|>", "<think>", "</think>",
-                            "<|vision_start|>", "<|vision_end|>"}) {
-    specials[token] = static_cast<TokenId>(vocab.size());
+  for (std::string_view token : std::initializer_list<std::string_view>{
+           kImStart, kImEnd, "<think>", "</think>", kVisionStart, kVisionEnd}) {
+    specials[std::string(token)] = static_cast<TokenId>(vocab.size());
     vocab.emplace_back(token);
   }
   const auto tokenizer =
@@ -230,6 +310,7 @@ int main(int argc, char** argv) {
     TestRendering();
     TestToolReasoningCheckpoint();
     TestImageTransportLimits();
+    TestWebpDecoding();
     if (argc == 1) {
       std::cout << "vision input, layout and rendering: passed\n";
       return 0;

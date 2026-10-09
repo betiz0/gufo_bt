@@ -17,6 +17,7 @@
 #include <span>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
 #include <type_traits>
 #include <utility>
 
@@ -29,9 +30,11 @@
 #include "src/core/json.hpp"
 #include "src/core/sampling.hpp"
 #include "src/models/qwen/chat_template.hpp"
+#include "src/models/qwen/control_tokens.hpp"
 #include "src/models/qwen/generator.hpp"
 
 #if defined(ENGINE_ENABLE_HIP)
+#include "src/core/hip/hip_utils.hpp"
 #include "src/core/speculative/speculative_verifier.hpp"
 #include "src/models/deepseek_v4_flash/dspark_sampler.hpp"
 #include "src/models/deepseek_v4_flash/engine.hpp"
@@ -42,6 +45,15 @@
 #endif
 
 namespace gufo::server {
+
+// A selected token ends the turn only when the request admits EOS and the token
+// is one of the model's stop tokens. The engine stops there itself and the stop
+// is reported by the engine, so this stays per-request state.
+template<typename State, typename Tokens>
+bool EndsTurn(const State& state, const Tokens& tokens, int token) {
+  return state.stop_at_eos() && tokens.IsStopToken(token);
+}
+
 namespace {
 
 using Clock = std::chrono::steady_clock;
@@ -53,90 +65,6 @@ void SetError(std::string* error, std::string message) {
 }
 
 #if defined(ENGINE_ENABLE_HIP)
-
-std::optional<ChatRequest> ConstrainChatRequest(
-    const ChatRequest& request, const TextModelRunner& runner,
-    sampling::SamplingConfig* sampling) {
-  bool strict_tools = request.constrained_tools;
-  for (const auto& tool : request.tools)
-    if (!tool.definition_json.empty()) {
-      const auto definition = json::parse(tool.definition_json);
-      const auto* function = definition.find("function");
-      strict_tools |= function && function->find("strict") &&
-                      function->find("strict")->as_bool();
-    }
-  if (!request.response_format &&
-      (request.tools.empty() ||
-       request.tool_choice == ChatRequest::ToolChoice::kNone ||
-       (!strict_tools && request.parallel_tool_calls)))
-    return std::nullopt;
-  auto constrained = request;
-  auto instruction = request.response_format ? request.response_format->prompt()
-                                             : std::string();
-  auto grammar = request.response_format;
-  if (!request.tools.empty() &&
-      request.tool_choice != ChatRequest::ToolChoice::kNone) {
-    std::vector<sampling::JsonConstraint::Tool> tools;
-    for (const auto& tool : request.tools) {
-      const auto definition = tool.definition_json.empty()
-                                  ? json::Value()
-                                  : json::parse(tool.definition_json);
-      const auto* function = definition.find("function");
-      const auto* strict = function ? function->find("strict") : nullptr;
-      const bool enforce = strict && strict->as_bool();
-      auto schema = json::parse(tool.parameters_json);
-      if (!enforce) {
-        if (!schema.contains("type"))
-          schema["type"] = "object";
-        if (!schema.contains("properties"))
-          schema["properties"] = json::Value::object();
-        if (!schema.contains("additionalProperties"))
-          schema["additionalProperties"] = false;
-      }
-      std::shared_ptr<const sampling::JsonConstraint> arguments;
-      try {
-        arguments = sampling::JsonConstraint::Compile(schema, enforce);
-      } catch (const std::invalid_argument&) {
-        if (enforce)
-          throw;
-        // Non-strict tool parameters are guidance, unlike response_format.
-        // An unrestricted/unsupported tool schema must not prevent a valid
-        // structured answer. Keep the declared tool name and JSON arguments.
-        arguments = sampling::JsonConstraint::Object();
-      }
-      tools.emplace_back(tool.name, std::move(arguments));
-    }
-    grammar = sampling::JsonConstraint::WithTools(
-        grammar, std::move(tools),
-        request.tool_choice == ChatRequest::ToolChoice::kRequired,
-        !request.response_format && request.parallel_tool_calls);
-    instruction +=
-        "\nIf a tool is needed, respond using the JSON tool-call form "
-        "<tool_call>{\"name\":\"function_name\",\"arguments\":{...}}</"
-        "tool_call>. "
-        "Tool arguments must follow the chosen function's schema.";
-    if (request.response_format)
-      instruction += " The JSON response schema applies to the final answer.";
-  }
-  if (!request.response_format_description.empty())
-    instruction.insert(0, request.response_format_description + "\n\n");
-  if (!constrained.messages.empty() &&
-      (constrained.messages.front().role == tokenization::ChatRole::kSystem ||
-       constrained.messages.front().role ==
-           tokenization::ChatRole::kDeveloper)) {
-    constrained.messages.front().content += "\n\n" + instruction;
-  } else {
-    constrained.messages.insert(
-        constrained.messages.begin(),
-        tokenization::ChatMessage{tokenization::ChatRole::kSystem,
-                                  instruction});
-  }
-  if (runner.InitialOutputState(request) ==
-      TextGenerationBackend::InitialOutputState::kReasoning)
-    grammar = sampling::JsonConstraint::WithReasoning(grammar);
-  sampling->constraint = runner.BindConstraint(grammar);
-  return constrained;
-}
 
 struct QwenImageContext final : TextPromptContext {
   std::shared_ptr<const models::qwen::vision::Prompt> prompt;
@@ -412,6 +340,9 @@ std::vector<std::uint8_t> QwenCompatibilityIdentity(
            << tokenization::QwenChatTemplate::OfficialTemplateSha256() << '\n'
            << "state_abi=" << state_abi << '\n'
            << "payload_layout=qwen-gfx1151-live-prefix-v3\n"
+           // Older learned boundaries could keep logits from an earlier
+           // prefix. Their payload has no readiness tag to distinguish them.
+           << "checkpoint_frontier=complete-prefix-v1\n"
            << "numerics=qwen-bf16-fp32-prefill-v1\n"
            << "rmsnorm=fused-square-sum-v1\n"
            << "prefill_attention=visible-causal-tail-v1\n"
@@ -662,7 +593,8 @@ public:
     if (!frontier_.has_value()) {
       throw std::logic_error("Qwen state has no next-token frontier");
     }
-    if (sampler.config().can_use_unmodified_argmax()) {
+    if (sampler.config().can_use_unmodified_argmax() ||
+        (verifier_ == nullptr && sampler.CanSelectArgmax(*frontier_))) {
       return *frontier_;
     }
     if (frontier_logits_.empty()) {
@@ -714,6 +646,7 @@ public:
   void FinishSpeculativeDecode(
       speculative::SpeculativeVerifier::StepResult verification,
       sampling::SamplerState& sampler, TextDecodeStep& result) {
+    result.draft_rounds = verification.draft_count > 0 ? 1 : 0;
     result.draft_tokens = verification.draft_count;
     result.draft_accepted_tokens = verification.accepted_count;
     result.execution_plan = {
@@ -948,8 +881,78 @@ const QwenTextRunnerState& RequireQwenState(const TextRunnerState& state) {
   return *qwen;
 }
 
-class QwenTextRunner final : public TextModelRunner {
+// Owns a four-byte device buffer and a private stream from load, so probing
+// a lost context needs no allocation. HIP context loss is sticky: after a GPU
+// reset even this memset fails with a hard error. Only such an error marks the
+// device lost; a memset still pending at the deadline may be queued behind
+// long kernels on the shared hardware queues, so it counts as usable.
+class HipTextModelRunner : public TextModelRunner {
 public:
+  HipTextModelRunner() {
+    HIP_CHECK(hipStreamCreateWithFlags(&probe_stream_, hipStreamNonBlocking));
+    if (const auto error = hipMalloc(&probe_buffer_, sizeof(std::uint32_t));
+        error != hipSuccess) {
+      hip::LogCleanupError(hipStreamDestroy(probe_stream_));
+      throw std::runtime_error(std::string("device probe allocation: ") +
+                               hipGetErrorString(error));
+    }
+  }
+  ~HipTextModelRunner() override {
+    hip::LogCleanupError(hipFree(probe_buffer_));
+    hip::LogCleanupError(hipStreamDestroy(probe_stream_));
+  }
+  HipTextModelRunner(const HipTextModelRunner&) = delete;
+  HipTextModelRunner& operator=(const HipTextModelRunner&) = delete;
+  HipTextModelRunner(HipTextModelRunner&&) = delete;
+  HipTextModelRunner& operator=(HipTextModelRunner&&) = delete;
+
+  [[nodiscard]] DeviceProbeStatus PollDevice() const override {
+    if (!probe_pending_) {
+      // Clear the failed work unit's thread-local error before probing.
+      (void)hipGetLastError();
+      if (hipMemsetAsync(probe_buffer_, 0, sizeof(std::uint32_t),
+                         probe_stream_) != hipSuccess ||
+          hipGetLastError() != hipSuccess)
+        return DeviceProbeStatus::kLost;
+      probe_pending_ = true;
+    }
+    const auto status = hipStreamQuery(probe_stream_);
+    if (status == hipErrorNotReady)
+      return DeviceProbeStatus::kPending;
+    probe_pending_ = false;
+    return status == hipSuccess ? DeviceProbeStatus::kUsable
+                                : DeviceProbeStatus::kLost;
+  }
+
+  [[nodiscard]] bool DeviceUsable() const override {
+    constexpr auto kTimeout = std::chrono::seconds(5);
+    const auto deadline = Clock::now() + kTimeout;
+    for (;;) {
+      const auto status = PollDevice();
+      if (status == DeviceProbeStatus::kUsable)
+        return true;
+      if (status == DeviceProbeStatus::kLost)
+        return false;
+      if (Clock::now() >= deadline) {
+        Logger::Warn("scheduler", "event=device_probe_timeout timeout_s=" +
+                                      std::to_string(kTimeout.count()));
+        return true;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+  }
+
+private:
+  hipStream_t probe_stream_{};
+  void* probe_buffer_{};
+  mutable bool probe_pending_{false};
+};
+
+class QwenTextRunner final : public HipTextModelRunner {
+public:
+  sampling::JsonConstraint::ToolFormat ToolFormat() const override {
+    return sampling::JsonConstraint::ToolFormat::kQwen;
+  }
   QwenTextRunner(
       std::shared_ptr<const hip::QwenGpuModel> model, std::uint32_t max_context,
       std::shared_ptr<const hip::QwenDFlashGpuModel> dflash_model = nullptr,
@@ -1017,12 +1020,22 @@ public:
     if (hipMemGetInfo(&free_bytes, &total_bytes) == hipSuccess) {
       capacity = free_bytes;
     }
+    // Snapshot buffers are device allocations, but on a unified-memory APU
+    // they are carved from the same RAM as every host allocation, and HIP's
+    // free figure does not see host pressure. Cap them by the host budget too.
+    std::size_t snapshot_capacity = HostSnapshotBudgetBytes();
+    std::size_t snapshot_ceiling = HostSnapshotCeilingBytes();
+    if (capacity.has_value()) {
+      snapshot_capacity = std::min(snapshot_capacity, *capacity);
+      snapshot_ceiling = std::min(snapshot_ceiling, *capacity);
+    }
     return {
         .resident_weights_bytes = resident_weights,
         .state_capacity_bytes = capacity,
         .per_request_state_bytes = usage.request_state_bytes,
         .temporary_scratch_bytes = usage.temporary_scratch_bytes,
-        .retained_snapshot_capacity_bytes = capacity,
+        .retained_snapshot_capacity_bytes = snapshot_capacity,
+        .retained_snapshot_ceiling_bytes = snapshot_ceiling,
         .requires_device_runtime_lock = true,
     };
   }
@@ -1173,7 +1186,7 @@ public:
       TextRunnerState& state, sampling::SamplerState& sampler) const override {
     auto& qwen = RequireQwenState(state);
     const TextRunnerToken token = qwen.SelectFrontier(sampler);
-    if (qwen.stop_at_eos() && model_->GetTokenizer().IsStopToken(token)) {
+    if (EndsTurn(qwen, model_->GetTokenizer(), token)) {
       return {
           .stop = true,
           .token = 0,
@@ -1695,8 +1708,11 @@ const DeepSeekTextRunnerState& RequireDeepSeekState(
   return *deepseek;
 }
 
-class DeepSeekTextRunner final : public TextModelRunner {
+class DeepSeekTextRunner final : public HipTextModelRunner {
 public:
+  sampling::JsonConstraint::ToolFormat ToolFormat() const override {
+    return sampling::JsonConstraint::ToolFormat::kDeepSeek;
+  }
   DeepSeekTextRunner(std::shared_ptr<models::deepseek_v4_flash::Model> model,
                      std::uint32_t max_context, bool use_dspark,
                      std::uint32_t max_draft_tokens,
@@ -1756,6 +1772,7 @@ public:
         .per_request_state_bytes = std::nullopt,
         .temporary_scratch_bytes = std::nullopt,
         .retained_snapshot_capacity_bytes = HostSnapshotBudgetBytes(),
+        .retained_snapshot_ceiling_bytes = HostSnapshotCeilingBytes(),
         .requires_device_runtime_lock = true,
     };
   }
@@ -1798,7 +1815,7 @@ public:
     for (const auto& message : request.messages) {
       models::deepseek_v4_flash::ChatMessage converted{
           .role = std::string(ChatRoleName(message.role)),
-          .content = message.content,
+          .content = message.content + message.framing_suffix,
           .reasoning_content = message.thought,
           .tool_calls = {},
           .tool_call_id = message.tool_call_id,
@@ -2049,6 +2066,7 @@ public:
       });
     }
     const auto stats_after = deepseek.session().DsparkStatistics();
+    step.draft_rounds = stats_after.steps - stats_before.steps;
     step.draft_tokens =
         stats_after.support_drafted - stats_before.support_drafted;
     step.draft_accepted_tokens =
@@ -2112,10 +2130,16 @@ public:
     }
 
     std::string error;
+    bool interrupted = false;
     if (!model_->DsparkStepBatch(
             std::span<const models::deepseek_v4_flash::SessionDsparkBatchItem>(
                 items.data(), decodes.size()),
-            &error)) {
+            &error, &interrupted)) {
+      // Cancellation is rejected before sampling or device-state mutation.
+      // Isolate the cancelled row rather than failing every client in its
+      // batch. Ordinary cycles retain the shared physical batch.
+      if (interrupted)
+        return TextModelRunner::DecodeBatch(decodes);
       throw std::runtime_error("DeepSeek DSpark batch decode failed: " + error);
     }
 
@@ -2146,6 +2170,7 @@ public:
         });
       }
       const auto stats_after = states[index]->session().DsparkStatistics();
+      step.draft_rounds = stats_after.steps - stats_before[index].steps;
       step.draft_tokens =
           stats_after.support_drafted - stats_before[index].support_drafted;
       step.draft_accepted_tokens =
@@ -2179,10 +2204,15 @@ public:
     }
 
     std::string error;
+    bool interrupted = false;
     if (!model_->EvaluateBatch(
             std::span<const models::deepseek_v4_flash::SessionBatchItem>(
                 items.data(), item_count),
-            &error)) {
+            &error, &interrupted)) {
+      if (interrupted) {
+        TextModelRunner::AdvanceBatch(advances);
+        return;
+      }
       throw std::runtime_error("DeepSeek batch decode failed: " + error);
     }
     for (std::size_t index = 0; index < item_count; ++index) {
@@ -2425,6 +2455,13 @@ public:
     return static_cast<std::size_t>(snapshot->SizeBytes());
   }
 
+  [[nodiscard]] bool PrefersState(
+      const ContinuationState& state) const noexcept override {
+    const auto* flash =
+        dynamic_cast<const QwenFlashNextTextRunnerState*>(&state);
+    return snapshot && flash && flash->session().OwnsSnapshot(*snapshot);
+  }
+
   std::shared_ptr<QwenFlashNextModel> model;
   std::unique_ptr<models::qwen38_flash_next::SessionSnapshot> snapshot;
   std::size_t position;
@@ -2448,8 +2485,11 @@ const QwenFlashNextTextRunnerState& RequireQwenFlashNextState(
   return *qfn;
 }
 
-class QwenFlashNextTextRunner final : public TextModelRunner {
+class QwenFlashNextTextRunner final : public HipTextModelRunner {
 public:
+  sampling::JsonConstraint::ToolFormat ToolFormat() const override {
+    return sampling::JsonConstraint::ToolFormat::kQwen;
+  }
   QwenFlashNextTextRunner(std::shared_ptr<QwenFlashNextModel> model,
                           std::uint32_t max_context, bool use_mtp,
                           std::uint32_t max_draft_tokens,
@@ -2487,6 +2527,7 @@ public:
                 .batched_multi_token_decode = use_mtp_,
                 .batched_multi_token_decode_max_width = use_mtp_ ? 8u : 0u,
                 .prefix_reuse = true,
+                .in_pass_checkpoint = true,
             },
         .persistence = persistence_,
     };
@@ -2500,7 +2541,8 @@ public:
       const auto deferred = model_->DeferredScratchBytes();
       capacity = free_bytes > deferred ? free_bytes - deferred : 0;
     }
-    // Snapshots live in host memory, not in the device state pool.
+    // Admission charges complete snapshot payloads. Flash-Next can retain
+    // mutable state and protected K/V rows in private device storage.
     return {
         .resident_weights_bytes = model_->ResidentBytes(),
         .state_capacity_bytes = capacity,
@@ -2512,6 +2554,7 @@ public:
         // reserve its remaining lazy buffers once from aggregate capacity.
         .temporary_scratch_bytes = 0,
         .retained_snapshot_capacity_bytes = HostSnapshotBudgetBytes(),
+        .retained_snapshot_ceiling_bytes = HostSnapshotCeilingBytes(),
         .requires_device_runtime_lock = true,
     };
   }
@@ -2604,12 +2647,25 @@ public:
       throw std::logic_error(
           "Qwen3.8-Flash-Next prefill has no remaining input");
     }
-    const std::size_t consumed = std::min<std::size_t>(
-        {max_input_tokens, prompt.size() - offset, model_->PrefillCapacity()});
+    const std::size_t remaining = prompt.size() - offset;
+    const std::size_t consumed =
+        std::min<std::size_t>({max_input_tokens, remaining,
+                               remaining <= model_->PrefillThroughCapacity()
+                                   ? model_->PrefillThroughCapacity()
+                                   : model_->PrefillCapacity()});
     const std::size_t next_position = offset + consumed;
     const auto prefix = QwenFlashNextEngineTokens(prompt.first(next_position));
+    // The next step most likely takes the same budget; its n-gram rows are
+    // read during this one and used only if it does.
+    const std::size_t after = prompt.size() - next_position;
+    const auto next = QwenFlashNextEngineTokens(prompt.subspan(
+        next_position,
+        std::min<std::size_t>({max_input_tokens, after,
+                               after <= model_->PrefillThroughCapacity()
+                                   ? model_->PrefillThroughCapacity()
+                                   : model_->PrefillCapacity()})));
     std::string error;
-    if (!qfn.session().Sync(prefix, &error)) {
+    if (!qfn.session().Sync(prefix, &error, next)) {
       qfn.set_position(0);
       throw std::runtime_error("Qwen3.8-Flash-Next prefill failed: " + error);
     }
@@ -2618,6 +2674,64 @@ public:
         .consumed_tokens = consumed,
         .decode_ready = next_position == prompt.size(),
     };
+  }
+
+  [[nodiscard]] std::optional<std::size_t> PrefillCheckpointBytes(
+      const TextRunnerState& state, std::span<const TextRunnerToken> prompt,
+      std::size_t offset, std::size_t budget,
+      std::size_t boundary) const override {
+    const auto& qfn = RequireQwenFlashNextState(state);
+    const auto consumed = std::min<std::size_t>(
+        {budget, prompt.size() - offset, model_->PrefillThroughCapacity()});
+    if (boundary <= offset + 1 || boundary >= offset + consumed ||
+        offset + consumed - boundary > 8)
+      return std::nullopt;
+    const auto bytes = qfn.session().PrefillCheckpointBytes(
+        static_cast<std::uint32_t>(boundary));
+    return bytes ? std::optional<std::size_t>(bytes) : std::nullopt;
+  }
+
+  [[nodiscard]] TextPrefillStep PrefillThrough(
+      TextRunnerState& state, std::span<const TextRunnerToken> prompt,
+      std::size_t offset, std::size_t budget, std::size_t boundary,
+      std::unique_ptr<TextRunnerSnapshot>* checkpoint) const override {
+    auto& qfn = RequireQwenFlashNextState(state);
+    if (offset != qfn.position())
+      throw std::logic_error("in-pass checkpoint offset does not match state");
+    const auto consumed = std::min<std::size_t>(
+        {budget, prompt.size() - offset, model_->PrefillThroughCapacity()});
+    const auto next_position = offset + consumed;
+    const auto prefix = QwenFlashNextEngineTokens(prompt.first(next_position));
+    std::unique_ptr<models::qwen38_flash_next::SessionSnapshot> captured;
+    std::string error;
+    double capture_ms = 0;
+    if (!qfn.session().SyncThrough(prefix, static_cast<std::uint32_t>(boundary),
+                                   &captured, &error, &capture_ms)) {
+      qfn.set_position(0);
+      throw std::runtime_error("in-pass checkpoint failed: " + error);
+    }
+    qfn.set_position(next_position);
+    *checkpoint = std::make_unique<QwenFlashNextTextRunnerSnapshot>(
+        model_, std::move(captured), boundary);
+    return {.consumed_tokens = consumed,
+            .decode_ready = next_position == prompt.size(),
+            .checkpoint_ms = capture_ms};
+  }
+
+  // The engine stops before committing EOS when the request enables it.
+  // Every returned token is committed work and is emitted exactly once.
+  void ResolveStepTokens(QwenFlashNextTextRunnerState&, bool engine_stopped,
+                         std::span<const std::int32_t> tokens,
+                         TextDecodeStep* step) const {
+    step->stop = engine_stopped;
+    step->selections.reserve(tokens.size());
+    for (const std::int32_t token : tokens) {
+      step->selections.push_back({
+          .stop = false,
+          .token = static_cast<TextRunnerToken>(token),
+          .piece = model_->TokenText(token),
+      });
+    }
   }
 
   [[nodiscard]] TextDecodeSelection SelectNext(
@@ -2632,7 +2746,7 @@ public:
           "Qwen3.8-Flash-Next token selection has no logits");
     }
     const auto token = static_cast<std::int32_t>(sampler.Sample(logits));
-    if (qfn.stop_at_eos() && model_->IsStopToken(token)) {
+    if (EndsTurn(qfn, *model_, token)) {
       return {.stop = true, .token = 0, .piece = {}};
     }
     return {
@@ -2681,6 +2795,8 @@ public:
     std::string error;
     const auto budget =
         std::min<std::size_t>(max_tokens, std::uint64_t{max_draft_tokens_} + 1);
+    // Use the same request policy as SelectNext and the batched MTP path.
+    // The engine stops before committing EOS or work beyond it.
     if (!qfn.session().DecodeStep(budget, working_sampler, &decoded, &error,
                                   qfn.stop_at_eos())) {
       throw std::runtime_error("Qwen3.8-Flash-Next MTP decode failed: " +
@@ -2690,17 +2806,10 @@ public:
     // draw so the next batch retains the rejection-conditioned distribution.
     sampler.CopyDrawStateFrom(working_sampler);
     TextDecodeStep step;
-    step.stop = decoded.stop;
-    step.selections.reserve(decoded.tokens.size());
-    for (const std::int32_t token : decoded.tokens) {
-      step.selections.push_back({
-          .stop = false,
-          .token = static_cast<TextRunnerToken>(token),
-          .piece = model_->TokenText(token),
-      });
-    }
+    ResolveStepTokens(qfn, decoded.stop, decoded.tokens, &step);
     qfn.set_position(qfn.session().Position());
     const auto stats_after = qfn.session().Statistics();
+    step.draft_rounds = stats_after.cycles - stats_before.cycles;
     step.draft_tokens = stats_after.drafted - stats_before.drafted;
     step.draft_accepted_tokens = stats_after.accepted - stats_before.accepted;
     return step;
@@ -2781,17 +2890,13 @@ public:
       decodes[i].sampler.get().CopyDrawStateFrom(samplers[i]);
       state.set_position(state.session().Position());
       auto& step = steps[i];
-      step.stop = results[i].stop;
+      ResolveStepTokens(state, results[i].stop, results[i].tokens, &step);
       if (active_count > 1 && !results[i].tokens.empty()) {
         step.execution_plan = {.kind = TextExecutionPlanKind::kBatched,
                                .physical_width = active_count};
       }
-      for (const auto token : results[i].tokens) {
-        step.selections.push_back({.stop = false,
-                                   .token = static_cast<TextRunnerToken>(token),
-                                   .piece = model_->TokenText(token)});
-      }
       const auto stats = state.session().Statistics();
+      step.draft_rounds = stats.cycles - before[i].cycles;
       step.draft_tokens = stats.drafted - before[i].drafted;
       step.draft_accepted_tokens = stats.accepted - before[i].accepted;
     }
@@ -2817,9 +2922,22 @@ public:
 
   [[nodiscard]] std::unique_ptr<TextRunnerSnapshot> Snapshot(
       const TextRunnerState& state) const override {
+    return CaptureSnapshot(state,
+                           QwenFlashNextSession::SnapshotMode::kBorrowed);
+  }
+
+  [[nodiscard]] std::unique_ptr<TextRunnerSnapshot> SnapshotForPersistence(
+      const TextRunnerState& state) const override {
+    return CaptureSnapshot(state,
+                           QwenFlashNextSession::SnapshotMode::kMaterialized);
+  }
+
+  [[nodiscard]] std::unique_ptr<TextRunnerSnapshot> CaptureSnapshot(
+      const TextRunnerState& state,
+      QwenFlashNextSession::SnapshotMode mode) const {
     const auto& qfn = RequireQwenFlashNextState(state);
     std::string error;
-    auto snapshot = qfn.session().SaveSnapshot(&error);
+    auto snapshot = qfn.session().SaveSnapshot(&error, mode);
     if (snapshot == nullptr) {
       throw std::runtime_error("Qwen3.8-Flash-Next snapshot failed: " + error);
     }
@@ -2920,6 +3038,7 @@ struct InferenceBackend::Impl {
     std::string kv_cache_format;
     SamplingDefaults sampling_defaults;
     std::uint32_t max_context{0};
+    bool supports_images{false};
     ReasoningOptions reasoning_defaults;
   };
 
@@ -2928,15 +3047,19 @@ struct InferenceBackend::Impl {
     ScheduledGenerationRequest(
         std::shared_ptr<const State> model_state,
         TextGenerationScheduler::Request scheduled_request,
-        InitialOutputState initial = InitialOutputState::kContent)
+        InitialOutputState initial = InitialOutputState::kContent,
+        std::optional<sampling::JsonConstraint::ToolFormat> tool_format = {})
         : state_(std::move(model_state)),
-          request_(std::move(scheduled_request)) {
+          request_(std::move(scheduled_request)),
+          tool_format_(tool_format) {
       if (initial == InitialOutputState::kReasoning)
         reasoning_end_ = state_->scheduler->runner().Tokenize("</think>");
     }
 
-    Result Wait(const TokenCallback& on_token) override {
-      auto result = request_.Wait(on_token);
+    Result Wait(const TokenCallback& on_token,
+                const ProgressCallback& on_progress,
+                const StartCallback& on_start) override {
+      auto result = request_.Wait(on_token, on_progress, on_start);
       if (!reasoning_end_.empty()) {
         const auto end =
             std::search(result.tokens.begin(), result.tokens.end(),
@@ -2949,10 +3072,16 @@ struct InferenceBackend::Impl {
 
     void Cancel() noexcept override { request_.Cancel(); }
 
+    std::optional<sampling::JsonConstraint::ToolFormat> ToolFormat()
+        const override {
+      return tool_format_;
+    }
+
   private:
     std::shared_ptr<const State> state_;
     TextGenerationScheduler::Request request_;
     std::vector<tokenization::TokenId> reasoning_end_;
+    const std::optional<sampling::JsonConstraint::ToolFormat> tool_format_;
   };
 
   [[nodiscard]] std::shared_ptr<const State> Snapshot() const {
@@ -2996,7 +3125,7 @@ struct InferenceBackend::Impl {
         });
     ScheduledGenerationRequest generation(std::move(current),
                                           std::move(request), initial);
-    return generation.Wait(on_token);
+    return generation.Wait(on_token, {}, {});
   }
 
   mutable std::mutex state_mutex;
@@ -3016,7 +3145,8 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
                             const TextSpeculativeConfig& speculative_config,
                             const TextDiskCacheConfig& disk_cache_config,
                             const TextKvCacheConfig& kv_cache_config,
-                            const std::string& vision_model_path) {
+                            const std::string& vision_model_path,
+                            TextRunnerRamCacheOptions ram_cache_config) {
 #if defined(ENGINE_ENABLE_HIP)
   TextDiskCacheConfig resolved_disk_cache_config = disk_cache_config;
   std::string load_error;
@@ -3098,7 +3228,8 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
     }
     return load(std::move(model), error, max_context, session_count,
                 prefill_policy, scheduler_policy, speculative_config,
-                std::move(resolved_disk_cache_config), kv_cache_config);
+                std::move(resolved_disk_cache_config), kv_cache_config,
+                ram_cache_config);
   }
   if (reader->GetMetadataString("general.architecture") == "qwen4exp") {
     if (!kv_cache_config.value.empty()) {
@@ -3173,7 +3304,8 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
     }
     return load(std::move(model), error, max_context, session_count,
                 prefill_policy, scheduler_policy, speculative_config,
-                std::move(resolved_disk_cache_config), kv_cache_config);
+                std::move(resolved_disk_cache_config), kv_cache_config,
+                ram_cache_config);
   }
   std::shared_ptr<models::qwen::vision::Encoder> vision;
   if (!kv_cache_config.value.empty() &&
@@ -3210,7 +3342,8 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
   }
   return load(std::move(model), error, max_context, session_count,
               prefill_policy, scheduler_policy, speculative_config,
-              std::move(resolved_disk_cache_config), kv_cache_config);
+              std::move(resolved_disk_cache_config), kv_cache_config,
+              ram_cache_config);
 #else
   (void)model_path;
   (void)max_context;
@@ -3221,6 +3354,7 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
   (void)disk_cache_config;
   (void)kv_cache_config;
   (void)vision_model_path;
+  (void)ram_cache_config;
   SetError(error, "HTTP inference requires the HIP backend");
   return false;
 #endif
@@ -3234,7 +3368,8 @@ bool InferenceBackend::load(std::shared_ptr<const hip::QwenGpuModel> model,
                             TextSchedulerPolicy scheduler_policy,
                             TextSpeculativeConfig speculative_config,
                             TextDiskCacheConfig disk_cache_config,
-                            TextKvCacheConfig kv_cache_config) {
+                            TextKvCacheConfig kv_cache_config,
+                            TextRunnerRamCacheOptions ram_cache_config) {
   if (model == nullptr) {
     SetError(error, "Qwen GPU model must not be null");
     return false;
@@ -3359,6 +3494,7 @@ bool InferenceBackend::load(std::shared_ptr<const hip::QwenGpuModel> model,
     new_state->sampling_defaults.model =
         sampling::TextPreset(model->GetConfig());
     new_state->sampling_defaults.supplied = {};
+    new_state->supports_images = model->VisionEncoder() != nullptr;
     auto runner = std::make_shared<QwenTextRunner>(
         std::move(model), max_context, std::move(dflash_model),
         speculative_options, execution_policy,
@@ -3378,7 +3514,8 @@ bool InferenceBackend::load(std::shared_ptr<const hip::QwenGpuModel> model,
     Logger::Info("loader",
                  "event=load_phase phase=sessions " + Logger::MemoryStatus());
     auto runner_pool = std::make_shared<TextRunnerPool>(
-        std::move(runner), session_count, std::move(runner_disk_cache));
+        std::move(runner), session_count, std::move(runner_disk_cache),
+        ram_cache_config);
     new_state->scheduler = std::make_shared<TextGenerationScheduler>(
         std::move(runner_pool), prefill_policy, scheduler_policy);
     {
@@ -3397,7 +3534,8 @@ bool InferenceBackend::load(
     std::uint32_t max_context, std::size_t session_count,
     TextPrefillPolicy prefill_policy, TextSchedulerPolicy scheduler_policy,
     TextSpeculativeConfig speculative_config,
-    TextDiskCacheConfig disk_cache_config, TextKvCacheConfig kv_cache_config) {
+    TextDiskCacheConfig disk_cache_config, TextKvCacheConfig kv_cache_config,
+    TextRunnerRamCacheOptions ram_cache_config) {
   if (model == nullptr) {
     SetError(error, "DeepSeek model must not be null");
     return false;
@@ -3469,7 +3607,8 @@ bool InferenceBackend::load(
       };
     }
     auto runner_pool = std::make_shared<TextRunnerPool>(
-        std::move(runner), session_count, std::move(runner_disk_cache));
+        std::move(runner), session_count, std::move(runner_disk_cache),
+        ram_cache_config);
     new_state->scheduler = std::make_shared<TextGenerationScheduler>(
         std::move(runner_pool), prefill_policy, scheduler_policy);
     {
@@ -3488,7 +3627,8 @@ bool InferenceBackend::load(
     std::uint32_t max_context, std::size_t session_count,
     TextPrefillPolicy prefill_policy, TextSchedulerPolicy scheduler_policy,
     TextSpeculativeConfig speculative_config,
-    TextDiskCacheConfig disk_cache_config, TextKvCacheConfig kv_cache_config) {
+    TextDiskCacheConfig disk_cache_config, TextKvCacheConfig kv_cache_config,
+    TextRunnerRamCacheOptions ram_cache_config) {
   if (model == nullptr) {
     SetError(error, "Qwen3.8-Flash-Next model must not be null");
     return false;
@@ -3540,6 +3680,7 @@ bool InferenceBackend::load(
     auto new_state = std::make_shared<Impl::State>();
     new_state->sampling_defaults.model = sampling::TextModelPreset::kQwen38;
     new_state->sampling_defaults.supplied = {};
+    new_state->supports_images = model->VisionEncoder() != nullptr;
     auto runner = std::make_shared<QwenFlashNextTextRunner>(
         std::move(model), max_context,
         speculative_config.backend == TextSpeculativeBackend::kMtp,
@@ -3558,7 +3699,8 @@ bool InferenceBackend::load(
       };
     }
     auto runner_pool = std::make_shared<TextRunnerPool>(
-        std::move(runner), session_count, std::move(runner_disk_cache));
+        std::move(runner), session_count, std::move(runner_disk_cache),
+        ram_cache_config);
     new_state->scheduler = std::make_shared<TextGenerationScheduler>(
         std::move(runner_pool), prefill_policy, scheduler_policy);
     {
@@ -3590,6 +3732,24 @@ bool InferenceBackend::ready() const {
 #endif
 }
 
+bool InferenceBackend::device_lost() const {
+#if defined(ENGINE_ENABLE_HIP)
+  const auto state = impl_->Snapshot();
+  return state != nullptr && state->scheduler->device_lost();
+#else
+  return false;
+#endif
+}
+
+bool InferenceBackend::supports_images() const {
+#if defined(ENGINE_ENABLE_HIP)
+  const auto state = impl_->Snapshot();
+  return state != nullptr && state->supports_images;
+#else
+  return false;
+#endif
+}
+
 std::uint32_t InferenceBackend::max_context() const {
 #if defined(ENGINE_ENABLE_HIP)
   const auto state = impl_->Snapshot();
@@ -3603,6 +3763,17 @@ std::string InferenceBackend::kv_cache_format() const {
 #if defined(ENGINE_ENABLE_HIP)
   const auto state = impl_->Snapshot();
   return state != nullptr ? state->kv_cache_format : std::string{};
+#else
+  return {};
+#endif
+}
+
+std::vector<InferenceBackend::SessionState> InferenceBackend::session_states()
+    const {
+#if defined(ENGINE_ENABLE_HIP)
+  const auto state = impl_->Snapshot();
+  return state != nullptr ? state->scheduler->SessionStates()
+                          : std::vector<SessionState>{};
 #else
   return {};
 #endif
@@ -3760,15 +3931,15 @@ InferenceBackend::start_complete(
     std::string_view prompt, std::size_t max_tokens,
     const sampling::SamplingConfig& sampling_config,
     const CancellationCheck& is_cancelled, bool stream_output, bool ignore_eos,
-    std::string_view client_id,
-    const std::vector<std::string>& stop_sequences) {
+    std::string_view client_id, const std::vector<std::string>& stop_sequences,
+    bool return_progress) {
 #if defined(ENGINE_ENABLE_HIP)
   const auto request_start = Clock::now();
   const auto state = impl_->Snapshot();
   if (state == nullptr) {
     return TextGenerationBackend::start_complete(
         prompt, max_tokens, sampling_config, is_cancelled, stream_output,
-        ignore_eos, client_id, stop_sequences);
+        ignore_eos, client_id, stop_sequences, return_progress);
   }
   auto prompt_tokens = state->scheduler->runner().Tokenize(prompt);
   auto scheduled_request = state->scheduler->Submit(
@@ -3783,13 +3954,14 @@ InferenceBackend::start_complete(
           .cache_prefix_tokens = 0,
           .stop_at_eos = !ignore_eos,
           .stop_sequences = stop_sequences,
+          .return_progress = return_progress,
       });
   return std::make_shared<Impl::ScheduledGenerationRequest>(
       state, std::move(scheduled_request));
 #else
   return TextGenerationBackend::start_complete(
       prompt, max_tokens, sampling_config, is_cancelled, stream_output,
-      ignore_eos, client_id, stop_sequences);
+      ignore_eos, client_id, stop_sequences, return_progress);
 #endif
 }
 
@@ -3807,8 +3979,9 @@ InferenceBackend::start_chat(const ChatRequest& request, std::size_t max_tokens,
   }
 
   auto effective_sampling = sampling_config;
+  std::optional<sampling::JsonConstraint::ToolFormat> tool_format;
   auto constrained = ConstrainChatRequest(request, state->scheduler->runner(),
-                                          &effective_sampling);
+                                          &effective_sampling, &tool_format);
   const auto& effective_request = constrained ? *constrained : request;
   auto prompt = state->scheduler->runner().PreparePrompt(effective_request);
   if (!prompt.has_value() || prompt->tokens.empty()) {
@@ -3829,10 +4002,12 @@ InferenceBackend::start_chat(const ChatRequest& request, std::size_t max_tokens,
           .cache_prompt = request.cache_prompt,
           .cache_prefix_tokens = prompt->cache_prefix_tokens,
           .stop_sequences = request.stop_sequences,
+          .return_progress = request.return_progress,
       });
   return std::make_shared<Impl::ScheduledGenerationRequest>(
       state, std::move(scheduled_request),
-      state->scheduler->runner().InitialOutputState(effective_request));
+      state->scheduler->runner().InitialOutputState(effective_request),
+      tool_format);
 #else
   return TextGenerationBackend::start_chat(request, max_tokens, sampling_config,
                                            is_cancelled, stream_output);

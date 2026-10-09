@@ -29,6 +29,7 @@
 #include "tests/models/qwen/hip/support/bfloat16.hpp"
 #include "tests/models/qwen/hip/support/device.hpp"
 #include "tests/models/qwen/hip/support/device_buffer.hpp"
+#include "tests/models/qwen/hip/support/fp16.hpp"
 
 // DFlash2 uses in-place Q/K and no target KV-cache outputs. Context injection
 // also uses the key-only path with no query heads.
@@ -682,7 +683,7 @@ void TestKvarnRotationPreservesQkScore() {
         head_dim;
     for (std::uint32_t d = 0; d < head_dim; ++d) {
       const float rotated = kk[kv_h * head_dim + d];
-      if (sink[row + d] != __half_as_ushort(__float2half_rn(rotated))) {
+      if (sink[row + d] != gufo::test::FloatToFp16Bits(rotated)) {
         throw std::runtime_error("the KVarN sink must hold the rotated K");
       }
     }

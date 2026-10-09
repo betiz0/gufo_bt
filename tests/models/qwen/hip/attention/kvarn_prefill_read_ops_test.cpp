@@ -25,6 +25,7 @@
 #include "src/models/qwen/hip/ops/attention.hpp"
 #include "src/models/qwen/kvarn_reference.hpp"
 #include "tests/models/qwen/hip/support/device.hpp"
+#include "tests/models/qwen/hip/support/fp16.hpp"
 #include "tests/testing/test_common.hpp"
 
 namespace {
@@ -134,8 +135,8 @@ struct Harness {
         for (const bool is_value : {false, true}) {
           std::vector<std::uint16_t> values(kHeadDim);
           for (std::uint32_t c = 0; c < kHeadDim; ++c) {
-            values[c] = __half_as_ushort(
-                __float2half_rn(KeyValue(position, head, c, is_value)));
+            values[c] = gufo::test::FloatToFp16Bits(
+                KeyValue(position, head, c, is_value));
           }
           const std::size_t offset =
               (is_value ? chunk_plane : 0) +
