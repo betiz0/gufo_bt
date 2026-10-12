@@ -103,7 +103,15 @@ The supported modalities are LLM, image, video, and audio (TTS, ASR).
 - The default stays `fp16`, so existing outputs, snapshots, compatibility keys
   and `.kvc` disk caches are unchanged. The startup log and `gufo bench` report
   the selected format, the tail length (or none), the effective bpv (body and
-  total) and the per-session KV capacity.
+  total) and the per-session KV capacity. The fitting tails cost 4.47 GiB per
+  262K session for `kvarn-k4v4` tail 256 (4.467 total bpv) and 6.08 GiB for
+  `kvarn-k6v5` tail 2048 (6.076 total bpv); the model README lists every tail
+  from none to 2048.
+- Quality against the q8→q4 reference (2026-10-12, same-label windows):
+  `kvarn-k6v5` tail 2048 meets the 0.13 budget at 4K and 32K (worst 0.125) but
+  not at 128K (worst 0.195, the large-deviation rate over nine fresh windows),
+  so long-context use of the quality-first preset is not sanctioned;
+  `kvarn-k4v4` tail 256 stays within its ≤ 1 budget everywhere measured.
 - KVarN with image tokens and M-RoPE positions is unverified (the vision check
   needs the `mmproj-BF16.gguf` sidecar, design D20 / task 5.4), so image
   requests should keep the default `fp16` KV.

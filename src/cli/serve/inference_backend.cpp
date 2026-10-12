@@ -161,11 +161,15 @@ bool DiskCacheEnabled(const TextDiskCacheConfig& config) noexcept {
 
 /// Canonical `kv_storage=` spelling for the disk-cache identity (design D9).
 /// FP16/FP32 keep their existing strings; KVarN names its preset, K/V widths,
-/// tail length (distinguishing unset from an explicit W) and scale type, so a
-/// cache built with another preset or tail is never reused.
+/// tail length (distinguishing unset from an explicit W) and scale type, and
+/// the gpu-test baseline probes name their own kind, so a cache built with
+/// another preset, tail or storage is never reused.
 std::string QwenKvStorageIdentity(const hip::QwenExecutionPolicy& policy) {
   if (!policy.UsesKvarn()) {
-    return policy.UsesFp16AttentionKv() ? "fp16" : "fp32";
+    const std::string_view storage =
+        hip::QwenKvCacheStorageName(policy.kv_cache_storage);
+    return storage.empty() ? (policy.UsesFp16AttentionKv() ? "fp16" : "fp32")
+                           : std::string(storage);
   }
   std::ostringstream value;
   value << "kvarn-k" << static_cast<int>(policy.kvarn.k_bits) << "v"
@@ -214,12 +218,20 @@ std::string QwenKvStorageIdentity(const hip::QwenExecutionPolicy& policy) {
 
 /// State ABI string for the disk-cache identity (design D9). FP16/FP32 keep
 /// their existing spellings; KVarN gets a distinct ABI that carries the preset
-/// identity, so a KVarN session can never load a canonical-cache state.
+/// identity, so a KVarN session can never load a canonical-cache state, and
+/// the gpu-test baseline probes append their own kind to the canonical
+/// spelling, so a probe session and a plain FP16 session never share a state.
 std::string QwenStateAbiName(bool speculative,
                              const hip::QwenExecutionPolicy& policy) {
   if (!policy.UsesKvarn()) {
-    return std::string(QwenStateAbi(speculative, policy.UsesFp16AttentionKv(),
-                                    policy.UsesBf16RecurrentState()));
+    std::string abi =
+        std::string(QwenStateAbi(speculative, policy.UsesFp16AttentionKv(),
+                                 policy.UsesBf16RecurrentState()));
+    if (policy.UsesBaselineQuant()) {
+      abi += "-";
+      abi += hip::QwenKvCacheStorageName(policy.kv_cache_storage);
+    }
+    return abi;
   }
   // One generation ahead of the canonical strings: v6/v5 reject every cache
   // written before the batched decode and verification stores were fixed to

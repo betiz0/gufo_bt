@@ -9,6 +9,13 @@ endif()
 set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
 option(BUILD_TESTING "Build correctness tests" OFF)
 option(GUFO_BUILD_TOOLS "Build development benchmarks and tuning tools" OFF)
+# gpu-test-only probes of the KV quantization quality evaluation (design D1):
+# the E_q8 / E_q4 baselines. Production builds leave it off, so their
+# `--kv-cache` values and the probe write path stay out of the binary.
+option(GUFO_QWEN_PSEUDO_KVARN "Build the Qwen KV quantization quality probes" OFF)
+if (GUFO_QWEN_PSEUDO_KVARN)
+  add_compile_definitions(GUFO_QWEN_PSEUDO_KVARN=1)
+endif()
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS ON)

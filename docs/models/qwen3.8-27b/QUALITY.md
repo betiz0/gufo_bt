@@ -52,6 +52,163 @@ every row quantized right after the sink):
 | E_q4 | 32K | 0.39844 | 0.001992 | 21.898 | 0.9180 | +0.04883 |
 | E_q4 | 128K | 0.43462 | 0.000367 | 22.086 | 0.9154 | -0.08130 |
 
+#### Re-measured baselines on the G0 windows (change task 1.4)
+
+The re-judgment change (`improve-kvarn-k6v5-quality-and-speed`) restores the
+baselines as a gpu-test-only `--kv-cache baseline-q8|baseline-q4` write path
+(design D1: rotate, quantize every non-sink row in blocks of 32 with an FP16
+scale, dequantize, inverse-rotate, store in the dense FP16 plane) and
+re-measures them on G0's own windows: label `g0-baseline-check`, G0's three
+corpora, G0's cached 4K teachers, depth 4K, 256 positions, run through the test
+ledger (`artifacts/test-ledger.jsonl`, `T1.4-BASELINE-G0`: exit 0, 274 s, all
+six units with 0 non-finite logits). A fresh label repeats one unit
+bit-identically (`T1.4-DET`, `baseline-q8` corpus 2: every field but `corpus`
+and `seconds` compares equal) and the teacher logits hash is unchanged, so the
+differences below come from the write path, not from measurement noise.
+
+| Baseline | Depth | Mean KL | Median KL | P99.9 KL | Top-1 | ΔNLL | Mean KL vs G0 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| E_q8 | 4K | 0.06401 | 0.000024 | 13.338 | 0.9753 | +0.06011 | +0.04326 |
+| E_q4 | 4K | 0.31170 | 0.000613 | 18.906 | 0.9492 | +0.00643 | +0.04360 |
+
+The median KL and the E_q8 top-1 rate stay within 0.008 of the G0 record, so
+the block-32 definition agrees at the typical position; the difference sits in
+the tail. Of the 50 window positions whose KL moves by more than 0.5 nats, 44
+are in the second half of the window, where the 4,352-token context is longest,
+and single positions carry spikes of up to +18.7 nats that the G0 record does
+not have. The per-corpus mean KL therefore moves in both directions (E_q8
+corpus 0: 0.00256 → 0.00182, lower; corpus 2: 0.05820 → 0.18639, higher).
+
+Hypothesis (the design's, not verified): phase 0 kept the rotated domain — it
+stored the quantized rotated row and rotated Q the same way — while design D1
+inverse-rotates the quantized row back and stores the *unrotated* row in FP16.
+The inverse rotation spreads each block's quantization error over all 256
+channels, and the stored row is rounded to FP16 once more; the extra error
+accumulates over the whole history and shows up where the teacher distribution
+is most sensitive. D1's estimate of that rounding (about an eighth of the E_q8
+error) is smaller than the measured difference. The difference is recorded, not
+judged (design D1): the ruler of this change is a baseline measured in the same
+label and the same windows, and the G0 numbers stay above as the phase-0
+record.
+
+### Re-judgment windows (tasks 2.5-2.7)
+
+The re-judgment evaluates three window groups, all of them different from G0's:
+
+| Depth | Label | Windows | Source |
+| --- | --- | ---: | --- |
+| 4K, 32K | `t08x` | 14 | `t08-reduced`'s eight (seeds 11-18, `~/.cache/gufo/kvarn-quality/t08/corpus-*.txt`) plus six fresh ones (`ext32k/corpus-*.txt`, seeds 21-26) |
+| 128K development | `g0dev-128k` | 3 | G0's corpora 0-2 (`~/.cache/gufo/kvarn-quality/corpus-*.txt`) |
+| 128K verdict | `verdict-128k` | 10 | fresh corpora, seeds 31-40 (`verdict128k/corpus-*.txt`) |
+
+The 32K extension exists because a label's corpus set cannot change after its
+first run while the 32K depth must keep six or more windows after the
+pre-registered teacher-mean-NLL rule (design D14); `t08-reduced` itself is left
+untouched. The 128K development windows reuse G0's cache: the corpus files are
+unchanged since 2026-09-30, their encoded-token SHA-256 values equal `g0-tail`'s
+manifest entries (and `merge-upstream-quality`'s, measured later on the same
+files), and the three 128K teacher files were copied into `g0dev-128k/teacher/`
+byte-identically (`c0..c2-d131072.logits`, SHA-256 equal to the `g0-tail`
+originals; the harness revalidates the token hash when it loads them). The
+verdict windows are measured for the baselines once (task 3.3) and for the
+candidates exactly once, in the final judgment (task 9.1); no improvement check
+uses them. The 4K and 32K judgment reads the `t08x` units of the final build
+(no chapter-6 or chapter-7 change was adopted, so those candidate units are the
+final ones), the 128K judgment reads `verdict-128k`. Exclusions under the pre-registered teacher-mean-NLL rule (D14):
+
+| Depth | Windows | Surviving | Excluded (teacher mean NLL) |
+| --- | ---: | ---: | --- |
+| 4K | 14 | 14 | none |
+| 32K | 14 | 8 | corpus 2 (11.3), 3 (6.0), 4 (5.5), 7 (8.5), 9 (6.2), 10 (11.2) |
+| 128K development | 3 | 3 | none |
+| 128K verdict | 10 | 9 | corpus 0 (11.1) |
+
+The five-window extension was enough: six of the fourteen 32K windows fall to
+the rule and eight survive, so the depth keeps well above the six-window
+target (the earlier `t08-reduced` set alone would have left four).
+
+### Reference positions of this build (task 3.4)
+
+q8->q4 positions with same-label baselines (window bootstrap, 2000 resamples,
+seed 20261005). 4K and 32K come from `t08x` (14 and 8 surviving windows), 128K
+development from `g0dev-128k` (3 windows).
+
+| Metric | 4K | 32K | 128K development |
+| --- | ---: | ---: | ---: |
+| mean KL | -0.025 [-0.077, 0.044] | 0.104 [-0.006, 0.145] | **0.178 [0.080, 0.254]** |
+| median KL | 0.002 [-0.009, 0.010] | -0.009 [-0.059, 0.014] | 0.008 [0.007, 0.022] |
+| large-deviation rate | 0.031 [0.000, 0.158] | 0.125 [0.000, 0.164] | 0.088 [-0.125, 0.167] |
+| top-1 disagreement | -0.024 [-0.195, 0.100] | 0.000 [-0.227, 0.088] | -0.056 [-0.125, 0.000] |
+
+`kvarn-k6v5` tail 2048 passes the 0.13 budget at 4K and 32K (worst 0.125 at
+32K, the large-deviation rate over 8 windows) but **fails on the 128K
+development windows** on mean KL (0.178 > 0.13, interval [0.080, 0.254] over
+three windows); the machine's spike mechanism is the production prefill (WMMA)
+path's f16 staging rounding (task 4.2 verdict in
+[experiments](EXPERIMENTS.md)). The change's judgment therefore rests on the
+verdict windows (`verdict-128k`, nine surviving windows), measured exactly once
+in task 9.1. `kvarn-k4v4` tail 256 stays at or below 1 everywhere measured so
+far (worst 0.875 at 32K).
+
+### Final judgment of this change (tasks 9.1-9.2)
+
+Two labels carry the judgment, each judged with its own same-label baselines
+(window bootstrap, 2000 resamples, seed 20261005; `--gate`):
+
+* `t08x` — 4K and 32K, 14 and 8 surviving windows (D14 excludes six 32K
+  windows). `kvarn-k6v5` tail 2048 passes (worst p 0.125, the 32K
+  large-deviation rate over 8 windows, budget 0.13) and `kvarn-k4v4` tail 256
+  passes (worst p 0.875, the 32K large-deviation rate, budget 1). The stretch
+  goal p <= 0.10 is not met (recorded, not judged).
+* `verdict-128k` — 128K, ten fresh-seed windows, corpus 0 excluded by D14, so
+  nine survive; the candidates were measured on these windows exactly once
+  (task 9.1, `T9.1-128K-K6V5-1..2` and `T9.1-128K-K4V4-1..2`).
+
+| Metric | `kvarn-k6v5` tail 2048 (budget 0.13) | `kvarn-k4v4` tail 256 (budget 1) |
+| --- | ---: | ---: |
+| mean KL | **0.161 [-0.002, 0.345]** | 0.834 [0.390, 1.321] |
+| median KL | 0.025 [0.009, 0.045] | 0.317 [0.224, 0.517] |
+| large-deviation rate | **0.195 [0.000, 0.457]** | 0.829 [0.429, 1.071] |
+| top-1 disagreement | 0.136 [-0.046, 0.380] | 0.739 [0.495, 0.976] |
+
+The gate fails for `kvarn-k6v5` tail 2048 at depth 128K (worst p 0.195, the
+large-deviation rate) and passes for `kvarn-k4v4` tail 256 (worst p 0.834, mean
+KL). The raw 128K means behind the ratios: `kvarn-k6v5` 0.03195,
+`baseline-q8` 0.01250, `baseline-q4` 0.13295; non-finite logits are 0 in every
+unit. The 128K point estimate is consistent with the three-window development
+result above (0.178) and with the G0 anchor record (0.143): the production
+prefill path's f16 staging rounding (task 4.2) still sets the position, and no
+adopted change moved it (chapter 7 records the decision of 2026-10-11).
+
+The quality contract's 128K clause ("p <= 0.13 at every depth") is therefore
+**not met**, and the design's fallback applies: adopt a bpv-increasing
+improvement or revise the target, with the decision returned to the user. The
+verdict windows are measured once, so a revised candidate cannot be re-judged
+on them; it would need fresh windows or the development windows.
+
+**Decision (2026-10-12, user):** record the outcome and revise the target. The
+change's quality contract now fixes the 0.13 budget at 4K and 32K and requires
+the 128K position to be recorded as measured; `kvarn-k6v5` tail 2048 is
+documented as a 4K/32K configuration and its 128K use is not sanctioned. No
+bpv-increasing improvement (the `k8` / `q8_0`-class variants of task 4.4) is
+adopted.
+
+Reproduce (from the repository root):
+
+```sh
+python3 tools/qwen27b/kvarn_quality.py report \
+  --out ~/.cache/gufo/kvarn-quality --label t08x --gate
+python3 tools/qwen27b/kvarn_quality.py report \
+  --out ~/.cache/gufo/kvarn-quality --label verdict-128k --gate
+```
+
+Anchor-method record for comparison (the previous change, design D-27: G0's
+E_q8/E_q4 on G0's windows as a fixed ruler): `kvarn-k6v5` tail 2048 worst 0.087
+and `kvarn-k4v4` tail 256 worst 0.478 on `t08-reduced`; re-reading the archived
+G0 label with its own baselines gives `kvarn-k6v5` tail 2048 worst 0.143 (128K
+large-deviation rate). The two rulers differ by window and implementation, so
+the numbers are recorded side by side rather than compared.
+
 Gate result (worst p over depths and the four judged metrics):
 
 | Preset | Fitting tail | Worst p | Limiting | Budget |

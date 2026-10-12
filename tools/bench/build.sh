@@ -52,6 +52,12 @@ for t in "${targets[@]}"; do
   if grep -q "hipblas" "$src"; then
     extra+=(-lhipblas -lhipblaslt -lrocblas)
   fi
+  link_sources=()
+  if [[ "$src" -ef tools/qwen27b/kvarn_read_compute_bench.hip ]]; then
+    # The microbenchmark seals and checks its fixture with the CPU reference.
+    link_sources+=(src/models/qwen/kvarn_reference.cpp)
+    link_sources+=(src/core/quant/ggml_dequant.cpp)
+  fi
   echo "==> $src -> $out"
   compile=(hipcc -O3 --offload-arch=gfx1151 -std=c++20
     -I. "${inc[@]}" -Rpass-analysis=kernel-resource-usage)
@@ -98,8 +104,8 @@ for t in "${targets[@]}"; do
     rm -rf "$objects"
     trap - EXIT
   else
-    "${compile[@]}" "${lib[@]}" \
-      "$src" "${extra[@]}" -o "$out" 2>"/tmp/${t}.build.log" ||
+    "${compile[@]}" "${lib[@]}" "$src" "${link_sources[@]}" \
+      "${extra[@]}" -o "$out" 2>"/tmp/${t}.build.log" ||
       { tail -40 "/tmp/${t}.build.log"; exit 1; }
   fi
   grep -E "Function Name|VGPRs:|Occupancy|VGPRs Spill|LDS Size" \

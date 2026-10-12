@@ -59,7 +59,8 @@
         "CMAKE_BUILD_TYPE": "RelWithDebInfo",
         "BUILD_TESTING": "ON",
         "ENGINE_ENABLE_HIP": "ON",
-        "GUFO_BUILD_TOOLS": "ON"
+        "GUFO_BUILD_TOOLS": "ON",
+        "GUFO_QWEN_PSEUDO_KVARN": "ON"
       }
     }
   ],

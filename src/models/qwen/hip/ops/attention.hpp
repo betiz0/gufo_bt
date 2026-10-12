@@ -34,9 +34,20 @@ struct KvarnWriteParams {
   /// attention.
   __half* chunk{nullptr};
   std::uint64_t chunk_plane_elements{0};
+  /// gpu-test baseline probe (design D1): 0 stores the dense FP16 rows as
+  /// they are, 8 or 4 rotate, quantize and dequantize every non-sink row in
+  /// blocks of 32 before it is stored. Only a baseline policy sets it, and
+  /// only a probe build acts on it.
+  std::uint8_t baseline_bits{0};
 
   __host__ __device__ [[nodiscard]] bool enabled() const noexcept {
     return sink != nullptr;
+  }
+
+  /// Whether K/V rows must be stored through the fused QK-norm/RoPE/KV-write
+  /// kernel, which is where KVarN and the baseline probes quantize rows.
+  __host__ __device__ [[nodiscard]] bool fused_write_required() const noexcept {
+    return enabled() || baseline_bits != 0;
   }
 };
 

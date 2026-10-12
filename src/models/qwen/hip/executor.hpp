@@ -338,36 +338,39 @@ public:
            config_.num_key_value_heads * config_.head_dim;
   }
   /// KVarN write destination for the fused KV write, or a disabled value for
-  /// the FP16/FP32 policies (design D1/D7).
+  /// the FP16/FP32 policies (design D1/D7). The gpu-test baseline probes get
+  /// the same structure with their quantization width and no KVarN regions.
   [[nodiscard]] KvarnWriteParams GetKvarnWriteParams() const noexcept {
+    KvarnWriteParams params{};
+    params.baseline_bits = policy_.BaselineBits();
     if (!policy_.UsesKvarn()) {
-      return {};
+      return params;
     }
-    return KvarnWriteParams{
-        static_cast<__half*>(d_kvarn_sink),
-        static_cast<__half*>(d_kvarn_tail),
-        kvarn_regions_.sink_elements,
-        kvarn_regions_.tail_elements,
-        static_cast<std::uint32_t>(kvarn_regions_.tail_rows),
-        static_cast<__half*>(d_kvarn_chunk),
-        KvarnChunkPlaneElements()};
+    params.sink = static_cast<__half*>(d_kvarn_sink);
+    params.tail = static_cast<__half*>(d_kvarn_tail);
+    params.sink_plane_elements = kvarn_regions_.sink_elements;
+    params.tail_plane_elements = kvarn_regions_.tail_elements;
+    params.ring_rows = static_cast<std::uint32_t>(kvarn_regions_.tail_rows);
+    params.chunk = static_cast<__half*>(d_kvarn_chunk);
+    params.chunk_plane_elements = KvarnChunkPlaneElements();
+    return params;
   }
   /// KVarN store destination for the decode, batched decode and verification
   /// paths: the F16 sink and the tail ring only (design D1/D4). The per-chunk
   /// prefill workspace is deliberately absent, because only the prefill path
   /// flushes it.
   [[nodiscard]] KvarnWriteParams GetKvarnDirectWriteParams() const noexcept {
+    KvarnWriteParams params{};
+    params.baseline_bits = policy_.BaselineBits();
     if (!policy_.UsesKvarn()) {
-      return {};
+      return params;
     }
-    return KvarnWriteParams{
-        static_cast<__half*>(d_kvarn_sink),
-        static_cast<__half*>(d_kvarn_tail),
-        kvarn_regions_.sink_elements,
-        kvarn_regions_.tail_elements,
-        static_cast<std::uint32_t>(kvarn_regions_.tail_rows),
-        nullptr,
-        0};
+    params.sink = static_cast<__half*>(d_kvarn_sink);
+    params.tail = static_cast<__half*>(d_kvarn_tail);
+    params.sink_plane_elements = kvarn_regions_.sink_elements;
+    params.tail_plane_elements = kvarn_regions_.tail_elements;
+    params.ring_rows = static_cast<std::uint32_t>(kvarn_regions_.tail_rows);
+    return params;
   }
   /// KVarN read source for the decode and verification attention: the sink,
   /// the sealed tiles and the tail ring (design D2). Nothing outside a prefill
@@ -553,6 +556,19 @@ public:
   [[nodiscard]] KvarnSealState* GetKvarnSealState() noexcept {
     return arena_.GetKvarnSealState();
   }
+
+#if defined(GUFO_QWEN_PSEUDO_KVARN)
+  /// gpu-test quality probes (change task 4.3): read-only views of the dense
+  /// FP16 K/V plane and the attention query scratch, so a teacher run can dump
+  /// real tiles for the CPU oracle. Nothing on a production path reads them,
+  /// and a production build does not compile them at all.
+  [[nodiscard]] const void* AttentionKvF16() const noexcept {
+    return arena_.d_attention_kv_f16;
+  }
+  [[nodiscard]] const float* AttentionQuery() const noexcept {
+    return arena_.d_q;
+  }
+#endif
 
   /// Runs one single token forward step on GPU, returning next token ID.
   [[nodiscard]] tokenization::TokenId ForwardToken(

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Phase-0 KV quantization quality tool (openspec add-kvarn-kv-cache-quantization).
+"""KV quantization quality tool (openspec add-kvarn-kv-cache-quantization,
+re-judged by improve-kvarn-k6v5-quality-and-speed).
 
 Drives the gpu-test `qwen_kvarn_quality_eval` harness, which compares the FP16
 KV teacher with probe KV formats on identical token histories, and summarizes
@@ -226,12 +227,16 @@ MAX_TEACHER_NLL = 5.0
 # a large deviation. The constant is declared here, the tool of record.
 LARGE_DEVIATION_NAT = 1.0
 # Budgets on the worst q8->q4 position over depths and metrics. Quality-first
-# must stay near E_q8, memory-first only has to beat E_q4. Both were fixed
-# before the T-08 re-measurement and must not move afterwards.
-QUALITY_FIRST_BUDGET = 0.15
+# must stay near E_q8, memory-first only has to beat E_q4. The stretch goal is
+# recorded, never judged. All three were fixed before the re-judgment and must
+# not move afterwards (design D2/D3).
+QUALITY_FIRST_BUDGET = 0.13
+QUALITY_STRETCH_BUDGET = 0.10
 MEMORY_FIRST_BUDGET = 1.0
-# The memory-first preset of design D1; matched by suffix.
-MEMORY_FIRST_SUFFIX = "k4v4"
+# The presets the gate judges and the budget each one must hold (design D3).
+# Every other measured preset and tail is reported without a verdict.
+JUDGED_PRESETS = (("kvarn-k6v5", QUALITY_FIRST_BUDGET),
+                  ("kvarn-k4v4", MEMORY_FIRST_BUDGET))
 
 # Judged metrics of design D17, as (display label, pooled-table key).
 GATE_METRICS = (
@@ -282,9 +287,6 @@ def summarize(results, max_teacher_nll=MAX_TEACHER_NLL):
     return table, windows
 
 
-NO_FIT = "no passing tail"
-
-
 def tail_key(tail):
     return -1 if tail is None else tail
 
@@ -321,68 +323,58 @@ def config_positions(table, name, tail, depths, eq8_name, eq4_name):
 
 
 def gate(table, depths):
-    """Design D17 gate: per preset and tail, the worst q8->q4 position over the
-    judged metrics and depths. Returns the failures, the fitting tail per
-    preset and kind, and the per-config positions for the summary."""
+    """Design D3 gate: each judged preset at every tail this label measured,
+    against its own budget, over all judged metrics and depths. A metric whose
+    denominator is not positive cannot be judged and fails the config (spec
+    "品質契約"). Returns the failures, the per-config records and the stretch
+    goal of the quality-first preset."""
     failures = []
-    fitting = {}
     records = []
-    # "unset" names a passing run without --kv-cache-tail; NO_FIT names a
-    # preset that fails at every tail, so the two can never be confused.
-    names = sorted({k for k, _, _ in table if k.startswith("kvarn-")})
-    for name in names:
+    stretch = {}
+    for name, budget in JUDGED_PRESETS:
         tails = sorted({t for k, t, _ in table if k == name}, key=tail_key)
-        for kind, budget, eq8_name, eq4_name in (
-                ("quality", QUALITY_FIRST_BUDGET, "baseline-q8",
-                 "baseline-q4"),
-                ("memory", MEMORY_FIRST_BUDGET, "baseline-q8",
-                 "baseline-q4")):
-            fitting[(name, kind)] = NO_FIT
-            for tail in tails:
-                label = "unset" if tail is None else str(tail)
-                positions, undefined = config_positions(
-                    table, name, tail, depths, eq8_name, eq4_name)
-                if undefined:
-                    reason = ", ".join(f"{d}/{m}" for d, m in undefined)
-                    print(f"gate {kind:8s} {name} tail {label:>4s}: "
-                          f"INDETERMINATE (p undefined at {reason})")
-                    records.append({"kv_cache": name, "tail": tail,
-                                    "kind": kind, "worst_p": None,
-                                    "limiting": "indeterminate",
-                                    "undefined": [f"{d}/{m}"
-                                                  for d, m in undefined]})
-                    continue
-                (worst_depth, worst_metric), worst_p = max(
-                    positions.items(), key=lambda kv: kv[1])
-                ok = worst_p <= budget
-                print(f"gate {kind:8s} {name} tail {label:>4s}: worst p "
-                      f"{worst_p:.3f} ({worst_depth} {worst_metric}) "
-                      f"budget {budget:g} -> {'PASS' if ok else 'FAIL'}")
-                records.append({"kv_cache": name, "tail": tail, "kind": kind,
-                                "worst_p": worst_p, "budget": budget,
-                                "limiting": f"{worst_depth} {worst_metric}",
-                                "pass": ok})
-                if ok and fitting[(name, kind)] == NO_FIT:
-                    fitting[(name, kind)] = label
-    for (name, kind), tail in sorted(fitting.items()):
-        print(f"fitting tail {kind:8s} {name}: {tail}")
-    # G0 needs the memory-first preset to fit p <= 1 at some tail and at least
-    # one preset to fit the quality-first budget; the highest-bit fitting
-    # preset is the quality-first preset. The other presets are only compared.
-    memory_first = [name for (name, kind), tail in fitting.items()
-                    if kind == "memory" and name.endswith(MEMORY_FIRST_SUFFIX)
-                    and tail != NO_FIT]
-    quality_first = sorted({name for (name, kind), tail in fitting.items()
-                            if kind == "quality" and tail != NO_FIT})
-    if not memory_first:
-        failures.append("memory-first preset has no fitting tail")
-    if not quality_first:
-        failures.append("no preset fits the quality-first budget")
-    chosen = quality_first[-1] if quality_first else NO_FIT
-    print(f"G0 quality-first preset: {chosen}")
+        if not tails:
+            failures.append(f"{name} has no measured cell")
+            print(f"gate {name}: no measured cell")
+            continue
+        for tail in tails:
+            label = "unset" if tail is None else str(tail)
+            positions, undefined = config_positions(
+                table, name, tail, depths, "baseline-q8", "baseline-q4")
+            if undefined:
+                reason = ", ".join(f"{d}/{m}" for d, m in undefined)
+                print(f"gate {name} tail {label:>4s}: INDETERMINATE "
+                      f"(p undefined at {reason})")
+                failures.append(f"{name} tail {label}: p undefined at {reason}")
+                records.append({"kv_cache": name, "tail": tail,
+                                "worst_p": None,
+                                "limiting": "indeterminate",
+                                "undefined": [f"{d}/{m}"
+                                              for d, m in undefined]})
+                continue
+            (worst_depth, worst_metric), worst_p = max(
+                positions.items(), key=lambda kv: kv[1])
+            ok = worst_p <= budget
+            if name == "kvarn-k6v5":
+                stretch[label] = worst_p <= QUALITY_STRETCH_BUDGET
+            print(f"gate {name} tail {label:>4s}: worst p {worst_p:.3f} "
+                  f"({worst_depth} {worst_metric}) budget {budget:g} -> "
+                  f"{'PASS' if ok else 'FAIL'}")
+            records.append({"kv_cache": name, "tail": tail,
+                            "worst_p": worst_p, "budget": budget,
+                            "limiting": f"{worst_depth} {worst_metric}",
+                            "pass": ok})
+            if not ok:
+                failures.append(f"{name} tail {label}: worst p {worst_p:.3f} "
+                                f"({worst_depth} {worst_metric}) > "
+                                f"{budget:g}")
+    for label, met in sorted(stretch.items()):
+        print(f"stretch goal {label:>4s}: worst p <= "
+              f"{QUALITY_STRETCH_BUDGET:g} -> {'met' if met else 'not met'} "
+              f"(recorded, not judged)")
     for failure in failures:
-        print(f"G0 FAIL: {failure}")
-    return failures, fitting, records
+        print(f"gate FAIL: {failure}")
+    return failures, records, stretch
 
 
 def load_label_at(root: Path):
@@ -453,21 +445,17 @@ def judged_metrics(cell):
     }
 
 
-def bootstrap_positions(results, max_teacher_nll, resamples, seed,
-                        anchor_results=None):
+def bootstrap_positions(results, max_teacher_nll, resamples, seed):
     """The q8->q4 position p of every judged metric at every depth with a
     window-wise bootstrap 95% interval (design D17 position). The resampling
     unit is the evaluation window (one surviving (corpus, depth) unit),
     resampled paired across the candidate and both baselines.
 
-    `anchor_results` supplies the E_q8/E_q4 windows from another label (design
-    D17 as amended on 2026-10-08: the baselines cannot be measured any more
-    because their implementation was removed, so G0's windows are the fixed
-    ruler). Without it the baselines must be present in `results`, as before.
+    E_q8 and E_q4 are candidates of the same label and the same evaluation
+    windows as the candidate; a baseline measured on another window is never
+    the ruler (spec "品質契約").
     """
     cells = window_cells(results, max_teacher_nll)
-    anchor_cells = (window_cells(anchor_results, max_teacher_nll)
-                    if anchor_results is not None else None)
     rng = random.Random(seed)
     rows = []
     anchors = (("baseline-q8", None), ("baseline-q4", None))
@@ -477,15 +465,10 @@ def bootstrap_positions(results, max_teacher_nll, resamples, seed,
     for name, tail in configs:
         for depth in sorted({d for _, _, d, _ in cells}):
             pairs = (name, tail), *anchors
-            if anchor_cells is None:
-                corpora = [c for c in sorted({w for _, _, d, w in cells
-                                              if d == depth})
-                           if all((n, t, depth, c) in cells
-                                  for n, t in pairs)]
-            else:
-                corpora = [c for c in sorted({w for _, _, d, w in cells
-                                              if d == depth})
-                           if (name, tail, depth, c) in cells]
+            corpora = [c for c in sorted({w for _, _, d, w in cells
+                                          if d == depth})
+                       if all((n, t, depth, c) in cells
+                              for n, t in pairs)]
             if not corpora:
                 continue
 
@@ -493,41 +476,14 @@ def bootstrap_positions(results, max_teacher_nll, resamples, seed,
                 return merged_cells([cells[(n, t, depth, corpora[p])]
                                      for p in picks])
 
-            def anchor_metrics(draw):
-                """E_q8 and E_q4 on the ruler's windows, resampled
-                independently so the interval carries the ruler's own window
-                noise too."""
-                windows = sorted({w for _, _, d, w in anchor_cells
-                                  if d == depth})
-                if not windows:
-                    return None
-                chosen = (windows if draw == 0 else
-                          [windows[rng.randrange(len(windows))]
-                           for _ in windows])
-                out = []
-                for n, t in anchors:
-                    parts = [anchor_cells[(n, t, depth, w)]
-                             for w in chosen
-                             if (n, t, depth, w) in anchor_cells]
-                    if not parts:
-                        return None
-                    out.append(judged_metrics(merged_cells(parts)))
-                return out
-
             point = {}
             draws = {label: [] for label, _ in GATE_METRICS}
             for draw in range(resamples + 1):
                 picks = (list(range(len(corpora))) if draw == 0 else
                          [rng.randrange(len(corpora)) for _ in corpora])
                 candidate = judged_metrics(pooled(name, tail, picks))
-                if anchor_cells is None:
-                    eq8 = judged_metrics(pooled(*anchors[0], picks))
-                    eq4 = judged_metrics(pooled(*anchors[1], picks))
-                else:
-                    ruler = anchor_metrics(draw)
-                    if ruler is None:
-                        continue
-                    eq8, eq4 = ruler
+                eq8 = judged_metrics(pooled(*anchors[0], picks))
+                eq4 = judged_metrics(pooled(*anchors[1], picks))
                 for label, key in GATE_METRICS:
                     denominator = eq4[key] - eq8[key]
                     if denominator <= 0:
@@ -559,28 +515,8 @@ def cmd_report(args):
     table, excluded = summarize(results, args.max_teacher_nll)
     table = {(canonical_candidate(name), tail, depth): m
              for (name, tail, depth), m in table.items()}
-    # Judge only the depths this label measured: the anchor label may carry
-    # extra depths whose candidate cells are absent here.
+    # Judge the depths this label measured, with the baselines of this label.
     depths = sorted({depth for _, _, depth in table})
-    anchor_results = None
-    if args.anchors_label:
-        anchor_out = Path(args.anchors_out or args.out)
-        anchor_root = anchor_out / args.anchors_label
-        if anchor_root.resolve() != label_dir(args).resolve():
-            _, anchor_results = load_label_at(anchor_root)
-        if anchor_results is not None:
-            anchor_table, _ = summarize(anchor_results, args.max_teacher_nll)
-            injected = 0
-            for (name, tail, depth), cell in anchor_table.items():
-                if canonical_candidate(name) not in ("baseline-q8",
-                                                     "baseline-q4"):
-                    continue
-                if (name, tail, depth) not in table:
-                    table[(name, tail, depth)] = cell
-                    injected += 1
-            print(f"ruler: {len(anchor_results)} baseline units from "
-                  f"{anchor_root} (design D17 as amended 2026-10-08; "
-                  f"{injected} anchor cells injected)")
     for w in excluded:
         print(f"excluded corpus {w['corpus']} depth {w['depth']}: teacher mean "
               f"NLL {w['teacher_mean_nll']:.1f} > {args.max_teacher_nll}")
@@ -599,10 +535,9 @@ def cmd_report(args):
               f"{m['large_dev_rate']:7.4f} {m['nll_diff']:8.5f} "
               f"{m['non_finite']:6d} {mem.get('total_bpv', float('nan')):7.3f} "
               f"{mem.get('session_kv_gib', float('nan')):6.2f}")
-    failures, fitting, positions = gate(table, depths)
+    failures, records, stretch = gate(table, depths)
     intervals = bootstrap_positions(results, args.max_teacher_nll,
-                                    args.bootstrap, args.bootstrap_seed,
-                                    anchor_results=anchor_results)
+                                    args.bootstrap, args.bootstrap_seed)
     print(f"\np (q8->q4 position) with window bootstrap 95% CI "
           f"({args.bootstrap} resamples, seed {args.bootstrap_seed}; the gate "
           f"budgets judge the pooled p)")
@@ -616,29 +551,19 @@ def cmd_report(args):
         print(f"{row['kv_cache']:20s} {tail:>5s} {row['depth']:7d} "
               f"{row['metric']:22s} {point:>8s} {interval:>18s} "
               f"{row['windows']:4d}")
-    quality_first = sorted({name for (name, kind), tail in fitting.items()
-                            if kind == "quality" and tail != NO_FIT})
     summary = {
         "schema_version": SCHEMA_VERSION,
         "excluded_windows": excluded,
         "max_teacher_nll": args.max_teacher_nll,
         "large_deviation_nat": LARGE_DEVIATION_NAT,
         "budgets": {"quality_first": QUALITY_FIRST_BUDGET,
+                    "quality_stretch": QUALITY_STRETCH_BUDGET,
                     "memory_first": MEMORY_FIRST_BUDGET},
         "memory": manifest["memory"],
-        "fitting_tail": {f"{name}:{kind}": tail
-                         for (name, kind), tail in fitting.items()},
-        "quality_first_preset": quality_first[-1] if quality_first else NO_FIT,
-        "g0_failures": failures,
-        "gate": positions,
+        "gate_failures": failures,
+        "gate": records,
+        "stretch_goal": stretch,
         "p_intervals": intervals,
-        "ruler": ({"label": args.anchors_label,
-                   "out": str(Path(args.anchors_out or args.out)),
-                   "units": len(anchor_results),
-                   "note": "E_q8/E_q4 windows from another label (design D17 "
-                           "as amended 2026-10-08: the baseline "
-                           "implementation was removed with task 3.10)"}
-                  if anchor_results is not None else None),
         "cells": [{"kv_cache": name, "tail": tail, "depth": depth, **m}
                   for (name, tail, depth), m in sorted(
                       table.items(),
@@ -695,12 +620,6 @@ def main():
                         default=BOOTSTRAP_RESAMPLES,
                         help="window bootstrap resamples for the p intervals")
     report.add_argument("--bootstrap-seed", type=int, default=BOOTSTRAP_SEED)
-    report.add_argument("--anchors-label", default="",
-                        help="label whose baseline-q8/baseline-q4 units are the "
-                             "fixed p ruler when this label has none (design "
-                             "D17 as amended 2026-10-08)")
-    report.add_argument("--anchors-out", default=None,
-                        help="directory of --anchors-label (default: --out)")
     common(report)
     report.set_defaults(func=cmd_report)
     args = parser.parse_args()

@@ -14,6 +14,22 @@
 // unit is never recomputed, and teacher logits are cached outside Git next to
 // the units, keyed by model, corpus tokens, depth, window and chunk.
 //
+// A candidate may name its tail (`--candidates kvarn-k6v5:2048`) when one
+// configuration must be measured alone instead of the `--tails` cross product.
+//
+// A unit JSON carries the pooled metrics plus the per-position series `kl`,
+// `nll_teacher`, `nll_candidate`, `top1_match` (1 when the candidate and the
+// teacher agree, 0 otherwise) and the candidate and teacher argmax token IDs
+// (`argmax`, `argmax_teacher`; -1 marks a position whose candidate logits are
+// not finite). `top1_agreement` is the mean of `top1_match`, so the pooled
+// figure can be recomputed from the array.
+//
+// Probe options: `--decode-tail N` sends the last N prefix tokens through
+// single-token decode instead of prefill (its label identity and teacher file
+// name carry the value), and `--dump-kv <layer>:<tile-start>` writes one real
+// FP16 K/V tile plus its queries per KV head under `<label>/dump/` for the CPU
+// oracle (gpu-test builds only).
+//
 //   <output>/<label>/manifest.json           identity, config, memory table
 //   <output>/<label>/teacher/c<C>-d<D>.logits  cached teacher logits
 //   <output>/<label>/units/<format>__<tail>__c<C>-d<D>.json
@@ -64,15 +80,36 @@ constexpr double kAssumedSecondsPerPrefixToken = 0.00385;
 /// Decode progress line interval of the D23 progress lines.
 constexpr std::uint32_t kDecodeProgressPositions = 32;
 
+/// One `--candidates` entry: a `--kv-cache` value and, when it is written as
+/// `name:tail`, the tail length that one configuration runs with instead of
+/// the `--tails` cross product. The cross product stays for sweeps; the
+/// explicit form expresses a single (format, tail) pair, which is what a
+/// five-configuration comparison needs.
+struct Candidate {
+  std::string name;
+  std::optional<std::uint32_t> tail;
+};
+
 struct Options {
   std::string model;
   std::vector<std::string> corpora;
   std::vector<std::uint32_t> depths{4096, 32768, 131072};
-  std::vector<std::string> candidates;
+  std::vector<Candidate> candidates;
   /// `--kv-cache-tail` values applied to every KVarN candidate; 0 = not given.
   std::vector<std::uint32_t> tails{0};
   std::uint32_t window{256};
   std::uint32_t chunk{256};
+  /// Prefix tokens that reach the context through single-token decode instead
+  /// of prefill (task 4.2 spike isolation): the first depth - decode_tail
+  /// tokens are prefilled, the rest are decoded one at a time.
+  std::uint32_t decode_tail{0};
+  /// `--dump-kv <layer>:<tile-start>`: write the FP16 K/V rows of one
+  /// tile-aligned run of `kKvarnTileTokens` positions for one layer, plus the
+  /// queries the scratch still holds, so the CPU oracle can re-run real tiles
+  /// through the quantization variants (task 4.3).
+  bool dump_kv{false};
+  std::uint32_t dump_layer{0};
+  std::uint32_t dump_tile_start{0};
   std::string output;
   std::string label{"kvarn-quality"};
   std::string model_sha256;
@@ -108,6 +145,28 @@ std::uint32_t ParseUint(const std::string& text) {
   return static_cast<std::uint32_t>(value);
 }
 
+/// Parses one candidate token: `name`, or `name:tail` with a tail length or
+/// `none` (the structural minimum of the model's KVarN ring). A second colon
+/// is malformed.
+Candidate ParseCandidate(const std::string& text) {
+  const std::size_t colon = text.find(':');
+  if (colon == std::string::npos) {
+    return {text, std::nullopt};
+  }
+  if (text.find(':', colon + 1) != std::string::npos) {
+    throw std::invalid_argument("malformed candidate " + text +
+                                " (usage: name or name:tail)");
+  }
+  const std::string tail = text.substr(colon + 1);
+  Candidate candidate{text.substr(0, colon), 0U};
+  if (tail == "none") {
+    candidate.tail = 0U;
+  } else {
+    candidate.tail = ParseUint(tail);
+  }
+  return candidate;
+}
+
 Options ParseArgs(int argc, char** argv) {
   Options o;
   for (int i = 1; i < argc; ++i) {
@@ -125,9 +184,10 @@ Options ParseArgs(int argc, char** argv) {
       o.depths.clear();
       for (const auto& d : Split(value()))
         o.depths.push_back(ParseUint(d));
-    } else if (arg == "--candidates")
-      o.candidates = Split(value());
-    else if (arg == "--tails") {
+    } else if (arg == "--candidates") {
+      for (const std::string& item : Split(value()))
+        o.candidates.push_back(ParseCandidate(item));
+    } else if (arg == "--tails") {
       o.tails.clear();
       for (const auto& t : Split(value()))
         o.tails.push_back(t == "none" ? 0 : ParseUint(t));
@@ -135,7 +195,18 @@ Options ParseArgs(int argc, char** argv) {
       o.window = ParseUint(value());
     else if (arg == "--chunk")
       o.chunk = ParseUint(value());
-    else if (arg == "--output")
+    else if (arg == "--decode-tail")
+      o.decode_tail = ParseUint(value());
+    else if (arg == "--dump-kv") {
+      const std::string text = value();
+      const std::size_t colon = text.find(':');
+      if (colon == std::string::npos) {
+        throw std::invalid_argument("--dump-kv needs <layer>:<tile-start>");
+      }
+      o.dump_kv = true;
+      o.dump_layer = ParseUint(text.substr(0, colon));
+      o.dump_tile_start = ParseUint(text.substr(colon + 1));
+    } else if (arg == "--output")
       o.output = value();
     else if (arg == "--label")
       o.label = value();
@@ -145,32 +216,45 @@ Options ParseArgs(int argc, char** argv) {
       throw std::invalid_argument("unknown option " + arg);
   }
   if (o.model.empty() || o.corpora.empty() || o.output.empty() ||
-      o.depths.empty() || o.tails.empty() || o.window == 0 || o.chunk == 0) {
+      o.depths.empty() || o.tails.empty() || o.window == 0 || o.chunk == 0 ||
+      std::any_of(o.depths.begin(), o.depths.end(), [&](std::uint32_t depth) {
+        return o.decode_tail >= depth;
+      })) {
     throw std::invalid_argument(
         "usage: qwen_kvarn_quality_eval --model M --corpus a.txt[,b.txt] "
         "--output DIR [--label NAME] [--depths 4096,32768,131072] "
-        "[--window 256] [--chunk 256] [--candidates v1,v2] "
+        "[--window 256] [--chunk 256] [--decode-tail N] [--dump-kv L:T] "
+        "[--candidates v1,v2[:tail]] "
         "[--tails none,256,1024,2048] [--model-sha256 HEX]\n"
-        "KVarN candidates run once per tail; baselines have no tail.");
+        "A candidate without an explicit :tail runs once per --tails entry; "
+        "baselines never take a tail.");
   }
   return o;
 }
 
-/// Candidate list x tails, with `--kv-cache-tail` applied only where it is
-/// accepted (KVarN). A baseline appears once, without a tail.
+/// One config per candidate and tail: an explicit `name:tail` entry runs once
+/// with that tail, a plain entry runs once per `--tails` value where the value
+/// accepts a tail and once without one otherwise. Baselines never take a tail.
 std::vector<Config> BuildConfigs(const Options& opt) {
   std::vector<Config> configs;
-  for (const std::string& name : opt.candidates) {
-    const bool takes_tail = gufo::hip::QwenKvCacheAcceptsTail(name);
+  for (const Candidate& candidate : opt.candidates) {
+    const bool takes_tail = gufo::hip::QwenKvCacheAcceptsTail(candidate.name);
+    if (candidate.tail.has_value() && !takes_tail && *candidate.tail != 0) {
+      throw std::invalid_argument("--candidates " + candidate.name +
+                                  " does not accept a tail");
+    }
     const std::vector<std::uint32_t> tails =
-        takes_tail ? opt.tails : std::vector<std::uint32_t>{0};
+        candidate.tail.has_value()
+            ? std::vector<std::uint32_t>{*candidate.tail}
+            : (takes_tail ? opt.tails : std::vector<std::uint32_t>{0});
     for (const std::uint32_t tail : tails) {
       Config config;
-      config.kv_cache = name;
+      config.kv_cache = candidate.name;
       config.tail = tail;
       config.policy = QwenExecutionPolicy::Production();
-      if (!gufo::hip::ResolveQwenKvCache(name, tail, &config.policy)) {
-        throw std::invalid_argument("unsupported --kv-cache " + name +
+      if (!gufo::hip::ResolveQwenKvCache(candidate.name, tail,
+                                         &config.policy)) {
+        throw std::invalid_argument("unsupported --kv-cache " + candidate.name +
                                     " with tail " + config.TailLabel());
       }
       configs.push_back(std::move(config));
@@ -262,14 +346,15 @@ std::uint64_t SealedTileCount(QwenGpuExecutor& executor) {
 
 Window RunWindow(QwenGpuExecutor& executor, std::span<const Token> tokens,
                  std::uint32_t depth, std::uint32_t window, std::uint32_t chunk,
-                 const std::string& what) {
+                 std::uint32_t decode_tail, const std::string& what) {
   const auto started = Clock::now();
   const auto elapsed = [&started]() {
     return std::chrono::duration<double>(Clock::now() - started).count();
   };
+  const std::uint32_t prefill_depth = depth - decode_tail;
   executor.Reset();
-  for (std::uint32_t offset = 0; offset < depth; offset += chunk) {
-    const std::uint32_t count = std::min(chunk, depth - offset);
+  for (std::uint32_t offset = 0; offset < prefill_depth; offset += chunk) {
+    const std::uint32_t count = std::min(chunk, prefill_depth - offset);
     (void)executor.ForwardPromptBatch(tokens.subspan(offset, count), offset,
                                       false);
     std::cerr << "prefill " << what << " chunk at " << offset << " (" << count
@@ -277,8 +362,11 @@ Window RunWindow(QwenGpuExecutor& executor, std::span<const Token> tokens,
               << " s sealed_tiles=" << SealedTileCount(executor) << "\n"
               << std::flush;
   }
+  for (std::uint32_t position = prefill_depth; position < depth; ++position) {
+    (void)executor.ForwardToken(tokens[position], position, false);
+  }
   std::cerr << "prefill " << what << " done at " << depth
-            << " tokens t=" << elapsed()
+            << " tokens (decoded tail " << decode_tail << ") t=" << elapsed()
             << " s sealed_tiles=" << SealedTileCount(executor) << "\n"
             << std::flush;
   Window out;
@@ -299,6 +387,139 @@ Window RunWindow(QwenGpuExecutor& executor, std::span<const Token> tokens,
             << " positions t=" << elapsed() << " s\n"
             << std::flush;
   return out;
+}
+
+/// Writes one real FP16 K/V tile and its queries for the CPU oracle (task
+/// 4.3): per KV head, the 128 x 256 rows of the tile plus the six query rows
+/// that share that head. The K/V rows come from the dense FP16 plane the
+/// teacher run fills; the queries come from the attention scratch, which
+/// holds only the last processed decode row, so the run must end at the
+/// tile's last position and the layer must be the last full-attention layer.
+void DumpKvRows(QwenGpuExecutor& executor, const Options& opt,
+                const fs::path& root, std::size_t corpus, std::uint32_t depth) {
+  using gufo::models::qwen::kKvarnSinkRows;
+  using gufo::models::qwen::kKvarnTileTokens;
+  const auto& config = executor.GetConfig();
+  const std::uint32_t head_dim = config.head_dim;
+  const std::uint32_t kv_heads = config.num_key_value_heads;
+  const std::uint32_t heads = config.num_attention_heads;
+  const std::uint32_t group = heads / kv_heads;
+  const std::uint32_t kv_width = kv_heads * head_dim;
+  const std::uint32_t max_context = executor.GetMaxContext();
+  const std::uint32_t last_attention_layer =
+      (config.FullAttentionLayerCount() - 1) * config.full_attention_interval;
+  // The dense FP16 plane is indexed by the attention layer, not by the global
+  // transformer layer, so the dump's layer number (which names the last
+  // full-attention layer for its queries) maps back here.
+  const std::uint32_t plane_layer =
+      opt.dump_layer / config.full_attention_interval;
+  const std::uint32_t last_position =
+      opt.dump_tile_start + kKvarnTileTokens - 1;
+  if (opt.dump_layer != last_attention_layer) {
+    throw std::invalid_argument(
+        "--dump-kv needs the last full-attention layer (" +
+        std::to_string(last_attention_layer) + ") for its queries");
+  }
+  if (opt.dump_tile_start < kKvarnSinkRows ||
+      (opt.dump_tile_start - kKvarnSinkRows) % kKvarnTileTokens != 0) {
+    throw std::invalid_argument(
+        "--dump-kv needs a tile-aligned start position");
+  }
+  if (depth + opt.window - 1 != last_position) {
+    throw std::invalid_argument(
+        "--dump-kv needs the run to end at the tile's last position " +
+        std::to_string(last_position));
+  }
+  const auto* plane =
+      static_cast<const std::uint16_t*>(executor.AttentionKvF16());
+  const float* query = executor.AttentionQuery();
+  if (plane == nullptr || query == nullptr) {
+    throw std::runtime_error("--dump-kv needs the dense FP16 KV plane");
+  }
+  const std::size_t plane_elements =
+      static_cast<std::size_t>(config.FullAttentionLayerCount()) * max_context *
+      kv_width;
+
+  const fs::path directory = root / "dump";
+  fs::create_directories(directory);
+  const auto write_bytes = [&](const std::string& name, const void* data,
+                               std::size_t bytes) {
+    const fs::path path = directory / name;
+    std::ofstream out(path.string(), std::ios::binary | std::ios::trunc);
+    if (!out) {
+      throw std::runtime_error("cannot write " + path.string());
+    }
+    out.write(static_cast<const char*>(data),
+              static_cast<std::streamsize>(bytes));
+    out.close();
+    return path;
+  };
+  const auto file_sha = [](const fs::path& path) {
+    const std::string bytes = ReadFile(path.string());
+    return gufo::crypto::Sha256Hex(
+        {reinterpret_cast<const std::uint8_t*>(bytes.data()), bytes.size()});
+  };
+
+  std::vector<std::uint16_t> k_rows(static_cast<std::size_t>(kKvarnTileTokens) *
+                                    head_dim);
+  std::vector<std::uint16_t> v_rows(k_rows.size());
+  std::vector<float> queries(static_cast<std::size_t>(group) * head_dim);
+  std::ostringstream meta;
+  meta << "{\n  \"layer\": " << opt.dump_layer << ",\n  \"corpus\": " << corpus
+       << ",\n  \"tile_start\": " << opt.dump_tile_start
+       << ",\n  \"tile_tokens\": " << kKvarnTileTokens
+       << ",\n  \"kv_heads\": " << kv_heads << ",\n  \"head_dim\": " << head_dim
+       << ",\n  \"group_size\": " << group
+       << ",\n  \"layout\": \"per head: [token][channel], K then V; "
+          "queries: [query head][channel]\",\n  \"heads\": [";
+  for (std::uint32_t head = 0; head < kv_heads; ++head) {
+    const std::string stem = "l" + std::to_string(opt.dump_layer) + "-h" +
+                             std::to_string(head) + "-p" +
+                             std::to_string(opt.dump_tile_start) + "-c" +
+                             std::to_string(corpus);
+    for (std::uint32_t row = 0; row < kKvarnTileTokens; ++row) {
+      const std::uint32_t position = opt.dump_tile_start + row;
+      const std::size_t offset =
+          ((static_cast<std::size_t>(plane_layer) * max_context + position) *
+           kv_width) +
+          head * head_dim;
+      if (hipMemcpy(k_rows.data() + static_cast<std::size_t>(row) * head_dim,
+                    plane + offset, head_dim * sizeof(std::uint16_t),
+                    hipMemcpyDeviceToHost) != hipSuccess ||
+          hipMemcpy(v_rows.data() + static_cast<std::size_t>(row) * head_dim,
+                    plane + plane_elements + offset,
+                    head_dim * sizeof(std::uint16_t),
+                    hipMemcpyDeviceToHost) != hipSuccess) {
+        throw std::runtime_error("--dump-kv device copy failed");
+      }
+    }
+    for (std::uint32_t q = 0; q < group; ++q) {
+      const std::uint32_t query_head = head * group + q;
+      if (hipMemcpy(queries.data() + static_cast<std::size_t>(q) * head_dim,
+                    query + static_cast<std::size_t>(query_head) * head_dim,
+                    head_dim * sizeof(float),
+                    hipMemcpyDeviceToHost) != hipSuccess) {
+        throw std::runtime_error("--dump-kv query copy failed");
+      }
+    }
+    const fs::path k_path = write_bytes(stem + "-k.f16", k_rows.data(),
+                                        k_rows.size() * sizeof(std::uint16_t));
+    const fs::path v_path = write_bytes(stem + "-v.f16", v_rows.data(),
+                                        v_rows.size() * sizeof(std::uint16_t));
+    const fs::path q_path = write_bytes(stem + "-q.f32", queries.data(),
+                                        queries.size() * sizeof(float));
+    meta << (head ? "," : "") << "\n    {\"kv_head\": " << head
+         << ", \"k_sha256\": \"" << file_sha(k_path) << "\", \"v_sha256\": \""
+         << file_sha(v_path) << "\", \"q_sha256\": \"" << file_sha(q_path)
+         << "\"}";
+    std::cerr << "dump " << stem << " k_sha256 " << file_sha(k_path) << "\n"
+              << std::flush;
+  }
+  meta << "\n  ]\n}\n";
+  WriteAtomically(directory / ("l" + std::to_string(opt.dump_layer) + "-p" +
+                               std::to_string(opt.dump_tile_start) + "-c" +
+                               std::to_string(corpus) + ".json"),
+                  meta.str());
 }
 
 double Percentile(std::vector<double> values, double q) {
@@ -358,11 +579,18 @@ bool SameHex(const char (&field)[64], const std::string& hex) {
 struct Paths {
   fs::path root;
 
-  [[nodiscard]] fs::path Teacher(std::size_t corpus,
-                                 std::uint32_t depth) const {
-    return root / "teacher" /
-           ("c" + std::to_string(corpus) + "-d" + std::to_string(depth) +
-            ".logits");
+  /// Decoded prefix rows are part of the cached teacher's identity: a run
+  /// that decodes the last `decode_tail` prefix tokens sees different rows
+  /// than a prefilled one, so its teacher is a different file (`-dt<N>`), and
+  /// the pre-change name stays byte-identical for prefilled runs.
+  [[nodiscard]] fs::path Teacher(std::size_t corpus, std::uint32_t depth,
+                                 std::uint32_t decode_tail) const {
+    std::string name =
+        "c" + std::to_string(corpus) + "-d" + std::to_string(depth);
+    if (decode_tail != 0) {
+      name += "-dt" + std::to_string(decode_tail);
+    }
+    return root / "teacher" / (name + ".logits");
   }
   [[nodiscard]] fs::path Unit(const Config& config, std::size_t corpus,
                               std::uint32_t depth) const {
@@ -372,10 +600,10 @@ struct Paths {
   }
 };
 
-[[nodiscard]] double EstimateSeconds(std::uint32_t depth,
-                                     std::uint32_t window) {
-  return kAssumedSecondsPerWindowPosition * window +
-         kAssumedSecondsPerPrefixToken * depth;
+[[nodiscard]] double EstimateSeconds(std::uint32_t depth, std::uint32_t window,
+                                     std::uint32_t decode_tail = 0) {
+  return kAssumedSecondsPerWindowPosition * (window + decode_tail) +
+         kAssumedSecondsPerPrefixToken * (depth - decode_tail);
 }
 
 /// Job progress in D16's log format: total, done, elapsed and remaining time.
@@ -456,8 +684,11 @@ void WriteManifest(const Options& opt, const Paths& paths,
                    const QwenGpuExecutor& executor) {
   std::ostringstream identity;
   identity << "\"model_sha256\": \"" << model_hash
-           << "\", \"window\": " << opt.window << ", \"chunk\": " << opt.chunk
-           << ", \"corpora\": [";
+           << "\", \"window\": " << opt.window << ", \"chunk\": " << opt.chunk;
+  if (opt.decode_tail != 0) {
+    identity << ", \"decode_tail\": " << opt.decode_tail;
+  }
+  identity << ", \"corpora\": [";
   for (std::size_t c = 0; c < corpora.sha256.size(); ++c) {
     identity << (c ? "," : "") << "\"" << corpora.sha256[c] << "\"";
   }
@@ -483,7 +714,8 @@ void WriteManifest(const Options& opt, const Paths& paths,
       << identity.str() << ", \"depths\": [";
   for (std::size_t i = 0; i < opt.depths.size(); ++i)
     out << (i ? "," : "") << opt.depths[i];
-  out << "]},\n  \"corpus_files\": [";
+  out << "]},\n  \"decode_tail\": " << opt.decode_tail
+      << ",\n  \"corpus_files\": [";
   for (std::size_t c = 0; c < opt.corpora.size(); ++c) {
     out << (c ? "," : "") << "{\"path\":\"" << opt.corpora[c]
         << "\",\"tokens\":" << corpora.tokens[c].size() << "}";
@@ -552,9 +784,10 @@ int main(int argc, char** argv) {
         for (const std::uint32_t depth : opt.depths)
           jobs.push_back({&config, c, depth});
     const auto is_done = [&](const Job& job) {
-      return fs::exists(job.config == nullptr
-                            ? paths.Teacher(job.corpus, job.depth)
-                            : paths.Unit(*job.config, job.corpus, job.depth));
+      return fs::exists(
+          job.config == nullptr
+              ? paths.Teacher(job.corpus, job.depth, opt.decode_tail)
+              : paths.Unit(*job.config, job.corpus, job.depth));
     };
     std::size_t done = 0;
     double pending_estimate = 0.0;
@@ -562,7 +795,8 @@ int main(int argc, char** argv) {
       if (is_done(job)) {
         ++done;
       } else {
-        pending_estimate += EstimateSeconds(job.depth, opt.window);
+        pending_estimate +=
+            EstimateSeconds(job.depth, opt.window, opt.decode_tail);
       }
     }
     Progress progress(jobs.size(), done, pending_estimate);
@@ -606,8 +840,9 @@ int main(int argc, char** argv) {
                                  std::to_string(job->depth);
         const auto& tokens = corpora.tokens[job->corpus];
         const auto started = Clock::now();
-        const Window window = RunWindow(*executor, tokens, job->depth,
-                                        opt.window, opt.chunk, what);
+        const Window window =
+            RunWindow(*executor, tokens, job->depth, opt.window, opt.chunk,
+                      opt.decode_tail, what);
         const double seconds =
             std::chrono::duration<double>(Clock::now() - started).count();
 
@@ -626,14 +861,22 @@ int main(int argc, char** argv) {
                             sizeof(header));
           bytes.append(reinterpret_cast<const char*>(window.logits.data()),
                        window.logits.size() * sizeof(float));
-          WriteAtomically(paths.Teacher(job->corpus, job->depth), bytes);
-          progress.Finished(what, seconds,
-                            EstimateSeconds(job->depth, opt.window));
+          WriteAtomically(
+              paths.Teacher(job->corpus, job->depth, opt.decode_tail), bytes);
+          if (opt.dump_kv && job->depth + opt.window - 1 ==
+                                 opt.dump_tile_start +
+                                     gufo::models::qwen::kKvarnTileTokens - 1) {
+            DumpKvRows(*executor, opt, paths.root, job->corpus, job->depth);
+          }
+          progress.Finished(
+              what, seconds,
+              EstimateSeconds(job->depth, opt.window, opt.decode_tail));
           continue;
         }
 
         // Candidate: load the cached teacher and score every position.
-        const fs::path teacher_path = paths.Teacher(job->corpus, job->depth);
+        const fs::path teacher_path =
+            paths.Teacher(job->corpus, job->depth, opt.decode_tail);
         std::ifstream teacher_file(teacher_path, std::ios::binary);
         TeacherHeader header{};
         if (!teacher_file.read(reinterpret_cast<char*>(&header),
@@ -662,7 +905,13 @@ int main(int argc, char** argv) {
             HashSpan<float>(std::span<const float>(teacher.logits));
 
         std::vector<double> kl, nll_teacher, nll_candidate;
-        std::size_t top1_match = 0, non_finite = 0;
+        // Position-wise top-1 evidence of the quality contract: the candidate
+        // and reference argmax IDs and whether they agree. A position whose
+        // candidate logits are not finite carries a -1 candidate ID and no
+        // match, so `top1_agreement` is exactly the mean of `top1_match`.
+        std::vector<double> top1_match_positions, argmax_candidate,
+            argmax_teacher;
+        std::size_t non_finite = 0;
         const auto argmax = [](std::span<const float> x) {
           return static_cast<std::size_t>(
               std::distance(x.begin(), std::max_element(x.begin(), x.end())));
@@ -676,10 +925,14 @@ int main(int argc, char** argv) {
           const Token target = tokens[job->depth + i + 1];
           const auto lt = LogSoftmax(ref);
           nll_teacher.push_back(-lt[target]);
+          const std::size_t reference_top = argmax(ref);
+          argmax_teacher.push_back(static_cast<double>(reference_top));
           if (!finite) {
             ++non_finite;
             kl.push_back(INFINITY);
             nll_candidate.push_back(INFINITY);
+            top1_match_positions.push_back(0.0);
+            argmax_candidate.push_back(-1.0);
             continue;
           }
           const auto lc = LogSoftmax(cand);
@@ -691,9 +944,13 @@ int main(int argc, char** argv) {
           }
           kl.push_back(divergence);
           nll_candidate.push_back(-lc[target]);
-          if (argmax(cand) == argmax(ref))
-            ++top1_match;
+          const std::size_t candidate_top = argmax(cand);
+          argmax_candidate.push_back(static_cast<double>(candidate_top));
+          top1_match_positions.push_back(candidate_top == reference_top ? 1.0
+                                                                        : 0.0);
         }
+        const std::size_t top1_match = static_cast<std::size_t>(std::count(
+            top1_match_positions.begin(), top1_match_positions.end(), 1.0));
         double mean_kl = 0.0, nll_diff = 0.0;
         for (std::size_t i = 0; i < kl.size(); ++i) {
           mean_kl += kl[i];
@@ -709,7 +966,9 @@ int main(int argc, char** argv) {
              << config->kv_cache << "\",\"tail\":"
              << (config->tail == 0 ? "null" : std::to_string(config->tail))
              << ",\"tail_length\":"
-             << gufo::hip::QwenKvarnTailRows(config->policy.kvarn)
+             << (config->policy.UsesKvarn()
+                     ? gufo::hip::QwenKvarnTailRows(config->policy.kvarn)
+                     : 0)
              << ",\"corpus\":" << job->corpus << ",\"depth\":" << job->depth
              << ",\"positions\":" << kl.size()
              << ",\"prefix_tokens\":" << job->depth + opt.window
@@ -726,6 +985,12 @@ int main(int argc, char** argv) {
         Json(unit, nll_teacher);
         unit << ",\"nll_candidate\":";
         Json(unit, nll_candidate);
+        unit << ",\"top1_match\":";
+        Json(unit, top1_match_positions);
+        unit << ",\"argmax\":";
+        Json(unit, argmax_candidate);
+        unit << ",\"argmax_teacher\":";
+        Json(unit, argmax_teacher);
         unit << "}\n";
         WriteAtomically(paths.Unit(*config, job->corpus, job->depth),
                         unit.str());
@@ -734,8 +999,9 @@ int main(int argc, char** argv) {
                 << Percentile(kl, 0.5) << " top1 "
                 << static_cast<double>(top1_match) / n << " non-finite "
                 << non_finite;
-        progress.Finished(summary.str(), seconds,
-                          EstimateSeconds(job->depth, opt.window));
+        progress.Finished(
+            summary.str(), seconds,
+            EstimateSeconds(job->depth, opt.window, opt.decode_tail));
       }
     };
 

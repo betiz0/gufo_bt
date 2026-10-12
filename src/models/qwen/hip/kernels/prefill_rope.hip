@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "src/models/qwen/hip/kernels/baseline_quant_device.hpp"
 #include "src/models/qwen/hip/kernels/kvarn_device.hpp"
 #include "src/models/qwen/hip/ops/attention.hpp"
 #include "src/models/qwen/hip/ops/token.hpp"
@@ -158,6 +159,54 @@ __launch_bounds__(256, 4) __global__ void BatchedFusedQKNormRoPEKvWriteKernel(
       ((static_cast<std::size_t>(layer_idx) * max_context + cur_pos) *
        kv_total) +
       (static_cast<std::size_t>(kv_h) * head_dim);
+
+#if defined(GUFO_QWEN_PSEUDO_KVARN)
+  if (kvarn.baseline_bits != 0) {
+    // gpu-test baseline probe (design D1), batched prefill variant: store the
+    // row the E_q8 / E_q4 baseline defines instead of a plain FP16 copy. Sink
+    // rows keep plain FP16; every later row is rotated, quantized and
+    // dequantized in blocks of 32 and inverse-rotated back. The read path is
+    // unchanged, and the normed+roped K row still reaches k_out unrotated.
+    for (std::size_t p = tid; p < half_rot; p += blockDim.x) {
+      const float k0 = s_norm[p];
+      const float k1 = s_norm[p + half_rot];
+      const float exponent =
+          static_cast<float>(2 * p) / static_cast<float>(rotary_dim);
+      const float inv_freq = 1.0F / powf(rope_theta, exponent);
+      const float angle =
+          models::qwen::vision::RopePosition(rope, cur_pos, p) * inv_freq;
+      const float cos_val = cosf(angle);
+      const float sin_val = sinf(angle);
+      s_norm[p] = (k0 * cos_val) - (k1 * sin_val);
+      s_norm[p + half_rot] = (k0 * sin_val) + (k1 * cos_val);
+    }
+    __syncthreads();
+    for (std::size_t i = tid; i < head_dim; i += blockDim.x) {
+      k_out[head_base + i] = s_norm[i];
+    }
+    const bool quantize = cur_pos >= models::qwen::kKvarnSinkRows;
+    BaselineRoundTripRow(s_norm, static_cast<int>(tid), kvarn.baseline_bits,
+                         quantize);
+    if (k_cache_f16 != nullptr) {
+      for (std::size_t i = tid; i < head_dim; i += blockDim.x) {
+        k_cache_f16[f16_offset + i] = __float2half_rn(s_norm[i]);
+      }
+    }
+    __syncthreads();
+    for (std::size_t i = tid; i < head_dim; i += blockDim.x) {
+      s_norm[i] = v[head_base + i];
+    }
+    __syncthreads();
+    BaselineRoundTripRow(s_norm, static_cast<int>(tid), kvarn.baseline_bits,
+                         quantize);
+    if (v_cache_f16 != nullptr) {
+      for (std::size_t i = tid; i < head_dim; i += blockDim.x) {
+        v_cache_f16[f16_offset + i] = __float2half_rn(s_norm[i]);
+      }
+    }
+    return;
+  }
+#endif
 
   if (kvarn.enabled()) {
     // design D3/D1: RoPE the normed K head, rotate it, and store the rotated

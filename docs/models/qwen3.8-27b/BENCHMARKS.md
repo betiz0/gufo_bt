@@ -175,6 +175,33 @@ ratios below are the recorded **reference values**, and later judgments
 at ≥ 0.97× of them. KVarN is a KV-memory feature and is expected to be slower
 than FP16 KV for long-context single-session generation.
 
+**Deferred judgments (design D8, user decision 2026-10-09).** The change
+`improve-kvarn-k6v5-quality-and-speed` judges none of the existing speed
+contracts: the depth 0–4K AR tg floor, the depth 32K and above tg and
+all-depth pp reference-value regressions, DFlash2's depth-0 floor,
+token-to-token p99/p50, C8 aggregate throughput and startup time are recorded
+there and re-measured on the post-change build by a follow-up change. The
+change records the depth 8K and 128K points for `kvarn-k6v5` tail 2048 with
+FP16 in the same series, and every reading or quantization change it adopts
+must keep 8K and 128K tg and pp at ≥ 0.97× of that record.
+
+**Change record (task 3.5, published by task 9.3).** Three serial series of
+`g1.py run --foreground --depths 8192,131072 --configs k6v5-t2048` with FP16 KV
+measured inside every series (Q8_0, SHA-256
+`d17816b6bafbe3f5c572ed94d9cee62516cf901628d4372fb73792a4a175f4cf`), ledger
+`T3.5-r1..r3` in `artifacts/g1-k6v5-8k128k-r*`. The depth-8K point is new; the
+128K tg ratio reproduces the G1 value exactly, and the 128K pp ratio is below
+the G1 record (0.947× of 0.830), which the deferral above leaves unjudged.
+`fp16` is the mean of the two bracket runs of the series, `tg` is the tg128
+ratio and `pp` the pp2048 ratio of `kvarn-k6v5` tail 2048 against that bracket.
+
+| `kvarn-k6v5`, tail 2048 | 8K tg | 8K pp | 128K tg | 128K pp |
+| --- | ---: | ---: | ---: | ---: |
+| series r1 | 0.960 | 0.863 | 0.631 | 0.787 |
+| series r2 | 0.959 | 0.865 | 0.631 | 0.786 |
+| series r3 | 0.959 | 0.865 | 0.631 | 0.784 |
+| median (published method) | 0.959 | 0.865 | 0.631 | 0.786 |
+
 <!-- bench:kvarn-ar -->
 | Qwen27B Q8 AR tg128 (tok/s) / FP16 ratio | d0 | d4,096 | d32,768 | d131,072 |
 | --- | ---: | ---: | ---: | ---: |

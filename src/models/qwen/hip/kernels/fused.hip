@@ -11,6 +11,7 @@
 #include "src/core/gguf_reader.hpp"
 #include "src/core/hip/detail/dispatch_telemetry.hpp"
 #include "src/core/hip/detail/gemv_dispatcher.hpp"
+#include "src/models/qwen/hip/kernels/baseline_quant_device.hpp"
 #include "src/models/qwen/hip/kernels/kvarn_device.hpp"
 #include "src/models/qwen/hip/ops.hpp"
 #include "src/models/qwen/hip/quant_ops.hpp"
@@ -190,6 +191,53 @@ __launch_bounds__(256, 4) __global__ void FusedQKNormRoPEKvWriteKernel(
   const std::size_t f16_offset =
       ((static_cast<std::size_t>(layer_idx) * max_context + pos) * kv_width) +
       head_base;
+
+#if defined(GUFO_QWEN_PSEUDO_KVARN)
+  if (kvarn.baseline_bits != 0) {
+    // gpu-test baseline probe (design D1): store the row the E_q8 / E_q4
+    // baseline defines instead of a plain FP16 copy. Sink rows keep plain
+    // FP16; every later row is rotated, quantized and dequantized in blocks
+    // of 32 and inverse-rotated back. The read path is unchanged, and the
+    // normed+roped K row still reaches k_out unrotated.
+    for (std::size_t p = tid; p < half_rot; p += blockDim.x) {
+      const float k0 = s_norm[p];
+      const float k1 = s_norm[p + half_rot];
+      const float exponent =
+          static_cast<float>(2 * p) / static_cast<float>(rotary_dim);
+      const float inv_freq = 1.0F / powf(rope_theta, exponent);
+      const float angle =
+          models::qwen::vision::RopePosition(rope, pos, p) * inv_freq;
+      const float cos_val = cosf(angle);
+      const float sin_val = sinf(angle);
+      s_norm[p] = (k0 * cos_val) - (k1 * sin_val);
+      s_norm[p + half_rot] = (k0 * sin_val) + (k1 * cos_val);
+    }
+    __syncthreads();
+    for (std::size_t i = tid; i < head_dim; i += blockDim.x) {
+      k_out[head_base + i] = s_norm[i];
+    }
+    BaselineRoundTripRow(s_norm, static_cast<int>(tid), kvarn.baseline_bits,
+                         pos >= models::qwen::kKvarnSinkRows);
+    if (k_cache_f16 != nullptr) {
+      for (std::size_t i = tid; i < head_dim; i += blockDim.x) {
+        k_cache_f16[f16_offset + i] = __float2half_rn(s_norm[i]);
+      }
+    }
+    __syncthreads();
+    for (std::size_t i = tid; i < head_dim; i += blockDim.x) {
+      s_norm[i] = v[head_base + i];
+    }
+    __syncthreads();
+    BaselineRoundTripRow(s_norm, static_cast<int>(tid), kvarn.baseline_bits,
+                         pos >= models::qwen::kKvarnSinkRows);
+    if (v_cache_f16 != nullptr) {
+      for (std::size_t i = tid; i < head_dim; i += blockDim.x) {
+        v_cache_f16[f16_offset + i] = __float2half_rn(s_norm[i]);
+      }
+    }
+    return;
+  }
+#endif
 
   for (std::size_t p = tid; p < half_rot; p += blockDim.x) {
     const float k0 = s_norm[p];

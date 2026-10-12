@@ -82,7 +82,21 @@ floors (AR tg ≥ 0.95× FP16 at depth 0–4K) and is slower than FP16 KV in
 long-context generation. The table is the G1 measurement (2026-10-03, Q8_0,
 three series, `pp` median of three; see [benchmarks](BENCHMARKS.md)). The depth
 32K/128K tg ratios and the all-depth pp ratios are the recorded **reference
-values**: later judgments must keep the same point at ≥ 0.97× of them.
+values**: later judgments must keep the same point at ≥ 0.97× of them. The
+change `improve-kvarn-k6v5-quality-and-speed` judges none of these contracts
+itself (design D8, user decision 2026-10-09): it records the depth 8K and 128K
+points for `kvarn-k6v5` tail 2048 with FP16 in the same series, requires every
+reading or quantization change it adopts to keep them at ≥ 0.97×, and leaves
+the floors, the reference-value regressions, p99/p50, C8 throughput and
+startup time to a follow-up change that re-measures them on the post-change
+build.
+The change's own record (task 3.5: three serial series with FP16 KV measured in
+every series, Q8_0 SHA-256
+`d17816b6bafbe3f5c572ed94d9cee62516cf901628d4372fb73792a4a175f4cf`) puts
+`kvarn-k6v5` tail 2048 at median FP16 ratios **tg 0.959 / pp 0.865 at 8K** and
+**tg 0.631 / pp 0.786 at 128K**. The 128K tg ratio reproduces the G1 value; the
+128K pp ratio is 0.947× of it and stays unjudged under the deferral above
+(series and method in [benchmarks](BENCHMARKS.md)).
 
 | Preset | Tail | d0 | 4K | 32K | 128K |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -164,8 +178,9 @@ under design D23), scored with the q8→q4 positions of design D17 as amended on
 2026-10-08 (D-27): the E_q8/E_q4 ruler comes from the G0 windows above, because
 the baseline implementation was removed with task 3.10. Windows excluded by the
 pre-registered teacher-mean-NLL rule (design D14): corpora 2, 3, 4 and 7 at 32K.
-Rows without the marker, and depth 128K for every preset, are the G0 phase-0
-probe values and have not been re-judged.
+Rows without the marker are the G0 phase-0 probe values (three corpora, seeds
+1–3, [`QUALITY.md`](QUALITY.md)); for the two judged tails the 128K rows are
+also G0 probes, superseded by the final judgment below.
 
 
 Gate (design D17): each judged metric (mean KL, median KL, large-deviation rate,
@@ -180,6 +195,34 @@ Reproduce (design D16):
 ```sh
 python3 tools/qwen27b/kvarn_quality.py report --label g0-tail --gate
 ```
+
+### Final judgment (2026-10-12, change `improve-kvarn-k6v5-quality-and-speed`)
+
+The judged pair is `kvarn-k6v5` tail 2048 (budget p ≤ 0.13, stretch 0.10) and
+`kvarn-k4v4` tail 256 (budget p ≤ 1); p is the q8→q4 position of each judged
+metric against **same-label** baselines (window bootstrap, 2000 resamples, seed
+20261005). Windows: 4K and 32K are the fourteen `t08x` windows (seeds 11–18
+and 21–26; six 32K windows fall to D14, eight survive), 128K is ten
+fresh-seed `verdict-128k` windows (seeds 31–40; corpus 0 falls to D14, nine
+survive, and the candidates were measured there exactly once).
+
+| Metric | k6v5 2048, 4K (14 win) | k6v5 2048, 32K (8 win) | k6v5 2048, 128K (9 win) |
+| --- | ---: | ---: | ---: |
+| mean KL | -0.025 [-0.077, 0.044] | 0.104 [-0.006, 0.145] | **0.161 [-0.002, 0.345]** |
+| median KL | 0.002 [-0.009, 0.010] | -0.009 [-0.059, 0.014] | 0.025 [0.009, 0.045] |
+| large-deviation rate | 0.031 [0.000, 0.158] | 0.125 [0.000, 0.164] | **0.195 [0.000, 0.457]** |
+| top-1 disagreement | -0.024 [-0.195, 0.100] | 0.000 [-0.227, 0.088] | 0.136 [-0.046, 0.380] |
+
+`kvarn-k4v4` tail 256 passes its ≤ 1 budget on the same windows (worst 0.875 at
+32K, the large-deviation rate; 0.834 on the 128K mean KL). `kvarn-k6v5` tail
+2048 passes at 4K and 32K (worst 0.125) but **fails the 0.13 budget at 128K**
+(worst p 0.195, the large-deviation rate), so the quality contract's
+all-depth clause is not met and depth 128K is not sanctioned for the
+quality-first preset; the stretch goal p ≤ 0.10 is not met either. The
+mechanism is the production prefill path's F16 staging rounding (task 4.2
+verdict), and no adopted change moved the position (the change's chapter 7
+records the decision not to adopt the available improvements). Full record and
+reproduction commands: [`QUALITY.md`](QUALITY.md).
 
 **Re-measured (2026-10-05, tasks 7.8):** with the verification-store fix
 the same corpus reports 0/11 AR/DFlash2 mismatches at depth 0 and ~3.9K,

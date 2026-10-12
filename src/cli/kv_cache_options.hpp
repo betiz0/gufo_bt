@@ -25,7 +25,13 @@ inline constexpr std::string_view kKvCacheFp16{"fp16"};
 
 /// Value list printed in `--help`.
 [[nodiscard]] inline std::string KvCacheValueList() {
-  return std::string(kKvCacheFp16) + ", kvarn-k4v4, kvarn-k5v4, kvarn-k6v5";
+  std::string values =
+      std::string(kKvCacheFp16) + ", kvarn-k4v4, kvarn-k5v4, kvarn-k6v5";
+#if defined(GUFO_QWEN_PSEUDO_KVARN)
+  // gpu-test quality probes (design D1).
+  values += ", baseline-q8, baseline-q4";
+#endif
+  return values;
 }
 
 /// Validates one `--kv-cache` value. Callers run this after parsing and before
@@ -35,6 +41,11 @@ inline constexpr std::string_view kKvCacheFp16{"fp16"};
   if (value == kKvCacheFp16) {
     return true;
   }
+#if defined(GUFO_QWEN_PSEUDO_KVARN)
+  if (value == "baseline-q8" || value == "baseline-q4") {
+    return true;
+  }
+#endif
   if (hip::QwenKvarnPreset preset; hip::ParseQwenKvarnPreset(value, &preset)) {
     return true;
   }

@@ -5,8 +5,11 @@ Covers the canonical options on `serve llm`, `chat`, `prompt` and `bench`:
 acceptance and help text, rejection of unknown values and of a tail outside
 256..2048 (or without a KVarN format) before any model load, and the startup
 rejection of an explicit value (`fp16` included) on models that do not offer
-the options. The phase-0 probe values (`pseudo-kvarn-*`, `baseline-*`) no
-longer exist in any build and must be rejected as unknown values.
+the options. The phase-0 probe values (`pseudo-kvarn-*`, `baseline-q4-l256`,
+`baseline-q5`) no longer exist in any build and must be rejected as unknown
+values. The E_q8 / E_q4 baselines (`baseline-q8`, `baseline-q4`) exist only in
+gpu-test probe builds: there they are accepted and listed, and they refuse a
+tail; any other build rejects them as unknown values.
 
 Usage: kv_cache_test.py <gufo>
 """
@@ -32,8 +35,10 @@ PRODUCTION_PRESETS = ("kvarn-k4v4", "kvarn-k5v4", "kvarn-k6v5")
 # Phase-0 probe values, removed with the pseudo-quantization path (task 3.10).
 REMOVED_PROBES = ("pseudo-kvarn-k4v4", "pseudo-kvarn-k5v4",
                   "pseudo-kvarn-k3v4", "pseudo-kvarn-k4v4-l0",
-                  "pseudo-kvarn-k5v4-l1024", "baseline-q8", "baseline-q4",
-                  "baseline-q4-l256", "baseline-q5")
+                  "pseudo-kvarn-k5v4-l1024", "baseline-q4-l256", "baseline-q5")
+# The E_q8 / E_q4 baselines of the quality evaluation (design D1). A probe
+# build accepts them and lists them in --help; every other build rejects them.
+BASELINE_PROBES = ("baseline-q8", "baseline-q4")
 
 
 def run(binary, args):
@@ -118,6 +123,39 @@ def check_production_presets(binary):
                status == 2 and "missing.gguf" not in output, output)
 
 
+def detect_probe_build(binary):
+    """Whether this binary is a gpu-test probe build (design D1): it accepts
+    the E_q8 / E_q4 baselines and lists them in --help."""
+    status, output = run(binary, [*COMMANDS[0], "--help"])
+    return status == 0 and all(value in output for value in BASELINE_PROBES)
+
+
+def check_quality_baselines(binary, probe_build):
+    """The baselines are a gpu-test-only option value: accepted and listed in
+    a probe build, unknown everywhere else, and never combined with a tail."""
+    for command in COMMANDS:
+        label = " ".join(command)
+        if probe_build:
+            status, output = run(binary, [*command, "--help"])
+            for value in BASELINE_PROBES:
+                expect(f"{label}: --help lacks {value}", value in output, output)
+        for value in BASELINE_PROBES:
+            status, output = run(binary, [*command, "--kv-cache", value,
+                                          "--model", "missing.gguf"])
+            if probe_build:
+                expect(f"{label}: {value} must be accepted by the parser",
+                       status != 2 and "--kv-cache value" not in output, output)
+                status, output = run(binary, [
+                    *command, "--kv-cache", value,
+                    "--kv-cache-tail", str(TAIL_MIN),
+                    "--model", "missing.gguf"])
+                expect(f"{label}: {value} with a tail must exit 2",
+                       status == 2 and "missing.gguf" not in output, output)
+            else:
+                expect(f"{label}: {value} must be rejected as unknown",
+                       status == 2 and "--kv-cache" in output, output)
+
+
 def check_model_report(binary):
     """A model that does not offer `--kv-cache` still reports its own KV format
     in the startup log. Only DeepSeek V4 Flash has a format distinct from F16
@@ -194,6 +232,7 @@ def main():
 
     check_tail(binary)
     check_production_presets(binary)
+    check_quality_baselines(binary, detect_probe_build(binary))
     check_model_report(binary)
 
     with tempfile.TemporaryDirectory(prefix="kv-cache-cli-") as directory:

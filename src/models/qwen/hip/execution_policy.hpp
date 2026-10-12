@@ -12,7 +12,44 @@ enum class QwenKvCacheStorage : std::uint8_t {
   kFp32,
   kFp16,
   kKvarn,
+  /// Baseline probes of the KV quantization quality evaluation (design D1,
+  /// `GUFO_QWEN_PSEUDO_KVARN` builds only): the dense FP16 planes hold rows
+  /// that were rotated, quantized and dequantized on write. They are a
+  /// distinct storage so no cache, snapshot or graph is ever reused across
+  /// them and `fp16`/KVarN, and the values stay unknown in production builds.
+  kBaselineQ8,
+  kBaselineQ4,
 };
+
+/// Whether the storage keeps the dense two-byte FP16 K/V planes, which the
+/// FP16 policy and the baseline probes share. KVarN replaces them with the
+/// sink, the sealed body and the tail ring.
+[[nodiscard]] constexpr bool QwenKvCacheUsesDenseFp16Planes(
+    QwenKvCacheStorage storage) noexcept {
+  return storage == QwenKvCacheStorage::kFp16 ||
+         storage == QwenKvCacheStorage::kBaselineQ8 ||
+         storage == QwenKvCacheStorage::kBaselineQ4;
+}
+
+/// Canonical `--kv-cache` spelling of a storage kind the CLI can name, or an
+/// empty view for KVarN (whose spelling carries its preset) and FP32 (which
+/// the option never selects).
+[[nodiscard]] constexpr std::string_view QwenKvCacheStorageName(
+    QwenKvCacheStorage storage) noexcept {
+  switch (storage) {
+    case QwenKvCacheStorage::kFp32:
+      return "fp32";
+    case QwenKvCacheStorage::kFp16:
+      return "fp16";
+    case QwenKvCacheStorage::kBaselineQ8:
+      return "baseline-q8";
+    case QwenKvCacheStorage::kBaselineQ4:
+      return "baseline-q4";
+    case QwenKvCacheStorage::kKvarn:
+      break;
+  }
+  return {};
+}
 
 /// Range of the `--kv-cache-tail` option: full-precision rows kept behind each
 /// KVarN query (design.md D1, D10). Without the option no tail is added.
@@ -99,11 +136,30 @@ struct QwenExecutionPolicy {
   }
 
   [[nodiscard]] constexpr bool UsesFp16AttentionKv() const noexcept {
-    return kv_cache_storage == QwenKvCacheStorage::kFp16;
+    return QwenKvCacheUsesDenseFp16Planes(kv_cache_storage);
   }
 
   [[nodiscard]] constexpr bool UsesKvarn() const noexcept {
     return kv_cache_storage == QwenKvCacheStorage::kKvarn;
+  }
+
+  /// The gpu-test baseline probes (design D1): the dense FP16 planes hold
+  /// rows that were quantized and dequantized on write. Production builds
+  /// never select them, so this is false for every value they accept.
+  [[nodiscard]] constexpr bool UsesBaselineQuant() const noexcept {
+    return kv_cache_storage == QwenKvCacheStorage::kBaselineQ8 ||
+           kv_cache_storage == QwenKvCacheStorage::kBaselineQ4;
+  }
+
+  /// Block width of the baseline probes: 8 for q8_0, 4 for q4_0, 0 otherwise.
+  [[nodiscard]] constexpr std::uint8_t BaselineBits() const noexcept {
+    if (kv_cache_storage == QwenKvCacheStorage::kBaselineQ8) {
+      return 8;
+    }
+    if (kv_cache_storage == QwenKvCacheStorage::kBaselineQ4) {
+      return 4;
+    }
+    return 0;
   }
 
   [[nodiscard]] constexpr bool UsesBf16RecurrentState() const noexcept {
@@ -125,6 +181,10 @@ struct QwenExecutionPolicy {
               (static_cast<std::uint64_t>(kvarn.tail_length) << 47U) |
               (static_cast<std::uint64_t>(kvarn.scale == QwenKvarnScale::kBf16)
                << 59U);
+    }
+    if (UsesBaselineQuant()) {
+      bits |= (std::uint64_t{1} << 60U) |
+              (static_cast<std::uint64_t>(BaselineBits()) << 61U);
     }
     return bits;
   }
@@ -160,13 +220,14 @@ struct QwenExecutionPolicy {
   return attention_heads == 24 && kv_heads == 4 && head_dim == 256;
 }
 
-/// Error text when a KVarN policy meets a shape KVarN does not support, or an
-/// empty string when KVarN is not selected or the shape matches. Callers raise
-/// this before allocating the arena (design D7).
+/// Error text when a quantizing policy — KVarN or a gpu-test baseline probe —
+/// meets a shape its write path does not support, or an empty string when
+/// neither is selected or the shape matches. Callers raise this before
+/// allocating the arena (design D7).
 [[nodiscard]] inline std::string QwenKvarnShapeError(
     const QwenExecutionPolicy& policy, std::uint32_t attention_heads,
     std::uint32_t kv_heads, std::uint32_t head_dim) {
-  if (!policy.UsesKvarn() ||
+  if ((!policy.UsesKvarn() && !policy.UsesBaselineQuant()) ||
       QwenKvarnSupportsShape(attention_heads, kv_heads, head_dim)) {
     return {};
   }
@@ -197,6 +258,16 @@ struct QwenExecutionPolicy {
     policy->kv_cache_storage = QwenKvCacheStorage::kFp16;
     return true;
   }
+#if defined(GUFO_QWEN_PSEUDO_KVARN)
+  // gpu-test quality probes (design D1). A production build has no branch
+  // here, so the values stay unknown and are rejected before a model loads.
+  if (name == "baseline-q8" || name == "baseline-q4") {
+    policy->kv_cache_storage = name == "baseline-q8"
+                                   ? QwenKvCacheStorage::kBaselineQ8
+                                   : QwenKvCacheStorage::kBaselineQ4;
+    return true;
+  }
+#endif
   if (QwenKvarnPreset preset; ParseQwenKvarnPreset(name, &preset)) {
     preset.tail_length = tail_tokens;
     policy->kvarn = preset;

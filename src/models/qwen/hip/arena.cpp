@@ -387,9 +387,9 @@ CompactSnapshotLayout MakeCompactSnapshotLayout(
       .conv_elements = conv_elements,
       .deltanet_elements = deltanet_elements,
   };
-  const std::size_t kv_element_bytes = kv_storage == QwenKvCacheStorage::kFp16
-                                           ? sizeof(std::uint16_t)
-                                           : sizeof(float);
+  const std::size_t kv_element_bytes =
+      QwenKvCacheUsesDenseFp16Planes(kv_storage) ? sizeof(std::uint16_t)
+                                                 : sizeof(float);
   layout.live_kv_elements_per_plane = CheckedMultiply(
       CheckedMultiply(attention_layers, valid_context), kv_width);
   layout.live_kv_bytes_per_plane =
@@ -432,8 +432,9 @@ CompactSnapshotLayout ParseCompactSnapshotLayout(
       GetLittleEndian<std::uint32_t>(payload, 32);
   const std::uint32_t recurrent_storage_value =
       GetLittleEndian<std::uint32_t>(payload, 36);
-  if (kv_storage_value >
-          static_cast<std::uint32_t>(QwenKvCacheStorage::kFp16) ||
+  const auto kv_storage = static_cast<QwenKvCacheStorage>(kv_storage_value);
+  if ((kv_storage != QwenKvCacheStorage::kFp32 &&
+       !QwenKvCacheUsesDenseFp16Planes(kv_storage)) ||
       recurrent_storage_value >
           static_cast<std::uint32_t>(QwenRecurrentStateStorage::kBf16)) {
     throw std::invalid_argument("Qwen compact snapshot precision is invalid");
@@ -443,8 +444,7 @@ CompactSnapshotLayout ParseCompactSnapshotLayout(
       GetLittleEndian<std::uint32_t>(payload, 16),
       GetLittleEndian<std::uint32_t>(payload, 20),
       GetLittleEndian<std::uint32_t>(payload, 24),
-      GetLittleEndian<std::uint32_t>(payload, 28),
-      static_cast<QwenKvCacheStorage>(kv_storage_value),
+      GetLittleEndian<std::uint32_t>(payload, 28), kv_storage,
       static_cast<QwenRecurrentStateStorage>(recurrent_storage_value),
       SizeFromU64(GetLittleEndian<std::uint64_t>(payload, 48)),
       SizeFromU64(GetLittleEndian<std::uint64_t>(payload, 56)), image_count);
@@ -704,12 +704,12 @@ std::size_t QwenGpuSnapshot::SerializeCompact(
   SnapshotTransfer transfer;
   if (layout.live_kv_bytes_per_plane != 0) {
     const std::size_t kv_element_bytes =
-        kv_storage_ == QwenKvCacheStorage::kFp16 ? sizeof(std::uint16_t)
-                                                 : sizeof(float);
+        QwenKvCacheUsesDenseFp16Planes(kv_storage_) ? sizeof(std::uint16_t)
+                                                    : sizeof(float);
     const std::size_t source_pitch = CheckedMultiply(
         CheckedMultiply(valid_context_, kv_width_), kv_element_bytes);
     const void* source =
-        kv_storage_ == QwenKvCacheStorage::kFp16 ? d_kv_f16_ : d_kv_f32_;
+        QwenKvCacheUsesDenseFp16Planes(kv_storage_) ? d_kv_f16_ : d_kv_f32_;
     if (source == nullptr) {
       throw std::logic_error("Qwen compact snapshot has no KV storage");
     }
@@ -1439,6 +1439,12 @@ QwenGpuArena::QwenGpuArena(const core::ModelConfig& config,
 
     const std::size_t total_kv = GetAttentionKvPlaneElements();
     if (!policy_.UsesKvarn()) {
+      const std::string shape_error =
+          QwenKvarnShapeError(policy_, config_.num_attention_heads,
+                              config_.num_key_value_heads, config_.head_dim);
+      if (!shape_error.empty()) {
+        throw std::runtime_error(shape_error);
+      }
       if (policy_.UsesFp16AttentionKv()) {
         HIP_CHECK(hipMalloc(&d_attention_kv_f16,
                             total_kv * sizeof(std::uint16_t) * 2));
