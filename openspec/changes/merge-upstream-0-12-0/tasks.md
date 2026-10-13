@@ -80,10 +80,14 @@
 
 ## 6. 報告・コミット・push
 
-- [ ] 6.1 5 章の結果を集約して利用者に報告する（スイートは再実行しない）。合格・不合格・スキップの一覧に、キャッシュ層のテスト、KVarN の一致性、functional cache スイート、マージ前 `.kvc` の再利用結果を併記する。失敗がある場合は、解決ミスか upstream の意図的変更かを切り分けて報告する。完了条件: 一覧と切り分け結果を利用者に提示する
-- [ ] 6.2 マージをコミットする。6.1 で不合格がない場合、または不合格について利用者が判断した後に、解決したファイルとマージで追加・変更された全ファイルをステージして `git commit -m "chore: merge upstream v0.12.0 (88090af)"` を実行する。完了条件: `git log -1 --format=%P` の親が `74b74c2` と `88090af` の 2 つで、`git diff --name-only --diff-filter=U` が空
-- [ ] 6.3 変更アーティファクトをコミットし、検証する。`openspec/changes/merge-upstream-0-12-0/` をステージしてコミットし、`openspec validate merge-upstream-0-12-0 --strict` を実行する。完了条件: 終了コード 0（「変更 'merge-upstream-0-12-0' は有効です」）と、`git status --short` にタスク所有外の変更が残っていない
-- [ ] 6.4 利用者の確認を得てから `git push origin kvarn-kv-cache-quantization` を実行する（fast-forward。push 後のロールバックは `git revert -m 1 <マージコミット>`）。完了条件: `git rev-list --count origin/kvarn-kv-cache-quantization..HEAD` が 0
+- [x] 6.1 5 章の結果を集約して利用者に報告する（スイートは再実行しない）。合格・不合格・スキップの一覧に、キャッシュ層のテスト、KVarN の一致性、functional cache スイート、マージ前 `.kvc` の再利用結果を併記する。失敗がある場合は、解決ミスか upstream の意図的変更かを切り分けて報告する。完了条件: 一覧と切り分け結果を利用者に提示する
+  - 根拠（2026-10-13）: 5.1〜5.11 の PASS/FAIL/スキップ一覧（5.1 17/17 + pytest 3 passed、5.2 9/9、5.3 2/2、5.4 両構成 22/22 match・mism 0・err 0、5.5 17/17、5.6 exit 0×2、5.7 11/11 + vision 手動 exit 0、5.8 2/3 PASS + 1 FAIL、5.9 両構成とも全 passed、5.10 両構成 PASS、5.11 PASS。スキップ 0）を提示。5.8 の失敗は (a) 断言が upstream 自身、(b) スケジューラは両側変更 0、(c) テスト自身が yield を明記、(d) 前回マージでも同一シグネチャで受理済み、として切り分けを提示し、利用者がホスト依存 flake として受理（判定は 5.8 の根拠に記録）
+- [x] 6.2 マージをコミットする。6.1 で不合格がない場合、または不合格について利用者が判断した後に、解決したファイルとマージで追加・変更された全ファイルをステージして `git commit -m "chore: merge upstream v0.12.0 (88090af)"` を実行する。完了条件: `git log -1 --format=%P` の親が `74b74c2` と `88090af` の 2 つで、`git diff --name-only --diff-filter=U` が空
+  - 根拠（2026-10-13）: `git add -A -- . ':(exclude)openspec/changes/merge-upstream-0-12-0'` → `git commit -m "chore: merge upstream v0.12.0 (88090af)"` = `4d0f39c`。`git log -1 --format=%P` = `74b74c2b594754d348b9e5060d651f606a8eb32a 88090afb2da10f9f1258ec08ddba0b57315305ac`（2 親）、`git diff --name-only --diff-filter=U` = 0 件。解決 2 ファイルに加え、3.5 の docs 修正（README 4 箇所・EXPERIMENTS 1 箇所・archive proposal 1 箇所）を同梱
+- [x] 6.3 変更アーティファクトをコミットし、検証する。`openspec/changes/merge-upstream-0-12-0/` をステージしてコミットし、`openspec validate merge-upstream-0-12-0 --strict` を実行する。完了条件: 終了コード 0（「変更 'merge-upstream-0-12-0' は有効です」）と、`git status --short` にタスク所有外の変更が残っていない
+  - 根拠（2026-10-13）: `git add openspec/changes/merge-upstream-0-12-0/` → `git commit -m "docs(openspec): record the merge-upstream-0-12-0 plan and evidence"` = `ffe7341`。`openspec validate merge-upstream-0-12-0 --strict` = 「変更 'merge-upstream-0-12-0' は有効です」（終了コード 0）、`git status --short` = 0 行
+- [x] 6.4 利用者の確認を得てから `git push origin kvarn-kv-cache-quantization` を実行する（fast-forward。push 後のロールバックは `git revert -m 1 <マージコミット>`）。完了条件: `git rev-list --count origin/kvarn-kv-cache-quantization..HEAD` が 0
+  - 根拠（2026-10-13）: 利用者の確認（push を実行する）を得て `git push origin kvarn-kv-cache-quantization` = `74b74c2..ffe7341`（fast-forward、53 コミット）。`git rev-list --count origin/kvarn-kv-cache-quantization..HEAD` = 0、`origin` の先頭 = `ffe7341`。ロールバックは `git revert -m 1 4d0f39c`
 
 ## Workflow follow-up
 
