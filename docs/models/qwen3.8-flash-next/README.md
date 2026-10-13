@@ -41,7 +41,7 @@ admission reserves the configured capacity before creating sessions.
 supported: its teacher-forced agreement with llama.cpp is worse than the
 unsloth `UD-Q4_K_XL` baseline's on one of the two retained prompts, so the
 qualification gate fails. Keep `UD-Q4_K_XL` as the supported target; the
-measurements and the failed gate are in [QUALITY.md](QUALITY.md#agention-ap-q4kxl-tier).
+measurements and the failed gate are in [QUALITY.md](QUALITY.md#agention-ap-q4_k_xl-tier).
 
 `agentionai/Signal-3.8-Flash-Next-GGUF`, **AP-Q4_K_XL**: a single 94.2 GiB file
 whose 1224 tensors are a per-tensor mix of Q6_K 520 (dense projections,
@@ -62,7 +62,7 @@ python3 tools/gguf_formats.py "$AP" --sha256   # identity, format and class hist
 ```
 
 The measurements and the measured context ceiling are in
-[QUALITY.md](QUALITY.md#agention-ap-q4kxl-tier); the file hashes, the per-format
+[QUALITY.md](QUALITY.md#agention-ap-q4_k_xl-tier); the file hashes, the per-format
 histogram and the per-class histogram are in
 [artifacts/model-identities.json](artifacts/model-identities.json).
 
@@ -74,7 +74,7 @@ specification's paired teacher-forced gate has the Swift tier's mean KL
 divergence above the unsloth `UD-Q4_K_XL` baseline's at the same configuration,
 so the gate fails as a whole. Keep `UD-Q4_K_XL` as the supported target; the
 measurements and the failed pairs are in
-[QUALITY.md](QUALITY.md#swift-15-q4km-tier).
+[QUALITY.md](QUALITY.md#swift-15-q4_k_m-tier).
 
 `ukisai/Swift-1.5-Qwen3.8-Flash-Next-GGUF`, **Q4_K_M**: three shards,
 119,599,029,952 bytes, 1224 tensors, `general.name` "Swift 1.5 Flash
@@ -101,7 +101,7 @@ python3 tools/gguf_formats.py "$SWIFT" --sha256   # identity, format and class h
 
 The per-configuration teacher-forced comparison, the measured context ceiling
 and its peak memory, the route pinning and the MTP smoke check are in
-[QUALITY.md](QUALITY.md#swift-15-q4km-tier); the shard hashes, the
+[QUALITY.md](QUALITY.md#swift-15-q4_k_m-tier); the shard hashes, the
 per-format and per-class histograms and the source revision are in
 [artifacts/model-identities.json](artifacts/model-identities.json).
 

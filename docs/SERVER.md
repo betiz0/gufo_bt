@@ -11,7 +11,7 @@ fields return explicit errors.
 
 Chat Completions is the main API, including streaming, images and tools.
 Responses supports text, images and function tools with optional streaming.
-Anthropic Messages exposes a synchronous text subset.
+Anthropic Messages supports text, images and custom tools.
 The reference protocols are:
 
 - https://developers.openai.com/api/reference/resources/responses/methods/create/
@@ -91,7 +91,7 @@ available memory.
 Text sampling follows each model's recommended defaults in `serve`, `prompt`
 and `chat`. Explicit request values override explicit server options, which
 otherwise inherit the effective thinking preset. Null request values inherit
-where supported; explicit zero values are preserved (`top_p` must remain positive).
+where supported; explicit zero values, including `top_p: 0`, are preserved.
 The startup sampling log reports server defaults; requests can override each
 setting independently, including when changing thinking mode.
 
@@ -566,6 +566,17 @@ no native effect are accepted and ignored so conforming clients interoperate
 `store` and `background` must be false when present; server-side conversations
 and `previous_response_id` remain unsupported.
 
+Function-call output accepts either a text string or an array of `input_text`
+and `input_image` parts. Images stay inside the corresponding tool result;
+image-only output and interleaved text/images are supported. Historical
+`custom_tool_call` items and their `custom_tool_call_output` use the same
+association and output parts; the custom call's free-form `input` is retained
+as literal tool-history data. This does not enable custom-tool generation.
+Chat Completions also accepts `image_url` parts in `role:"tool"` content.
+Existing text-string outputs keep their prompt representation. Images remain
+unsupported in assistant/system/developer messages; only `detail:"auto"` is
+accepted, and file IDs and `input_file` parts remain unsupported.
+
 Responses report `incomplete` with reason `max_output_tokens` when generation
 hits its limit. Otherwise they report `completed`. `stream: true` sends typed
 SSE events with consecutive `sequence_number` values: lifecycle, output items,
@@ -595,12 +606,18 @@ The other compatibility routes are deliberately limited:
 | Route | Supported request | Output limit |
 | --- | --- | --- |
 | `/v1/completions` | One prompt string, buffered or SSE completion | `max_tokens` |
-| `/v1/messages` | Text messages and optional text system instructions | `max_tokens` |
+| `/v1/messages` | Text, image, thinking and tool blocks, optional text system instructions and custom tools; buffered or SSE | `max_tokens` |
 | `/completion` | One prompt string, non-streaming completion | `n_predict` |
 
 All four routes validate the loaded model, positive integer limits and shared
-sampling controls. Messages and `/completion` reject streaming; all reject
-multiple candidates. Responses and Messages honor the server's thinking defaults.
+sampling controls. `/completion` rejects streaming; all reject multiple
+candidates. Streamed Messages send Anthropic SSE events: `message_start`,
+`content_block_start`/`content_block_delta`/`content_block_stop` for
+`thinking` (`thinking_delta`), `text` (`text_delta`) and `tool_use`
+(`input_json_delta`) blocks, then `message_delta` with `stop_reason` and the
+complete usage, and `message_stop`. `message_start` reports zero usage because
+prompt accounting is final only at the end. A failure after the headers sends
+an `error` event. Responses and Messages honor the server's thinking defaults.
 Messages accepts `thinking.type` (`enabled`, `adaptive` or `disabled`);
 `adaptive` keeps the server's thinking default, and `budget_tokens` has no
 native equivalent, so the effort stays the server's unless
@@ -610,11 +627,29 @@ before the `text` block, with an empty `signature`, for every accepted
 `thinking` blocks unchanged so later turns reuse the cached prompt.
 `output_config.effort` (`low`, `medium`, `high`, `xhigh` or `max`) sets the
 reasoning effort used while thinking is on; it never enables thinking. Other
-`output_config` members are rejected. Messages rejects tools; use Chat
-Completions for tools. Completions routes accept `stop`;
+`output_config` members are rejected. Messages maps custom `tools`
+(`input_schema`) and `tool_choice` (`auto`, `any`, `tool`, `none`, with
+`disable_parallel_tool_use`) onto the Chat tool path, so framing, schema
+constraints and cache reuse match Chat Completions. Calls are returned as
+`tool_use` blocks with `stop_reason: "tool_use"`; replay them unchanged with
+the following `tool_result` blocks. Server tools such as `web_search` are
+rejected. Messages accepts `image` blocks in user turns and in `tool_result`
+content, with a `base64` source (PNG, JPEG or WebP) or an HTTPS `url` source,
+under the same limits and model requirements as Chat Completions images;
+images in assistant turns, `file` sources and `document` blocks are rejected.
+Completions routes accept `stop`;
 Messages accepts `stop_sequences`. Responses has no stop-sequence field.
-`/infill` and `/v1/messages/count_tokens` return 501: suffix-conditioned infill
-and template-aware message counting are not implemented.
+`POST /v1/messages/count_tokens` accepts the same text, images, system, thinking and
+tool history as Messages and returns `{"input_tokens": N}` after rendering the
+model's chat template. `max_tokens` is optional; `stream: true` is rejected.
+The count includes cached prompt tokens and does not generate, prefill or
+change the conversation cache. Prompts may exceed the configured execution
+context so clients can size them before trimming; generation still enforces
+the context limit. Images use the same resizing and visual token expansion as
+generation, without running the vision encoder; the matching projector must
+be loaded. Models without image support reject image counts with 400.
+Backends without chat counting support return 501. `/infill` still returns 501 because
+suffix-conditioned infill is not implemented.
 
 Raw Completions accepts `stream: true` and
 `stream_options: {"include_usage": true}`. The final usage event reports prompt,

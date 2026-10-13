@@ -47,7 +47,7 @@ p ≤ 1 を満たした。
 4K / 32K の 0.13 を必達、128K は測定値の記録とし、`kvarn-k6v5` テール長 2048
 は 4K / 32K 用の構成として文書化する（128K の利用は未承認）。bpv を増やす
 改善（k8 / q8_0 級）は採用しない。判定の全文と再現コマンドは
-[docs/models/qwen3.8-27b/QUALITY.md](../../../docs/models/qwen3.8-27b/QUALITY.md)
+[docs/models/qwen3.8-27b/QUALITY.md](../../../../docs/models/qwen3.8-27b/QUALITY.md)
 の最終判定節にある。
 
 ## Impact
