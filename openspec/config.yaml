@@ -1,0 +1,25 @@
+schema: spec-driven
+
+# gufo_bt プロジェクトの文脈
+# アーティファクト作成時に AI に提示されます。
+
+context: |
+  言語: 日本語
+  技術スタック: C++ (CMake/CTest), HIP/ROCm, Linux x86-64, gfx1151 (Strix Halo), Nix
+  テスト: ctest --preset gpu-full 等。ビルドは cmake --preset gpu-test
+
+  GPU/VRAM を使用するテストの実行ルール (必須):
+  - VRAM を消費するテスト (GPU/operator/model チェック等) は並列実行してはならない (MUST NOT)
+  - ctest に --parallel / -j (値が 1 以外) を付けて実行しない
+  - GPU テストは一度に 1 インスタンスのみ。既に GPU テスト実行中なら追加起動しない
+  - ソース側で強制する場合は CTest の RESOURCE_LOCK プロパティでシリアライズする
+  - 理由: 並列起動による VRAM 枯渇・OOM を防ぎ、結果を再現可能に保つため
+
+rules:
+  tasks:
+    - GPU/VRAM を使用するテストを含む変更は、検証手順を逐次実行前提で記述する
+
+operations:
+  apply:
+    guidance:
+      - VRAM を消費するテストの検証は必ず逐次実行し、並列起動 (ctest --parallel, 同時プロセス) を提案・実行しない
