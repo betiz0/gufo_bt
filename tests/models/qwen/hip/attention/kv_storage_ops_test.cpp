@@ -72,7 +72,8 @@ gufo::core::ModelConfig ProductionQwen27BConfig() {
 void TestCausalDecodeRows() {
   using gufo::test::DeviceBuffer;
   constexpr unsigned heads = 6, kv_heads = 1, dim = 256, rows = 8;
-  constexpr unsigned context = 65544, layer = 1, width = heads * dim;
+  // 131064 + the widest row group stays inside the context.
+  constexpr unsigned context = 131073, layer = 1, width = heads * dim;
   constexpr std::size_t cache_size = 2U * context * kv_heads * dim;
   std::vector<float> query(rows * width), gate(query.size()), cache(cache_size);
   std::vector<__half> cache_half(cache_size);
@@ -93,8 +94,9 @@ void TestCausalDecodeRows() {
   for (bool fp16 : {false, true}) {
     for (bool gated : {false, true}) {
       for (unsigned batch : {1U, 2U, 3U, rows}) {
-        for (unsigned start : {0U, 17U, 120U, 124U, 127U, 128U, 504U, 508U,
-                               511U, 512U, 8192U, 32768U, 65536U}) {
+        for (unsigned start :
+             {0U, 17U, 120U, 124U, 127U, 128U, 504U, 508U, 511U, 512U, 4093U,
+              4095U, 4096U, 4097U, 8192U, 32768U, 65536U, 131064U}) {
           float* const cache32 = fp16 ? nullptr : kv.data();
           void* const cache16 = fp16 ? kv_half.data() : nullptr;
           for (unsigned row = 0; row < batch; ++row) {

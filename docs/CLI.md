@@ -100,13 +100,20 @@ The supported modalities are LLM, image, video, and audio (TTS, ASR).
   no tail tokens are added (the structural minimum). Fitting tails:
   `kvarn-k4v4` 256, `kvarn-k5v4` none, `kvarn-k6v5` 2048. Specifying it without
   a KVarN preset, outside the range, or on another model is a startup error.
-- The default stays `fp16`, so existing outputs, snapshots, compatibility keys
-  and `.kvc` disk caches are unchanged. The startup log and `gufo bench` report
-  the selected format, the tail length (or none), the effective bpv (body and
-  total) and the per-session KV capacity. The fitting tails cost 4.47 GiB per
-  262K session for `kvarn-k4v4` tail 256 (4.467 total bpv) and 6.08 GiB for
-  `kvarn-k6v5` tail 2048 (6.076 total bpv); the model README lists every tail
-  from none to 2048.
+- The default stays `fp16`. Outputs, snapshots, compatibility keys and `.kvc`
+  disk caches stay identical for builds whose FP16 decode-attention arithmetic
+  is unchanged. Builds with the decode-attention block kernel (change
+  `update-qwen-decode-attention-blocks`) add a `fp16_decode_attention=`
+  identity row for dense FP16 planes and compute different FP16 decode values;
+  their `.kvc` disk caches written by an earlier build or by upstream at the
+  same commit are recomputed instead of reused (the tokens match a cold run
+  with an empty cache directory), while FP32 reference-KV and KVarN
+  identities, FP16 snapshot versions and formats are unaffected. The startup
+  log and `gufo bench` report the selected format, the tail length (or none),
+  the effective bpv (body and total) and the per-session KV capacity. The
+  fitting tails cost 4.47 GiB per 262K session for `kvarn-k4v4` tail 256
+  (4.467 total bpv) and 6.08 GiB for `kvarn-k6v5` tail 2048 (6.076 total bpv);
+  the model README lists every tail from none to 2048.
 - Quality against the q8→q4 reference (2026-10-12, same-label windows):
   `kvarn-k6v5` tail 2048 meets the 0.13 budget at 4K and 32K (worst 0.125) but
   not at 128K (worst 0.195, the large-deviation rate over nine fresh windows),
@@ -126,14 +133,19 @@ same point at ≥ 0.97× of them):
 
 | Preset | Tail | d0 | 4K | 32K | 128K |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| `kvarn-k4v4` | none | 0.996 / 0.925 | 0.986 / 0.922 | 0.949 / 0.890 | 0.843 / 0.826 |
-| `kvarn-k4v4` | 2048 | 0.996 / 0.985 | 0.987 / 0.922 | 0.943 / 0.894 | 0.838 / 0.840 |
-| `kvarn-k5v4` | none | 0.996 / 0.924 | 0.982 / 0.921 | 0.914 / 0.889 | 0.753 / 0.822 |
-| `kvarn-k5v4` | 2048 | 0.996 / 0.987\* | 0.984 / 0.924\* | 0.908 / 0.889\* | 0.752 / 0.835 |
+| `kvarn-k4v4` | none | 0.996 / 0.925 | 0.986 / 0.922 | 0.948 / 0.890 | 0.845 / 0.826 |
+| `kvarn-k4v4` | 2048 | 0.996 / 0.985 | 0.987 / 0.922 | 0.943 / 0.894 | 0.840 / 0.840 |
+| `kvarn-k5v4` | none | 0.996 / 0.924 | 0.982 / 0.921 | 0.916 / 0.889 | 0.757 / 0.822 |
+| `kvarn-k5v4` | 2048 | 0.996 / 0.987\* | 0.984 / 0.924\* | 0.912 / 0.889\* | 0.755 / 0.835\* |
 
 \* Main configuration re-measured in the same series on 2026-10-08 (task 6.3, design D23): AR tg / pp2048 ratios against FP16 at d0 0.996/0.987, d4K 0.984/0.924, d32K 0.908/0.889; depth 128K keeps the G1 value. The floors and the reference checks (≥ 0.95 at d0–4K, ≥ 0.97× the G1 point at 32K) pass.
-| `kvarn-k6v5` | none | 0.996 / 0.924 | 0.974 / 0.921 | 0.860 / 0.887 | 0.632 / 0.816 |
-| `kvarn-k6v5` | 2048 | 0.996 / 0.985 | 0.979 / 0.920 | 0.854 / 0.891 | 0.631 / 0.830 |
+| `kvarn-k6v5` | none | 0.996 / 0.924 | 0.974 / 0.921 | 0.862 / 0.887 | 0.637 / 0.816 |
+| `kvarn-k6v5` | 2048 | 0.996 / 0.985 | 0.979 / 0.920 | 0.858 / 0.891 | 0.635 / 0.830 |
+
+The depth 32K and 128K `tg` cells are the G1R re-measurement of 2026-10-15
+(task 2.15, design D17) in the build that replaced the FP16 decode attention
+(change `update-qwen-decode-attention-blocks`); the `pp` cells keep the G1
+values, because prefill attention is out of that change's scope.
 
 **Speculative decoding**
 

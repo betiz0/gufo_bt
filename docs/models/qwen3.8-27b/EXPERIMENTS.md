@@ -138,6 +138,14 @@
 | 形式・演算の変更と版の確定（2026-10-12、tasks 8.1/8.3、design D6） | 本変更が確定した区分: **ペイロードの配置 = 変更なし**（KVarN のタイル/リング/スナップショットのレイアウトは不変、変更したファイルに該当なし）、**量子化演算 = 変更なし**（回転・二軸正規化・RTN は不変。章 7 では改善を採用せず、4.4 の変種比較と WMMA 二重丸めの分析を記録のみとした）、**読み出し経路の演算 = 変更なし**（章 6 は一次判定 no-go で省略、`kernels/kvarn_read.hip`・prefill 注意・封印カーネルは不変）。したがって task 8.3 を適用: `kKvarnCompactSnapshotVersion = 3`、`kCompactSnapshotVersion = 1`、`kQwenPersistentPayloadVersion = 3` は変更前と同一で、`QwenStateAbiName` の KVarN 世代 `qwen-gfx1151-state-v5-` / `qwen-gfx1151-dflash-state-v6-` と FP16/FP32 の文字列も不変（baseline の probe 用分岐は `UsesBaselineQuant()` のときだけ末尾を付けるため既定の文字列に影響しない）。同一性キーの `kv_storage=` は fp16/kvarn の既存表記のままで、gpu-test 専用の `baseline-q8`/`baseline-q4` だけが新しい表記を持つ（release は値自体を拒否）。検査: `qwen_attention_kvarn_state_ops_test` を含む演算子群はタスク 10.1 で実行。 |
 | 変更まとめ: 採用・不採用の判断（2026-10-12、task 9.5、change `improve-kvarn-k6v5-quality-and-speed`） | **一次判定（5.3）: 不採用（no-go）** — タイル単位の読み出し試作は 128K ストリーミングで試作/現行 = 1.3846（目標 ≤ 0.5）。資源は健全（57 SGPR・64 VGPR・spill 0）で、キャッシュ常駐では k6v5 で 0.87 倍と勝つが、k4v4 では 1.70 倍で負け、律速は動かない。**二次判定（6.1）: 未実施** — design D4/D5 の定めどおり no-go で章 6 を省略。**改善策（7.1〜7.3）: 採用なし**（利用者の判断、2026-10-11）— 4.2 の切り分けは本番 prefill（WMMA）の f16 二重丸めで design D5 が維持する性質、4.4 の変種は k8/q8_0 が bpv 上限超、k-mean/bias-corrected はスコア誤差 ≤10% の改善にとどまり、実タイルでも同じ順位。**32K のスパイク**: 量子化誤差でもチャンク境界の不具合でもなく、prefill（WMMA）経路が逆量子化値を f16 に落とす二重丸め（decode 経路と `attention_batched` は FP32 のため現れない）。**品質**: `kvarn-k6v5` テール 2048 は 4K/32K で予算 0.13 に適合（最悪 0.125、32K 大逸脱率、8 窓）だが 128K 開発用の窓で未達（平均 KL 0.178、3 窓）→ 判定用の窓（task 9.1/9.2）の結果は品質優先 L2048 が 4K/32K で PASS（最悪 0.125）、128K で未達（最悪 0.195、平均 KL 0.161、9 窓）で、利用者の判断（2026-10-12）により記録のうえ目標を改定。`kvarn-k4v4` テール 256 は全測定で p ≤ 1。**速度**: 8K/128K の記録（3 系列の中央値 tg 0.959 / 0.631、pp 0.865 / 0.786）を BENCHMARKS.md と README.md に掲載し、既存の下限・退行規則は後続の変更へ繰り延べ。**形式と版**: ペイロード・量子化演算・読み出しの演算はいずれも不変のため、スナップショット版・`state_abi`・同一性キーは変更なし（task 8.3）。 |
 | KVarN 利用開始の判断（2026-10-08、tasks 8.3〜8.5、design D23/D20/D17/D-27） | **利用開始は行わない（利用者の判断）**。既定は `fp16` のまま。材料: 8.3（T3 の再実行）は exit 0・64.1 s で停止もループも再現せず（T2b・T3 の停止記録は当時の経過）。8.4（`kvarn-k5v4` テール 2048、新規窓）は最悪 p 0.109 ≤ 0.15・非有限 0。6.1 の 3 構成（新規窓、D-27 の固定のものさし）は `kvarn-k4v4` テール 256 = 0.478 ≤ 1、`kvarn-k5v4` テール 2048 = 0.109（予算なし・記録）、`kvarn-k6v5` テール 2048 = 0.087 ≤ 0.15 で、いずれも予算に適合（4K 8 窓・32K 4 窓、D14 の除外 4 窓、非有限 0）。6.2 の長距離参照は 3 構成すべて 64/64 正答。既存の根拠は 4.4 の 一致 299/299（128K の封印境界 8/8）、G0、G1、G2。一方で 6.3（T-09）の **C8 合計スループットが 未達**（0.936 < 0.95、8 並列）で、利用者の判断により **PR 提出を保留**（基準の変更も追加の 最適化も行わない、2026-10-08）。利用開始の可否と構成の選択、統計的なタスク評価（後続の change）、32K の窓数（spec の 6 窓に対して 4 窓）、128K の再判定が残る。 |
+| Decode 注意のブロック構造 Phase 0（2026-10-13、tasks 1.1〜1.8、change `update-qwen-decode-attention-blocks`、design D1/D3/D5/D6/D10/D11/D15） | ベンチ `tools/bench/qwen_decode_attention_bench.hip`（基点 801abd3 の FP16 split-K 部分注意カーネルと起動関数を逐語コピーした対照。コピーは `tools/bench/detail/qwen_decode_attention_base_801abd3.inc` に置き、`git show 801abd3:src/models/qwen/hip/kernels/attention_decode.hip | sed -n '624,787p;868,894p'` と `cmp` で byte 一致を確認）。候補は 1 ブロック =（KV ヘッド, 行, パーティション）、6 クエリヘッドを WMMA の M 次元に並べ、K/V タイルを 16 トークンずつ LDS に 1 回だけ置いて全ヘッドで共有し、8 warp（256 スレッド）で回す。
+**精度（G0F、R=1、6 系列長 × 2 入力）: 合格** — Q と P を f16 の上位+残差に分け（残差は 2^11 倍して非正規化域を避ける）、WMMA の累算入力を避けて明示 fmaf で畳む版は、12 点すべてで最大絶対誤差と RMS が対照以下。代表: 生成式入力 n=131072 は最大絶対 9.64e-10・RMS 1.95e-10（対照 4.81e-09・1.23e-09）、2^-8 スケール入力 n=131072 は 2.26e-12・7.20e-13（対照 1.23e-11・7.27e-12）。分けない版（Q/P とも上位のみ）は 5〜1000 倍悪く、ベンチ専用に留める。
+**独立性（G0F）: 合格** — 分割方式 A・B とも、`kv_storage_ops_test` の 13 開始位置に 4093・4095・4096・4097・131064 を加えた 18 位置で、R ∈ {2,3,8} の各行の注意出力が R=1 単独実行と byte 一致（`--mode r1-check`）。
+**G0P: 方式 B を採用**（D11 の基準: R=1 では A と ±1% 以内（32K 1.0424 対 1.0515、128K 4.0795 対 4.0801）、R=8 で B が 32K 18%・128K 12% 速い（32K 4.3249 対 3.6634、128K 17.3456 対 15.5029）。どの点でも 5% 超の遅れなし）。
+**速度（D15 の閾値を再導出）** — 初回実装は R=1 1.55 倍・R=8 1.62〜1.64 倍・resident 4.17 ms/層で未達。段のステージングをレジスタ経由のソフトウェアパイプライン（K/V のグローバル読み出しを前段の計算で隠す）に変えた後は、R=1 cold が 32K 1.032 倍・128K 1.031 倍、R=8 cold が 32K 1.128 倍・128K 1.058 倍、resident の 128K 換算が 2.19 ms/層 = 対照比 1.06〜1.13 倍（掃引の当てはめは実行ごとに ±8% 揺れる）。当初の R=8 ≤0.5 倍と resident ≤0.72 ms/層は、行ごとに KV を 1 回読む構造のままでは届かない: 対照は 128K R=8 で既に約 455 GB/s（L2 相当）、resident の読み出しは帯域律速でなく、resident 換算 0.72 ms/層は対照自身の計算床 2.0 ms/層の 2.7 倍下にある。再導出した基準（利用者の判断、2026-10-13）: R=1・R=8 の cold と resident 換算を「基点比 1.15 倍以下（有意な退行なし）」とし、精度と独立性の項目は据え置く。実測はこの基準内（最悪 1.13 倍）。資源（パイプライン後）: 160 VGPR・9 waves/SIMD・LDS 24.5 KiB・spill 0（対照 77 VGPR・16 waves・4 KiB）。浅い深度の記録（R=1 cold、基準外）: 128 0.0403 ms、512 0.0424、4096 0.0852（対照 0.0152/0.0198/0.0623）。
+**G0U の下地** — `tools/bench/qwen_decode_attention_dump.hip`（公開起動関数のみ、KVarN は `kvarn_read_compute_bench.hip` と同じ CPU 参照エンコーダで封印）は、基点ツリーで 2 回ビルド・実行した出力が `cmp` 一致し、基点と候補の出力も一致（本変更はまだ本番コードを変更していない）。
+**WMMA の実測（gfx1151）** — (a) `v_wmma_f32_16x16x16_f16` の C 入力（累算）は丸めず切り捨てる（1 命令あたり約 0.4 ULP、256 段で相対 1e-5 の負バイアス。これが無いと候補は対照に負ける: 131072 で 1.18e-08 対 4.81e-09。明示 fmaf の畳み込みで 9.64e-10 に改善）。(b) f16 非正規化オペランドでは 16 項の内積が相対 5e-4 まで失われる（全値 2^-16 スケールの入力で 4.4e-6 の負バイアス。2^16 倍すると 1.6e-9 に戻る）。位相 0 の入力は値が f16 正規域に残る 2^-8 スケールを必須入力とし、全値非正規化の入力は参考記録として扱う。
+再現: `nix develop -c tools/bench/build.sh tools/bench/qwen_decode_attention_bench.hip` ののち `/tmp/qwen_decode_attention_bench --mode cold|resident|accuracy|r1-check --partitions a|b --rows N --start-pos P [--iters 5 --sweep 2304 9216 1152]`（GPU ジョブは重ねない、cold と resident は 5 回以上の中央値、精度は FP64 参照）。**D9 に従い停止し、測定値と選択肢を利用者に報告**（Phase 1 以降は未着手）。 |
 Q4 C1 AR leads the pinned d0/d32K controls; Q8 C1 AR matches them.
 DFlash2 retains AR output in the focused shallow/deep and concurrent checks.
 Current comparisons and unmeasured cells are in [benchmarks](BENCHMARKS.md);
@@ -159,3 +167,305 @@ is limited.
 
 Published workload numbers live only in [benchmarks](BENCHMARKS.md); source and
 model qualification live in [quality](QUALITY.md).
+
+Phase 1: the production block kernel (`QwenDecodeBlockAttentionPartialsKernel` in
+`kernels/attention_decode.hip`, reached from `LaunchAttention` /
+`LaunchCausalDecodeAttention` for FP16 with n >= 128) was measured from the
+Phase 0 bench in production mode (`--candidate-mode 7`) against the frozen base
+copy (`--mode accuracy|r1-check|cold|resident`, medians of 5). Accuracy at R=1
+against FP64, max abs / RMS, production versus base: n=128 1.33e-09 / 3.01e-10
+versus 2.07e-09 / 3.76e-10; n=129 1.54e-09 / 3.17e-10 versus 1.54e-09 /
+3.21e-10; n=4096 4.32e-10 / 1.11e-10 versus 1.06e-09 / 2.64e-10; n=4097
+4.22e-10 / 1.05e-10 versus 8.39e-10 / 2.18e-10; n=32768 4.22e-10 / 1.07e-10
+versus 1.83e-09 / 4.39e-10; n=131072 9.64e-10 / 1.95e-10 versus 4.81e-09 /
+1.23e-09. Every RMS point and every max-abs point except n=129 improves;
+n=129's max-abs is 0.26% above the base (1.543762e-09 versus 1.539827e-09)
+while its RMS is below, so D5's strict "not worse" condition is not met at that
+single point and the gate outcome stays open. The 2^-8-scaled input is below
+the base at every length (e.g. n=131072 2.26e-12 versus 1.23e-11), and the
+un-split variant stays 5x-1000x worse. Row independence (R in {2,3,8}, 18 start
+positions) and mixed-partition rows (4096 with 4097 in one launch) are
+byte-identical to the single-row runs; `qwen_attention_long_context_ops_test`,
+`qwen_attention_kv_storage_ops_test` and `qwen_attention_kvarn_read_ops_test`
+pass, and the unchanged-path dump matches the base tree byte for byte.
+`qwen_graph_ops_test` and `qwen_mtp_gpu_test` fail at dynamic-link time in this
+environment (`GLIBC_2.43 not found`, no code executed), the same toolchain
+deviation recorded for the earlier changes.
+
+Phase 1 task 2.10: `kQ4ContextCost` re-measured for the block kernel with the
+Phase 0 bench in production mode (`--mode cold --candidate-mode 7 --iters 5`),
+one layer per launch, anchor plus 1-7 proposals (rows 2..8) at start positions
+2047 and 32764, the same method the table's artifact
+(`artifacts/q4-dflash2-c1-focused.json`, `controller_cost_calibration`) used:
+per-layer times (2K -> 32K) 0.0610 -> 0.7113 (2 rows), 0.0861 -> 0.9179 (3),
+0.1042 -> 1.2506 (4), 0.1277 -> 1.5424 (5), 0.1449 -> 1.7686 (6),
+0.1593 -> 2.1136 (7), 0.1797 -> 2.3611 (8) ms; extra cost * 16 / 100 ms =
+0.104, 0.133, 0.183, 0.226, 0.260, 0.313, 0.349 (table: 0.10, 0.13, 0.18,
+0.23, 0.26, 0.31, 0.35, replacing 0.11, 0.14, 0.21, 0.23, 0.25, 0.31, 0.35).
+The measured per-layer values reproduce the artifact's within a few percent,
+which validates the harness; no other GPU workload ran alongside.
+
+Phase 1 task 2.11 (kernels suite): 13 of the 16 `check.py kernels` targets pass
+with the block kernel. `qwen_sampling_hip_test` ("upload logits: invalid
+argument"), `qwen_dflash_noncausal_attention_ops_test` (hipMemcpy "invalid
+argument") and `qwen_q4kxl_quant_ops_test` abort identically when run from the
+pre-change binaries of 2026-10-04 in `build/gpu-test`, so the failures are an
+environment (HIP runtime/build mix) deviation and not a consequence of this
+change. `qwen_graph_ops_test` and `qwen_mtp_gpu_test` cannot load at all in this
+environment (dynamic-link `GLIBC_2.43` mismatch, no code executed). The `model`
+and `multi-session` suites need a Qwen3.8 27B MTP model, which this machine does
+not carry (only the Flash-Next MTP weights and the 27B target/DFlash2 weights);
+those entries stay unmeasured rather than skipped-as-passed.
+
+Phase 1 accuracy decision (2026-10-13, user): the n=129 max-abs point of the
+formula input (1.543762e-09 vs the base's 1.539827e-09, +0.26%) is accepted.
+Every other max-abs point and all twelve RMS points are at or below the base,
+and the absolute errors sit six orders of magnitude inside the 5e-4 contract
+limit, so G0F's accuracy item is judged met with this single exception
+recorded. Options for closing it further (a third split term, a different
+partial-sum order) were measured and do not move the value.
+
+Phase 1 G1F speed (2026-10-15, Q8_0, greedy, base vs candidate Nix builds of the
+staged change; 5% and 3 ms both required for significance):
+* C1 single-user `gufo bench -p 2048 -n 128 -r 1`, pp2048/tg128 in t/s — d0
+  573.55/7.68 vs 570.58/7.68; d4096 534.63/7.62 vs 534.10/7.61; d32768
+  441.42/7.19 vs 439.54/7.17; d65536 368.01/6.75 vs 368.15/6.73; d131072
+  277.60/6.03 vs 276.95/5.98. No significant regression at any point.
+* C1 DFlash2 `--speculative dflash2` tg128 — d32768 39.29 vs 39.64; d65536
+  32.83 vs 32.94; d131072 7.68 vs 7.77. All positive but below the 5% band, so
+  the D16 "significant improvement" item is not reached; reported to the user
+  (D9) and treated as no-regression under the re-derived reading.
+* C8 aggregate, 8 concurrent `gufo serve llm -j 8 -c 4096` users, 4096-token
+  context each, tg128, measured with a local SSE client: AR 51.152 vs 50.536
+  t/s (-1.2%), DFlash2 56.201 vs 56.493 t/s (+0.5%). No significant
+  regression. (The repo's model_bench tables need a local bench.json that is
+  not committed, so the C8 points were measured with this equivalent harness.)
+* functional `tests/functional/run.py --suite long-context --suite cache`
+  (AR/DFlash2 modes): every case passed on both builds; the qualification
+  verdict is `inconclusive` only because the FP16 compatibility identity change
+  (D19) changes disk-cache progress attestations relative to the baseline.
+
+Phase 1 task 2.8 (G1I): `gufo serve llm --cache-disk <dir>` with a ~1k-token
+greedy request, one preallocated session.
+* FP16 (default kv cache): the base build wrote
+  `89b113b1…-abbcc2303dc9dac5.kvc`; loading the same directory with the
+  candidate build left that file untouched and wrote a second, different file
+  `a5cf7aa0…-fa4338c8ea460cfa.kvc`, i.e. the FP16 compatibility identity changed
+  and the base cache is never reused (design D19). The completion text was
+  empty for both builds on this prompt (first request after load). Re-run with
+  a warmup request and a short factual prompt (16 greedy tokens, seed 7): cold
+  candidate, base-with-cache and candidate-loading-the-base-directory all
+  returned the identical text (`\n\nThe sky appears blue because shorter
+  wavelengths of sunlight, such as blue, are`), and the candidate added new
+  identity-named files instead of reusing the base's, so the FP16 cache is
+  recomputed and the tokens are unchanged (D19).
+* `kvarn-k5v4`: both builds produced and reused
+  `9f8c57af…-cb7ab9b48150df64.kvc` unchanged, with identical greedy tokens
+  (`<think>\n\n</think>\n\ndog. The quick`), so the KVarN compatibility identity
+  is byte-identical to the base as required.
+
+Phase 1 task 2.14: the replaced FP16 partials kernel
+(`QwenDecodeSplitKAttentionHalfPartialsKernel` and its
+`LaunchSplitKAttentionHalfPartials` dispatcher) is deleted from
+src/models/qwen/hip/kernels/attention_decode.hip; the block kernel is the only
+FP16 decode/verification selection path, with no flag, environment variable or
+dual dispatch. Deletion was reconstructable from the Nix source copy of the
+candidate build. FP32 split-K kernels are untouched. After the deletion
+`ctest -R qwen_attention` reports 15/15 passed (decode_blocks, long_context,
+kv_storage, kvarn_* and wmma_prefill included), so the unchanged paths and the
+KVarN readout still match their references.
+
+Phase 1 tasks 2.2/2.3 note: the FP16 partials write exactly the scratch layout
+the FP32 split-K path uses, so the merge stays the shared
+`QwenDecodeSplitKAttentionReduceKernel` and the block kernel is the only new
+kernel; `SelectDecodeAttentionSplitCount`,
+`QwenDecodeSplitKAttentionReduceKernel` and `QwenKvarnSplitKReduceKernel` are
+byte-identical to 801abd3. The FP16 path therefore has its own partition
+function and its own partials kernel, and reuses the unchanged shared merge
+over its 32 whole-tile partitions (an empty partition writes max −∞ / sum 0,
+which the merge skips). `attention_policy.hpp` only adds the block range
+helper next to the untouched `SelectDecodeAttentionSplitCount`.
+
+Phase 1 task 2.7 (G0U, 2026-10-15): the unchanged-path dump
+(`tools/bench/qwen_decode_attention_dump.hip`) built from the base worktree
+(`/tmp/gufo_base` at 801abd3) and from the candidate tree produced
+byte-identical files (481280 bytes each, sha256
+`cde663a00f28da262a95ca93574c3921bc228ed07b7c809aa4522ceb2c1769d3`; the two
+manifests differ only in the output path they record). Covered records: the
+n=127 online path, the FP32 reference-KV path in MTP's argument shape at
+n=128/4096/32768 (cache row, single-row output and 8-row output) and the sealed
+KVarN `k5v4` decode and verification-row reads at the same lengths.
+`qwen_graph_ops_test`, `qwen_attention_kv_storage_ops_test`,
+`qwen_attention_kvarn_read_ops_test` and `qwen_mtp_gpu_test` all pass on
+binaries rebuilt from the staged tree (`libgufo_core.a` and the four
+executables relinked at 11:17). MTP's predictor attention stays on the FP32
+reference split-K path: `LaunchAttention` selects it whenever the FP32 planes
+are non-null and `mtp/executor.cpp` passes `d_kv_cache_`, so the FP16 block
+kernel cannot be reached from MTP.
+
+The `GLIBC_2.43 not found` load failures recorded for the earlier tasks are a
+runtime-search artifact rather than a broken test: the `build/gpu-test-fresh`
+binaries are compiled against the system glibc 2.43, but their RUNPATH resolves
+libc/libm from the Nix `gcc-prefix` tree (glibc 2.42), so the loader rejects
+them before any code runs. Launching them with
+`LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu` (the library they were linked
+against) loads and passes them; `qwen_mtp_gpu_test` additionally needs the
+model paths (`/home/betiz/models/Qwen3.8-27B-Q8_0.gguf` and
+`/home/betiz/models/MTP/mtp-Qwen3.8-27B-Q4_0.gguf`) and otherwise reports the
+missing-artifact skip (exit 77).
+
+Phase 2 task 3.1 (KVarN read bench, 2026-10-15): `tools/bench/qwen_decode_attention_bench.hip`
+gained `--mode kvarn-cold|kvarn-accuracy|kvarn-r1-check` with the sealed
+`kvarn-k5v4` tail-2048 fixture, an FP64 reference over the sealed bytes, the
+control copy `tools/bench/detail/qwen_kvarn_read_base_801abd3.inc` (549 body
+lines extracted from `git show 801abd3:src/models/qwen/hip/kernels/kvarn_read.hip
+| sed -n '615,700p;702,794p;796,1104p;1108,1168p'`, eight top-level identifiers
+renamed with a `Base` prefix, otherwise byte-identical), and the D14 candidate
+`QwenKvarnBlockDecodePartialsKernel` (block = (KV head, partition), all rows in
+the block, one 16-token decode of each sealed tile per block into LDS, six heads
+in the WMMA M dimension, folding on the A side and in the FP32 post-processing).
+Resources from the build (`tools/bench/build.sh`): control kernels 86 / 31 / 92
+VGPR at 16 waves/SIMD with 0 / 1024 / 608 B LDS; candidate 112 VGPR, 6 waves/SIMD,
+41056 B LDS per block and 29 spilled SGPRs.
+
+Phase 2 task 3.2 (G0K, 2026-10-15): the gate is not met, and Phase 2 stops here
+per design D9 with the user's decision (the accuracy item was re-worked first,
+then the speed item decided the outcome).
+
+* Accuracy (`--mode kvarn-accuracy`, R=1, FP64 reference): the control matches
+  the reference at 1.112146e-08 max-abs / 2.246e-09 RMS (d32768) and
+  6.929e-09 / 1.006e-09 (d131072); the candidate reaches only 3.654935e-03 /
+  1.233e-04 and 4.356801e-04 / 1.926e-05. A first fix replaced the staged
+  hi+residual B operands with the exact f16 codes and moved the whole KVarN fold
+  to the A side (`KvarnBuildFold`, the Phase 0 pattern) and corrected the FP64
+  reference to use per-row gates; the candidate's error stayed at the 1e-4..1e-3
+  level, so the shortfall is not the earlier missing-residual bug. G0K requires
+  the candidate at or below the control.
+* Speed (`--mode kvarn-cold`, `kvarn-k5v4` tail 2048, per layer, median of 5,
+  after the accuracy rework that halved the LDS to 24672 B and raised occupancy
+  from 6 to 10 waves/SIMD): d32768 R=1 control decode 1.4300 ms against
+  candidate 6.3861 ms (4.5x), R=8 6.1930 against 9.4771 (1.5x); d131072 R=1
+  control 5.5855 against 25.6989 (4.6x), R=8 24.9390 against 38.4698 (1.5x).
+  The verification rows cost the control 7.1057 ms (R=1) and 9.7178 ms (R=8) at
+  d32768 and 28.7927 / 39.6847 ms at d131072. G0K asks for R=1 at <= 0.50x of
+  the new FP16 kernel (which is faster still than the KVarN control) and R=8 at
+  <= 0.5x of the base KVarN verification read; the candidate misses both.
+* Row independence (`--mode kvarn-r1-check`) is still not usable as evidence:
+  the verbatim control mismatches its own single-row runs for R=2/3/8 (one, two
+  and seven rows respectively) even after pinning the split count for both the
+  group and the single-row launches, so the bench's comparison setup remains
+  wrong. The candidate follows the same pattern, and G0K's independence item
+  stays unjudged; it does not change the verdict, which the accuracy and speed
+  items already decide.
+* The resources explain the speed: 123 VGPR, 24672 B LDS per block and 10
+  waves/SIMD (33 spilled SGPRs) against the control's 86-92 VGPR at 16
+  waves/SIMD reproduce the occupancy wall that rejected the earlier shared-KV
+  staging attempt (experiment row 105 above).
+* Verdict: `kvarn-k5v4` tail 2048 block read is not adopted. The bench keeps the
+  control copy and the candidate for reproduction, the production KVarN read
+  path, the state ABI and the `qwen/kv-cache-quantization` contract are
+  untouched, and tasks 3.3-3.10 do not apply. Tasks 3.1-3.2 stay recorded with
+  the measurements above.
+Phase 1 task 2.11 (G1F quality, 2026-10-15): the four `check.py` suites and the
+two functional suites, run against builds of the staged tree with
+`LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu` (see the G0U note) and
+`GUFO_QWEN27B_MODEL=/home/betiz/models/Qwen3.8-27B-Q8_0.gguf`,
+`GUFO_QWEN27B_MTP_MODEL=/home/betiz/models/MTP/mtp-Qwen3.8-27B-Q4_0.gguf`,
+`GUFO_QWEN27B_DFLASH_MODEL=/home/betiz/models/Qwen3.8-27B-DFlash2-Q8_0.gguf`.
+Weights: Q8_0 `d17816b6…`, MTP Q4_0 `50d9ce5a…`, DFlash2 Q8_0 `c18e800d…`.
+
+* `kernels` (16 tests, `build/gpu-test-fresh`): 16/16 passed, including the four
+  tests that abort in the pre-change `build/gpu-test` binaries.
+* `model`: `qwen27b_target_test` 145.2 s passed, `qwen_mtp_gpu_test` 3.2 s
+  passed, `qwen_dflash_gpu_test` 101.7 s passed, `qwen27b.dflash-kvarn` 315.7 s
+  passed, `qwen27b.cli` failed at the `/infill` assertion (pre-existing: the
+  server registers `/infill` as `NotImplemented` in the base tree, `origin/main`
+  and `upstream/main` alike, and a direct probe returns 501 on both builds).
+* `multi-session`: `qwen27b_multisession_target_test` 673.5 s passed,
+  `qwen_dflash_multisession_gpu_test` 106.4 s passed,
+  `inference_backend_multisession_gpu_test` failed on the W=2 assertion:
+  `concurrency tokens=8,8 widths=1,1 plans=serial-fallback,serial-fallback`.
+* `serving`: `inference_backend_gpu_test` passed (205.6 s).
+* hosted CPU contract suite (`cmake --build --preset pr` on the reconfigured
+  `build/cpu-test`): 57/57 passed. `tools/ci/check-format.py`,
+  `check-dependencies.py` and `check-docs.py` pass.
+* `kernel_resources_test`: the new kernel has 0 scratch (`--report
+  QwenDecodeBlock` lists nothing). The test itself reports 53 kernels over
+  their allowance (52 `qfn_mmq::mul_mat_q` instantiations and one
+  `gdn_row_split`), all Qwen3.8 Flash-Next code; the same 53 appear for the base
+  binary built with the same toolchain, so the baseline file does not match this
+  toolchain rather than this change.
+* functional (`tests/functional/run.py --suite long-context --suite cache`),
+  base build `/nix/store/ah8qlx18…-gufo-0-unstable-801abd3-dirty/bin/gufo`
+  recorded as the baseline, candidate
+  `/nix/store/q38c6739vd1a8h322fkqr9c336hcb530-gufo-0-unstable-801abd3-dirty/bin/gufo`
+  (identical server options; the candidate is a Nix build so that it starts
+  inside the `nix develop` python environment the runner needs):
+  every case of every suite passed in both modes on both builds (602
+  measurements each). The aggregate verdict is `inconclusive`, not `failed`:
+  `quality_or_coverage_changes` is empty and the flagged items are 4 (AR mode)
+  and 8 (DFlash2 mode) sub-100 ms timing metrics (`queue_ms`,
+  `cache_snapshot_ms`, `max_inter_token_ms`) that differ between the runs and
+  do not reproduce across the two modes (the same metrics stay inside the band
+  elsewhere), i.e. single-run noise above the harness's 5% and 3 ms band rather
+  than a quality or coverage change.
+
+
+Phase 1 verdict (2026-10-15): the FP16 decode/verification block kernel is
+adopted. G0F, G0U, G1I, G1F and G1R are recorded above (the G1F DFlash2
+"significant improvement" item stayed below the 5% band and was reported to the
+user, who accepted the no-regression reading); the old half-partials kernel is
+deleted, no switch or environment variable remains, and the FP16 compatibility
+identity carries the new row. Phase 2 (KVarN read block structure) was judged
+separately below and is not adopted.
+
+The multi-session `inference_backend_multisession_gpu_test` failure is not
+attributable to this change on this machine: an exact control built from the
+base source (`/tmp/gufo_base`) with the same toolchain and the same
+environment fails the same assertion twice in a row, reporting
+`concurrency tokens=8,8 widths=1,1 plans=serial-fallback,serial-fallback` and
+"concurrent Qwen requests did not execute through W=2" exactly like the
+candidate build (candidate also failed twice, identically). The older
+pre-change binary in `build/gpu-test` (Oct 4, different toolchain) fails the
+same test in two different places instead, so the test does not hold on this
+machine regardless of this change. The C8 measurement of the same candidate
+build keeps 8 concurrent sessions at 51.152 against 50.536 t/s (no significant
+regression), so batching itself works.
+
+Phase 1 task 2.15 (G1R, 2026-10-15): the KVarN tg reference points at depth
+32,768 and 131,072 re-measured in the adopted block-kernel build before any
+KVarN read change. Three serial `g1.py` series per mode with the FP16 brackets
+inside every series (`artifacts/g1r-ar-r{1,2,3}`, `artifacts/g1r-g2-r{1,2,3}`),
+depths 32,768 and 131,072, greedy, Q8_0 `d17816b6…`, candidate
+`build/release-fresh/gufo`, medians of the three series; the per-invocation stop
+was the harness default of 3600 s for the AR series and 1800 s for the DFlash2
+series (twice the conservative per-job estimate; the worst measured job was
+516 s, so neither bound was approached). One AR job (`k6v5-none d131072`) was
+re-run after a stray DFlash2 launch overlapped it.
+
+* AR tg FP16 ratios (previous G1 value → G1R): d32,768 0.949→0.9484,
+  0.943→0.9428, 0.914→0.9163, 0.910→0.9121, 0.860→0.8619, 0.854→0.8577;
+  d131,072 0.843→0.8450, 0.838→0.8400, 0.753→0.7567, 0.752→0.7550,
+  0.632→0.6367, 0.631→0.6350 for k4v4 none/2048, k5v4 none/2048, k6v5
+  none/2048. Every point moves by at most 0.005.
+* DFlash2 tg FP16 ratios (previous G2 value → G1R): d32,768 0.628→0.6123,
+  0.617→0.6032, 0.626→0.6098, 0.606→0.5914, 0.579→0.5644, 0.581→0.5671;
+  d131,072 0.807→0.7685, 0.767→0.7302, 0.741→0.7059, 0.737→0.7020,
+  0.347→0.3312, 0.667→0.6394. The ratios fall by 2.2–4.8% relative, mostly
+  because the same kernel makes the eight-row FP16 verification faster (FP16
+  DFlash2 tg 39.62 against 38.36 tok/s at d32,768 and 7.82 against 7.56 at
+  d131,072 in the previous G2 series; the alternating G1F runs of the default
+  FP16 DFlash2 measured +0.9% at d32,768 and +1.2% at d131,072). The
+  quantized-KV presets rise by 0.5–1.1% at d32,768 but move by -0.8% to -1.6% at
+  d131,072 against the previous G2 series, which is not a matched pair; this is
+  below the 5% and 3 ms band and is recorded as unconfirmed, not as a
+  regression. The matched G1F AR pair at d131,072 shows the same sign (-0.8%),
+  also below the band.
+* The pp reference values stay at the G1/G2 values: prefill attention is out of
+  this change's scope, and the pp ratios measured inside the DFlash2 series use
+  the speculative run's own FP16 bracket, so they are not comparable with the
+  G1 pp reference.
+* The new values are recorded next to the old ones in
+  [benchmarks](BENCHMARKS.md) with the model SHA-256, the method and the
+  reproduction commands, and the two tables in the model README and
+  `docs/CLI.md` carry the new tg cells with the pp cells unchanged.

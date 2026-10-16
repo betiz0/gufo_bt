@@ -302,8 +302,13 @@ private:
   // cold-KV measurements include the anchor plus 1–7 proposals and preserve
   // the actual row-tile boundaries. Position is deterministic on replay;
   // request timings and sampled proposals never enter the decision.
+  // Re-measured 2026-10-13 for the decode-attention block kernel
+  // (openspec change update-qwen-decode-attention-blocks, task 2.10): one
+  // layer per WMMA block kernel, 5 launches per point; per-layer times at
+  // 2K/32K were 0.061/0.711 (2 rows) through 0.180/2.361 (8 rows) ms, giving
+  // 0.104/0.133/0.183/0.226/0.260/0.313/0.349 before rounding.
   static constexpr std::array<float, kMaxDraftTokens> kQ4ContextCost{
-      0.11F, 0.14F, 0.21F, 0.23F, 0.25F, 0.31F, 0.35F};
+      0.10F, 0.13F, 0.18F, 0.23F, 0.26F, 0.31F, 0.35F};
   DFlashDraftPolicy policy_;
   std::uint32_t limit_;
   bool q8_target_;

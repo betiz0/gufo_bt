@@ -515,3 +515,18 @@ DFlash2 uses mixed/repetitive cases. Rates sum individual decode rates.
 Loading uses cold files, C1/DFlash2/capacity 262144; memory uses C1/AR peak HIP
 allocation. Commands, hashes and counts remain in [artifacts](artifacts/bench.json)
 and the [benchmark workflow](../../../.agents/skills/benchmark-model/SKILL.md).
+
+## Declared limits for the decode attention blocks
+
+The FP16 decode and verification block kernel (change
+`update-qwen-decode-attention-blocks`) decides "matches within the declared
+limit" with the values below; the same values are source constants in the
+tests, and this change does not loosen any of them.
+
+| Check | Limit | Source | Rationale |
+| --- | --- | --- | --- |
+| Block partitions against the FP64 reference, including partitions without keys | max abs 5e-4 | `kDecodeAttentionFp64MaxAbsTolerance` in `tests/models/qwen/hip/attention/decode_blocks_ops_test.cpp` | The same contract the FP16 long-context decode test already holds; the block kernel must not relax it. |
+| Partition invariants (128-token boundaries, at most 32 partitions, one partition per position) | exact | `tests/models/qwen/hip/attention/decode_partition_policy_test.cpp` | Policy arithmetic only; no tolerance is meaningful. |
+| Rows of one verification launch against the same row run alone, and mixed-partition rows | byte-identical | `qwen_attention_kv_storage_ops_test`, `qwen_attention_decode_blocks_ops_test` | The scalar-decode bit contract; a tolerance would hide an ordering change. |
+
+Reproduce: `cmake --build --preset gpu-test --target qwen_attention_decode_partition_test qwen_attention_decode_blocks_ops_test` then `ctest --preset gpu-full -R '^qwen_attention_(decode_partition|decode_blocks)'` (the partition test is CPU-only; add `-DENGINE_ENABLE_HIP=OFF` to run it without a GPU).

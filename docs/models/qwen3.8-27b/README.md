@@ -100,14 +100,22 @@ every series, Q8_0 SHA-256
 
 | Preset | Tail | d0 | 4K | 32K | 128K |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| `kvarn-k4v4` | none | 0.996 / 0.925 | 0.986 / 0.922 | 0.949 / 0.890 | 0.843 / 0.826 |
-| `kvarn-k4v4` | 2048 | 0.996 / 0.985 | 0.987 / 0.922 | 0.943 / 0.894 | 0.838 / 0.840 |
-| `kvarn-k5v4` | none | 0.996 / 0.924 | 0.982 / 0.921 | 0.914 / 0.889 | 0.753 / 0.822 |
-| `kvarn-k5v4` | 2048 | 0.996 / 0.987\* | 0.984 / 0.924\* | 0.908 / 0.889\* | 0.752 / 0.835 |
+| `kvarn-k4v4` | none | 0.996 / 0.925 | 0.986 / 0.922 | 0.948 / 0.890 | 0.845 / 0.826 |
+| `kvarn-k4v4` | 2048 | 0.996 / 0.985 | 0.987 / 0.922 | 0.943 / 0.894 | 0.840 / 0.840 |
+| `kvarn-k5v4` | none | 0.996 / 0.924 | 0.982 / 0.921 | 0.916 / 0.889 | 0.757 / 0.822 |
+| `kvarn-k5v4` | 2048 | 0.996 / 0.987\* | 0.984 / 0.924\* | 0.912 / 0.889\* | 0.755 / 0.835 |
 
 \* Main configuration re-measured in the same series on 2026-10-08 (task 6.3, design D23): AR tg / pp2048 ratios against FP16 at d0 0.996/0.987, d4K 0.984/0.924, d32K 0.908/0.889; depth 128K keeps the G1 value. The floors and the reference checks (≥ 0.95 at d0–4K, ≥ 0.97× the G1 point at 32K) pass.
-| `kvarn-k6v5` | none | 0.996 / 0.924 | 0.974 / 0.921 | 0.860 / 0.887 | 0.632 / 0.816 |
-| `kvarn-k6v5` | 2048 | 0.996 / 0.985 | 0.979 / 0.920 | 0.854 / 0.891 | 0.631 / 0.830 |
+| `kvarn-k6v5` | none | 0.996 / 0.924 | 0.974 / 0.921 | 0.862 / 0.887 | 0.637 / 0.816 |
+| `kvarn-k6v5` | 2048 | 0.996 / 0.985 | 0.979 / 0.920 | 0.858 / 0.891 | 0.635 / 0.830 |
+
+The depth 32K and 128K `tg` cells are the G1R re-measurement of 2026-10-15
+(task 2.15, design D17) in the build that replaced the FP16 decode attention
+(change `update-qwen-decode-attention-blocks`); the `pp` cells keep the G1
+values, because prefill attention is out of that change's scope. The FP16
+DFlash2 ratios of the same re-measurement are lower (0.564–0.612 at 32K,
+0.331–0.769 at 128K) because the new kernel also speeds up the eight-row FP16
+verification; both sets are recorded in [benchmarks](BENCHMARKS.md).
 
 Cells are `tg ratio / pp ratio` against FP16 KV at the same depth. The benefit
 is the KV memory of many long-context sessions (16.0 GiB → 4.45–6.08 GiB per
@@ -273,6 +281,26 @@ python3 tools/prof/prof.py run --stages qwen --tag tg -o OUT -- \
   --kv-cache kvarn-k5v4 --kv-cache-tail 2048 \
   --speculative dflash2 --dflash-model DFLASH
 ```
+
+### FP16 decode attention and cache identity
+
+The decode-attention block kernel (change `update-qwen-decode-attention-blocks`)
+replaces the FP16 decode and verification arithmetic for dense FP16 planes: one
+block carries one (KV head, row, 128-token partition), the six GQA query heads
+of that KV head sit in the WMMA M dimension, and each K/V tile is read from
+global memory into shared memory once for all six heads. Row independence and
+the verification-versus-scalar bit contract are unchanged, but the values
+themselves differ from earlier builds.
+
+Dense FP16 configurations therefore carry an extra compatibility-identity row
+(`fp16_decode_attention=kv-head-wmma-v1`):
+
+- `.kvc` disk caches written by an earlier build, or by upstream at the same
+  commit, do not match and are recomputed automatically; the greedy token
+  sequence is the same as a cold run with an empty cache directory. FP16
+  snapshots keep their version and format.
+- FP32 reference-KV and KVarN configurations keep the identity rows they had,
+  so their snapshots and caches still match.
 
 ## Images
 

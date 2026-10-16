@@ -77,6 +77,46 @@ struct AttentionSupportParams {
          (static_cast<std::size_t>(head_dim) + 2);
 }
 
+/// FP16 decode and verification tile width: the block kernel stages K and V in
+/// 128-token tiles (design D1/D11).
+inline constexpr std::size_t kDecodeAttentionBlockTokens{128};
+
+/// One partition of the FP16 decode/verification attention blocks: whole
+/// 128-token tiles spread over `kSplitKDecodeAttentionMaxSplits` partitions,
+/// the last one absorbing the remainder. This is the whole-tile split the
+/// KVarN read already uses and the method design D11 selected for the FP16
+/// path; it replaces the `ceil(n / 32)` split of
+/// `SelectDecodeAttentionSplitCount` for the FP16 block kernel only. Below the
+/// split-K threshold, split 0 covers the whole sequence and the remaining
+/// splits are empty.
+struct DecodeAttentionBlockRange {
+  std::size_t begin{0};
+  std::size_t end{0};
+  /// A partition without keys contributes nothing to the merge.
+  [[nodiscard]] constexpr bool empty() const noexcept { return begin >= end; }
+};
+
+[[nodiscard]] constexpr DecodeAttentionBlockRange
+SelectDecodeAttentionBlockRange(std::size_t sequence_length,
+                                std::uint32_t split) noexcept {
+  if (SelectDecodeAttentionSplitCount(sequence_length) == 1) {
+    return split == 0
+               ? DecodeAttentionBlockRange{0, sequence_length}
+               : DecodeAttentionBlockRange{sequence_length, sequence_length};
+  }
+  const std::size_t blocks =
+      (sequence_length + kDecodeAttentionBlockTokens - 1) /
+      kDecodeAttentionBlockTokens;
+  const std::size_t begin_block = (static_cast<std::uint64_t>(split) * blocks) /
+                                  kSplitKDecodeAttentionMaxSplits;
+  const std::size_t end_block =
+      (static_cast<std::uint64_t>(split + 1) * blocks) /
+      kSplitKDecodeAttentionMaxSplits;
+  const std::size_t begin = begin_block * kDecodeAttentionBlockTokens;
+  const std::size_t end = end_block * kDecodeAttentionBlockTokens;
+  return {begin, end < sequence_length ? end : sequence_length};
+}
+
 [[nodiscard]] constexpr bool IsTiledAttentionSupported(
     const AttentionSupportParams& params) noexcept {
   return params.batch_size != 0 &&

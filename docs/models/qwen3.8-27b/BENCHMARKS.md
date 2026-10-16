@@ -229,6 +229,65 @@ all-depth pp ratios (0.816–0.985) are the reference values G1 records; later
 judgments must stay at ≥ 0.97× of the same point. The depth-0 `pp` spread
 between tail unset and tail 2048 (0.925 against 0.985) is recorded as measured.
 
+**G1R: the tg reference values re-measured in the block-kernel build (2026-10-15,
+task 2.15, design D17).** The FP16 decode and verification arithmetic changed
+(change `update-qwen-decode-attention-blocks`, Phase 1), so the tg denominator
+of the performance contract is re-measured before any KVarN read change. Three
+serial `g1.py` series at depths 32,768 and 131,072 with FP16 KV bracketed inside
+every series (AR: `artifacts/g1r-ar-r{1,2,3}`; DFlash2:
+`artifacts/g1r-g2-r{1,2,3}`, `--speculative dflash2`), greedy, Q8_0 weights
+SHA-256 `d17816b6bafbe3f5c572ed94d9cee62516cf901628d4372fb73792a4a175f4cf`,
+candidate binary `build/release-fresh/gufo`, medians of the three series. The pp
+reference values stay as measured above (prefill attention is out of the
+change's scope). FP16 tg in these series: AR 7.17 (d32,768) and 6.00 (d131,072)
+tok/s; DFlash2 39.62 and 7.82 tok/s.
+
+| AR tg128 FP16 ratio (new reference) | k4v4 none | k4v4 2048 | k5v4 none | k5v4 2048 | k6v5 none | k6v5 2048 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| d32,768, previous G1 value | 0.949 | 0.943 | 0.914 | 0.910 | 0.860 | 0.854 |
+| d32,768, G1R | 0.9484 | 0.9428 | 0.9163 | 0.9121 | 0.8619 | 0.8577 |
+| d131,072, previous G1 value | 0.843 | 0.838 | 0.753 | 0.752 | 0.632 | 0.631 |
+| d131,072, G1R | 0.8450 | 0.8400 | 0.7567 | 0.7550 | 0.6367 | 0.6350 |
+
+| DFlash2 tg128 FP16 ratio (new reference) | k4v4 none | k4v4 2048 | k5v4 none | k5v4 2048 | k6v5 none | k6v5 2048 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| d32,768, previous G2 value | 0.628 | 0.617 | 0.626 | 0.606 | 0.579 | 0.581 |
+| d32,768, G1R | 0.6123 | 0.6032 | 0.6098 | 0.5914 | 0.5644 | 0.5671 |
+| d131,072, previous G2 value | 0.807 | 0.767 | 0.741 | 0.737 | 0.347 | 0.667 |
+| d131,072, G1R | 0.7685 | 0.7302 | 0.7059 | 0.7020 | 0.3312 | 0.6394 |
+
+The AR ratios move by at most 0.005 (the AR decode is bandwidth-bound, design
+D13). The DFlash2 ratios fall by 2.2–4.8% relative, mostly because the same
+block kernel makes the eight-row FP16 verification faster: FP16 DFlash2 tg
+rises from 38.36 to 39.62 tok/s at 32,768 and from 7.56 to 7.82 tok/s at
+131,072 (the alternating G1F base/candidate runs of the default FP16 DFlash2
+measured +0.9% at 32,768 and +1.2% at 131,072). The quantized-KV DFlash2 presets
+rise by 0.5–1.1% at 32,768 but move by -0.8% to -1.6% at 131,072 against the
+previous G2 series. That series was measured in another session, so the
+comparison is not matched; the 131,072 movement is below the 5% and 3 ms
+significance band and is recorded as unconfirmed, not as a regression. The
+matched G1F AR pair at 131,072 shows the same sign (-0.8%), also below the band.
+Later judgments keep the same points at ≥ 0.97× of these G1R values; the pp
+values stay at ≥ 0.97× of the G1 values above.
+
+Reproduce (candidate release build, one series at a time; three series each):
+
+```sh
+python3 tools/qwen27b/g1.py run --foreground --binary build/release-fresh/gufo \
+  --depths 32768,131072 --out artifacts/g1r-ar-r<N>
+python3 tools/qwen27b/g1.py run --foreground --binary build/release-fresh/gufo \
+  --depths 32768,131072 --out artifacts/g1r-g2-r<N> \
+  --extra-args "--speculative dflash2 --dflash-model <DFlash2-Q8_0>"
+python3 tools/qwen27b/g1_d19.py --artifacts artifacts --series-prefix g1r-ar-r \
+  --json artifacts/g1r-ar-summary.json
+python3 tools/qwen27b/g1_d19.py --artifacts artifacts --series-prefix g1r-g2-r \
+  --json artifacts/g1r-g2-summary.json
+```
+
+`g1_d19.py` also checks the depth 0–4K tg floor, which these series do not
+measure, so its exit status reports those points as FAIL while the 32K/128K
+table it prints is the one recorded here.
+
 Measured 2026-10-03 with the host toolchain (ROCm 7.14, host glibc 2.43): the
 `nix develop` build links ROCm's raw `hipClang` without the nixpkgs compiler
 wrapper and mixes host glibc 2.43 with the store's glibc 2.42, so that binary

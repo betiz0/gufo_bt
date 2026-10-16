@@ -390,8 +390,15 @@ std::vector<std::uint8_t> QwenCompatibilityIdentity(
            << hip::detail::kSplitKDecodeAttentionMinContext << '\n'
            << "attention_split_count="
            << hip::detail::kSplitKDecodeAttentionMaxSplits << '\n'
-           << "kv_storage=" << QwenKvStorageIdentity(execution_policy) << '\n'
-           << "recurrent_storage="
+           << "kv_storage=" << QwenKvStorageIdentity(execution_policy) << '\n';
+  // Dense FP16 planes run the decode-attention arithmetic that the block
+  // kernel replaced, so their cache keys carry the arithmetic's identity
+  // (design D19). FP32 reference-KV and KVarN configurations keep the rows
+  // they had.
+  if (execution_policy.UsesFp16AttentionKv()) {
+    identity << "fp16_decode_attention=kv-head-wmma-v1\n";
+  }
+  identity << "recurrent_storage="
            << (execution_policy.UsesBf16RecurrentState() ? "bf16" : "fp32")
            << '\n'
            << "context_tokens=" << max_context << '\n'

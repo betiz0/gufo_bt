@@ -40,3 +40,35 @@ schema: spec-driven
 #     archive:
 #       guidance:
 #         - 完了前にアーカイブ結果を要約する
+#
+
+context: |
+  言語: 日本語
+  技術スタック: C++ (CMake/CTest), HIP/ROCm, Linux x86-64, gfx1151 (Strix Halo), Nix
+  テスト: ctest --preset gpu-full 等。ビルドは cmake --preset gpu-test
+
+  対象モデルは Qwen3.8 27B（src/models/qwen、docs/models/qwen3.8-27b）と Qwen3.8 Flash-Next（src/models/qwen38_flash_next、docs/models/qwen3.8-flash-next）の 2 つ。
+  カーネル・テスト・数値契約はモデルごとに持ち、モデル間で共有しない。
+
+  GPU/VRAM を使用するテストの実行ルール (必須):
+  - VRAM を消費するテスト (GPU/operator/model チェック等) は並列実行してはならない (MUST NOT)
+  - ctest に --parallel / -j (値が 1 以外) を付けて実行しない
+  - GPU テストは一度に 1 インスタンスのみ。既に GPU テスト実行中なら追加起動しない
+  - ソース側で強制する場合は CTest の RESOURCE_LOCK プロパティでシリアライズする
+  - 理由: 並列起動による VRAM 枯渇・OOM を防ぎ、結果を再現可能に保つため
+
+rules:
+  proposal:
+    - 両モデルへの影響を書く。片方だけを対象にする場合は、もう片方を対象外とする理由を書く
+  specs:
+    - capability はモデルごとに分ける
+  design:
+    - Context・判定基準・リスクをモデルごとの節に分ける
+  tasks:
+    - GPU/VRAM を使用するテストを含む変更は、検証手順を逐次実行前提で記述する
+    - タスク群をモデルごとに分け、片方の未達がもう片方を止めないようにする
+
+operations:
+  apply:
+    guidance:
+      - VRAM を消費するテストの検証は必ず逐次実行し、並列起動 (ctest --parallel, 同時プロセス) を提案・実行しない

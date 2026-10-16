@@ -52,6 +52,9 @@ add_qwen_cpu_test(qwen_l1_ssm_module_test
 add_qwen_cpu_test(qwen_fusion_route_test
   tests/models/qwen/hip/execution_policy_test.cpp
   "cpu;models;qwen;hip;policy;fusion")
+add_qwen_cpu_test(qwen_attention_decode_partition_test
+  tests/models/qwen/hip/attention/decode_partition_policy_test.cpp
+  "cpu;models;qwen;hip;attention;dispatch;decode-partition")
 add_qwen_cpu_test(qwen_attention_policy_test
   tests/models/qwen/hip/attention_policy_test.cpp
   "cpu;models;qwen;hip;attention;dispatch")
@@ -84,6 +87,9 @@ if (ENGINE_ENABLE_HIP)
   add_qwen_hip_test(qwen_attention_decode_ops_test
     tests/models/qwen/hip/attention/backend_ops_test.cpp
     "hip;gpu;kernels;qwen;qwen-kernel-oracle;slow;attention;decode;backend")
+  add_qwen_hip_test(qwen_attention_decode_blocks_ops_test
+    tests/models/qwen/hip/attention/decode_blocks_ops_test.cpp
+    "hip;gpu;kernels;qwen;qwen-kernel-oracle;slow;attention;decode;blocks;opt-c214-decode-blocks")
   add_qwen_hip_test(qwen_attention_long_context_ops_test
     tests/models/qwen/hip/attention/long_context_ops_test.cpp
     "hip;gpu;kernels;qwen;qwen-kernel-oracle;slow;attention;decode;long-context")

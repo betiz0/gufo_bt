@@ -53,8 +53,8 @@ for t in "${targets[@]}"; do
     extra+=(-lhipblas -lhipblaslt -lrocblas)
   fi
   link_sources=()
-  if [[ "$src" -ef tools/qwen27b/kvarn_read_compute_bench.hip ]]; then
-    # The microbenchmark seals and checks its fixture with the CPU reference.
+  if grep -q "kvarn_reference.hpp" "$src"; then
+    # The microbenchmarks seal and check their fixtures with the CPU reference.
     link_sources+=(src/models/qwen/kvarn_reference.cpp)
     link_sources+=(src/core/quant/ggml_dequant.cpp)
   fi
